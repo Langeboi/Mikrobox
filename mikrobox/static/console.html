@@ -1,0 +1,38 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Mikrobox console</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/xterm@5.3.0/css/xterm.css">
+<style>
+  html, body { height: 100%; margin: 0; background: #111; }
+  #term { height: 100%; padding: 8px; box-sizing: border-box; }
+</style>
+</head>
+<body>
+<div id="term"></div>
+<script src="https://cdn.jsdelivr.net/npm/xterm@5.3.0/lib/xterm.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/xterm-addon-fit@0.8.0/lib/xterm-addon-fit.js"></script>
+<script>
+  // Temporary test page until the real UI exists. Usage: /console?lab=1&node=1
+  const q = new URLSearchParams(location.search);
+  const term = new Terminal({ cursorBlink: true, fontSize: 14 });
+  const fit = new FitAddon.FitAddon();
+  term.loadAddon(fit);
+  term.open(document.getElementById("term"));
+  fit.fit();
+  addEventListener("resize", () => fit.fit());
+
+  const proto = location.protocol === "https:" ? "wss" : "ws";
+  const ws = new WebSocket(
+    `${proto}://${location.host}/api/labs/${q.get("lab")}/nodes/${q.get("node")}/console`
+  );
+  ws.binaryType = "arraybuffer";
+  ws.onopen = () => ws.send("\r");
+  ws.onmessage = (e) =>
+    term.write(typeof e.data === "string" ? e.data : new Uint8Array(e.data));
+  ws.onclose = () => term.write("\r\n[disconnected]\r\n");
+  term.onData((data) => ws.readyState === 1 && ws.send(data));
+</script>
+</body>
+</html>

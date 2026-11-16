@@ -1,0 +1,98 @@
+"""The lab model: labs hold nodes (routers, clients) and links between ports."""
+
+from __future__ import annotations
+
+import ipaddress
+from enum import Enum
+from typing import Optional
+
+from pydantic import BaseModel, Field, field_validator
+
+NAME_PATTERN = r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,62}$"
+
+
+class NodeKind(str, Enum):
+    chr = "chr"
+    client = "client"
+
+
+class Node(BaseModel):
+    id: int
+    kind: NodeKind
+    name: str = Field(pattern=NAME_PATTERN)
+    ports: int = Field(ge=1)
+    cpus: int = Field(default=1, ge=1, le=8)
+    ram_mb: int = Field(default=256, ge=128, le=16384)
+    # Clients only: applied to eth0 when the client starts.
+    address: Optional[str] = None
+    gateway: Optional[str] = None
+
+    @field_validator("address")
+    @classmethod
+    def _check_address(cls, v: Optional[str]) -> Optional[str]:
+        if v is not None:
+            ipaddress.ip_interface(v)
+            if "/" not in v:
+                raise ValueError("address needs a prefix length, e.g. 192.168.10.2/24")
+        return v
+
+    @field_validator("gateway")
+    @classmethod
+    def _check_gateway(cls, v: Optional[str]) -> Optional[str]:
+        if v is not None:
+            ipaddress.ip_address(v)
+        return v
+
+
+class Endpoint(BaseModel):
+    node: int
+    port: int = Field(ge=1)
+
+
+class Link(BaseModel):
+    id: int
+    a: Endpoint
+    # None means "a" is plugged into the management bridge.
+    b: Optional[Endpoint] = None
+
+    def touches(self, node_id: int) -> bool:
+        return self.a.node == node_id or (self.b is not None and self.b.node == node_id)
+
+    def endpoints(self) -> list[Endpoint]:
+        return [self.a] if self.b is None else [self.a, self.b]
+
+
+class Lab(BaseModel):
+    id: int
+    name: str = Field(pattern=NAME_PATTERN)
+    nodes: list[Node] = Field(default_factory=list)
+    links: list[Link] = Field(default_factory=list)
+
+    def node(self, node_id: int) -> Optional[Node]:
+        return next((n for n in self.nodes if n.id == node_id), None)
+
+
+class State(BaseModel):
+    labs: list[Lab] = Field(default_factory=list)
+
+    def lab(self, lab_id: int) -> Optional[Lab]:
+        return next((lab for lab in self.labs if lab.id == lab_id), None)
+
+    def all_nodes(self) -> list[Node]:
+        return [n for lab in self.labs for n in lab.nodes]
+
+    def all_links(self) -> list[Link]:
+        return [link for lab in self.labs for link in lab.links]
+
+
+def free_id(used: set[int]) -> int:
+    """Lowest positive integer not in use, so ids (and interface names) stay short."""
+    i = 1
+    while i in used:
+        i += 1
+    return i
+
+
+def default_chr_ram(cpus: int, ports: int) -> int:
+    """MikroTik's RouterOS v7 sizing formula, using its lower published baseline."""
+    return 256 + 8 * cpus * (ports - 1)
