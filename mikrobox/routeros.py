@@ -82,5 +82,32 @@ def import_config(host: str, username: str, password: str, config: str) -> str:
         transport.close()
 
 
+RESTORE_FILE = "mikrobox-restore.rsc"
+RESET_COMMAND = f"/system reset-configuration no-defaults=yes skip-backup=yes run-after-reset={RESTORE_FILE}"
+MERGE_COMMAND = f"/import file-name={RESTORE_FILE}"
+
+
+def restore_config(host: str, username: str, password: str, config: str, replace: bool) -> str:
+    """Upload a saved config and load it: on top of the current one, or after a reset."""
+    import paramiko
+
+    transport = _connect(host, username, password)
+    try:
+        sftp = paramiko.SFTPClient.from_transport(transport)
+        sftp.putfo(io.BytesIO(config.encode("utf-8")), RESTORE_FILE)
+        sftp.close()
+        if not replace:
+            return _exec(transport, MERGE_COMMAND, timeout=180)
+        try:
+            _exec(transport, RESET_COMMAND, timeout=15)
+        except (paramiko.SSHException, OSError, EOFError):
+            pass  # the router is already restarting
+        return ""
+    except (paramiko.SSHException, OSError, EOFError) as e:
+        raise RouterError(f"Restore on {host} failed: {e}")
+    finally:
+        transport.close()
+
+
 def set_identity(host: str, username: str, password: str, name: str) -> str:
     return run(host, username, password, f'/system identity set name="{name}"')

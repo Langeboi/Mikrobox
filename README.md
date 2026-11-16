@@ -28,6 +28,12 @@ available through the API (interactive docs at `/docs`).
 - Topology export as a PNG image, device duplication, double-click to open a console.
 - Automatic config backups per lab (all routers or chosen ones, every 15 minutes to 24
   hours), kept as revisions only when the config changed, with a side-by-side compare.
+- Shared consoles: everyone who opens a device's console sees the same session and can
+  type. Badges show who else is in the lab and which device they have selected.
+- Restore a saved revision to a router, replacing its config or applying it on top.
+- Documentation export: a zip with a Markdown write-up (devices, cabling, areas, notes),
+  the topology image and each router's latest config.
+- Connectivity test: ping and traceroute from a client, from the Tools menu.
 - Settings: light or dark theme, grid, snapping, port labels, defaults for new routers.
 - Browser console for routers (serial port) and clients (shell), over a websocket.
 - Live packet capture of any port as a pcap stream you can pipe into Wireshark.

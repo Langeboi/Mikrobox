@@ -757,3 +757,207 @@ def test_backup_falls_back_to_ssh_when_the_agent_refuses(client, monkeypatch):
         for server, path in servers:
             server.close()
             path.unlink()
+
+
+def test_presence_lists_other_people(client):
+    a = client.post("/api/presence", json={"client": "tab-aaaa", "lab": 1, "node": 3}).json()
+    assert a == {"others": []}
+    client.post("/api/users", json={"username": "anna", "password": "long-enough"})
+    anna = TestClient(client.app)
+    anna.post("/api/auth/login", json={"username": "anna", "password": "long-enough"})
+    b = anna.post("/api/presence", json={"client": "tab-bbbb", "lab": 1}).json()
+    assert b["others"] == [{"user": "tester", "lab": 1, "node": 3}]
+    a = client.post("/api/presence", json={"client": "tab-aaaa", "lab": 1}).json()
+    assert a["others"] == [{"user": "anna", "lab": 1, "node": None}]
+
+
+def test_console_is_shared_between_viewers(client, monkeypatch):
+    """Two people on one router console see the same output, and both can type."""
+    import socket, threading
+
+    lab = make_lab(client)
+    r1 = add_node(client, lab, name="R1")
+    node = client.rt.store.state.lab(lab).node(r1["id"])
+    monkeypatch.setattr(client.rt, "node_running", lambda n: True)
+    client.rt.s.run_dir.mkdir(parents=True, exist_ok=True)
+    path = client.rt.serial_socket(node)
+    server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    server.bind(str(path))
+    server.listen(1)
+    accepted, typed = [], []
+
+    def router():
+        conn, _ = server.accept()
+        accepted.append(conn)
+        conn.sendall(b"MikroTik Login: ")
+        while True:
+            data = conn.recv(100)
+            if not data:
+                return
+            typed.append(data)
+            conn.sendall(b"echo:" + data)
+
+    threading.Thread(target=router, daemon=True).start()
+    url = f"/api/labs/{lab}/nodes/{r1['id']}/console"
+
+    def read_until(ws, want_bytes=None, want_viewers=None):
+        got = b""
+        for _ in range(20):
+            msg = ws.receive()
+            if msg.get("bytes"):
+                got += msg["bytes"]
+                if want_bytes and want_bytes in got:
+                    return got
+            elif msg.get("text", "").startswith("\x01"):
+                import json
+                viewers = json.loads(msg["text"][1:])["viewers"]
+                if want_viewers and viewers == want_viewers:
+                    return viewers
+        raise AssertionError(f"did not see {want_bytes or want_viewers}; got {got!r}")
+
+    try:
+        with client.websocket_connect(url) as first:
+            read_until(first, want_bytes=b"MikroTik Login: ")
+            with client.websocket_connect(url) as second:
+                # The second viewer gets the earlier output replayed, over the same single connection.
+                read_until(second, want_bytes=b"MikroTik Login: ")
+                read_until(first, want_viewers=["tester", "tester"])
+                second.send_bytes(b"admin")
+                read_until(first, want_bytes=b"echo:admin")
+                read_until(second, want_bytes=b"echo:admin")
+                first.send_bytes(b"hello")
+                read_until(second, want_bytes=b"echo:hello")
+            read_until(first, want_viewers=["tester"])
+        assert len(accepted) == 1 and b"".join(typed) == b"adminhello"
+    finally:
+        server.close()
+        for conn in accepted:
+            conn.close()
+
+
+def test_restore_revision(client, monkeypatch):
+    from mikrobox import routeros
+
+    lab = make_lab(client)
+    r1 = add_node(client, lab, name="R1")
+    client.post(f"/api/labs/{lab}/links", json={"a": {"node": r1["id"], "port": 1}})
+    base = f"/api/labs/{lab}/nodes/{r1['id']}"
+    backups = client.app.state.backups
+    assert backups.store(r1["id"], "/system identity\nset name=OLD\n")
+    rev = client.get(base + "/revisions").json()["revisions"][0]["id"]
+
+    assert client.post(f"{base}/revisions/{rev}/restore", json={}).json() == {"ok": False, "message": "Start R1 first."}
+    monkeypatch.setattr(client.rt, "node_running", lambda n: True)
+    calls = []
+    monkeypatch.setattr(routeros, "export_config", lambda *a, **k: "/system identity\nset name=CURRENT\n")
+    monkeypatch.setattr(routeros, "restore_config",
+                        lambda host, u, p, text, replace: calls.append((host, text, replace)) or "")
+    r = client.post(f"{base}/revisions/{rev}/restore", json={"mode": "replace"}).json()
+    assert r["ok"] and r["via"] == "ssh" and "resetting" in r["message"]
+    assert calls == [("10.99.1.1", "/system identity\nset name=OLD\n", True)]
+    # The config it replaced was saved first, so the restore can be undone.
+    assert len(client.get(base + "/revisions").json()["revisions"]) == 2
+    r = client.post(f"{base}/revisions/{rev}/restore", json={"mode": "merge"}).json()
+    assert r["ok"] and calls[-1][2] is False and "on top" in r["message"]
+    assert client.post(f"{base}/revisions/20000101T000000Z/restore", json={}).status_code == 404
+
+
+def test_restore_through_the_guest_agent(client, monkeypatch):
+    import base64, json, socket, threading
+
+    lab = make_lab(client)
+    leaf = add_node(client, lab, name="LEAF1")
+    node = client.rt.store.state.lab(lab).node(leaf["id"])
+    client.app.state.backups.store(leaf["id"], "/system identity\nset name=LEAF1\n")
+    rev = client.get(f"/api/labs/{lab}/nodes/{leaf['id']}/revisions").json()["revisions"][0]["id"]
+    monkeypatch.setattr(client.rt, "node_running", lambda n: True)
+    client.rt.s.run_dir.mkdir(parents=True, exist_ok=True)
+    server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    server.bind(str(client.rt.agent_socket(node)))
+    server.listen(4)
+    log = []
+
+    def agent():
+        while True:
+            try:
+                conn, _ = server.accept()
+            except OSError:
+                return
+            f = conn.makefile("rwb")
+            for line in f:
+                msg = json.loads(line)
+                cmd, args = msg["execute"], msg.get("arguments", {})
+                if cmd == "guest-sync":
+                    reply = {"return": args["id"]}
+                elif cmd == "guest-file-open":
+                    log.append(("open", args["path"], args["mode"])); reply = {"return": 5}
+                elif cmd == "guest-file-write":
+                    log.append(("write", base64.b64decode(args["buf-b64"]).decode())); reply = {"return": {"count": 1}}
+                elif cmd == "guest-file-close":
+                    log.append(("close",)); reply = {"return": {}}
+                elif cmd == "guest-exec":
+                    log.append(("exec", base64.b64decode(args["input-data"]).decode())); reply = {"return": {"pid": 9}}
+                else:
+                    reply = {"return": {"exited": True, "exitcode": 0, "out-data": base64.b64encode(b"/system identity\n").decode()}}
+                f.write(json.dumps(reply).encode() + b"\n"); f.flush()
+
+    threading.Thread(target=agent, daemon=True).start()
+    try:
+        r = client.post(f"/api/labs/{lab}/nodes/{leaf['id']}/revisions/{rev}/restore", json={}).json()
+        assert r["ok"] and r["via"] == "agent", r
+        assert ("open", "mikrobox-restore.rsc", "w") in log
+        assert ("write", "/system identity\nset name=LEAF1\n") in log
+        assert log[-1] == ("exec", "/system reset-configuration no-defaults=yes skip-backup=yes "
+                                   "run-after-reset=mikrobox-restore.rsc")
+    finally:
+        server.close()
+        client.rt.agent_socket(node).unlink()
+
+
+def test_documentation_export(client):
+    import base64, io, zipfile
+
+    lab = make_lab(client)
+    r1 = add_node(client, lab, name="R1", x=100, y=100)
+    sw = add_node(client, lab, name="SW1", role="switch", x=500, y=500)
+    pc = add_node(client, lab, kind="client", name="PC1", address="10.0.0.2/24", gateway="10.0.0.1", x=120, y=160)
+    client.post(f"/api/labs/{lab}/links", json={"a": {"node": r1["id"], "port": 1}})
+    client.post(f"/api/labs/{lab}/links",
+                json={"a": {"node": r1["id"], "port": 2}, "b": {"node": pc["id"], "port": 1}})
+    client.post(f"/api/labs/{lab}/annotations",
+                json={"kind": "rect", "x": 50, "y": 50, "w": 200, "h": 200, "text": "Site A"})
+    client.post(f"/api/labs/{lab}/annotations",
+                json={"kind": "note", "x": 0, "y": 0, "w": 10, "h": 10, "text": "Line one\nLine two"})
+    client.app.state.backups.store(r1["id"], "/system identity\nset name=R1\n")
+
+    png = b"\x89PNG fake image"
+    r = client.post(f"/api/labs/{lab}/documentation", json={"png": base64.b64encode(png).decode()})
+    assert r.status_code == 200 and "first-documentation.zip" in r.headers["content-disposition"]
+    z = zipfile.ZipFile(io.BytesIO(r.content))
+    assert sorted(z.namelist()) == ["configs/R1.txt", "first.md", "topology.png"]
+    assert z.read("topology.png") == png and b"set name=R1" in z.read("configs/R1.txt")
+    md = z.read("first.md").decode()
+    assert "![Topology](topology.png)" in md
+    assert "| R1 | Router (CHR) | 8 | 1 | 312 | 10.99.1.1 | Stopped |" in md
+    assert "| SW1 | Switch (CHR) | 24 |" in md and "| PC1 | Client | 1 | 1 | 128 | 10.0.0.2/24 | Stopped |" in md
+    assert "| R1 | ether1 | Cloud | |" in md and "| R1 | ether2 | PC1 | eth0 |" in md
+    assert "- **Site A**: R1, PC1" in md
+    assert "> Line one\n> Line two" in md
+    assert "[configs/R1.txt](configs/R1.txt)" in md and "| SW1 | not available | never backed up |" in md
+    assert client.post(f"/api/labs/{lab}/documentation", json={"png": "not base64!"}).status_code == 400
+    no_image = zipfile.ZipFile(io.BytesIO(client.post(f"/api/labs/{lab}/documentation", json={}).content))
+    assert "topology.png" not in no_image.namelist()
+
+
+def test_connectivity_test_rules(client, monkeypatch):
+    lab = make_lab(client)
+    r1 = add_node(client, lab, name="R1")
+    pc = add_node(client, lab, kind="client", name="PC1")
+    assert client.post(f"/api/labs/{lab}/nodes/{r1['id']}/test", json={"target": "10.0.0.1"}).status_code == 400
+    url = f"/api/labs/{lab}/nodes/{pc['id']}/test"
+    assert client.post(url, json={"target": "10.0.0.1"}).status_code == 409  # stopped
+    monkeypatch.setattr(client.rt, "node_running", lambda n: True)
+    assert client.post(url, json={"target": "-c 1; reboot"}).status_code == 422
+    assert client.post(url, json={"target": "--help"}).status_code == 422
+    r = client.post(url, json={"target": "192.168.20.2", "tool": "traceroute"}).json()
+    assert r["ok"] is False and r["command"].startswith("traceroute -n") and "Dry-run" in r["output"]

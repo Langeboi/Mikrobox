@@ -63,8 +63,26 @@ class _Channel:
             raise AgentError(f"guest agent connection failed ({e})")
 
 
-def run_script(socket_path: Path, script: str, timeout: float = 60) -> str:
-    """Run a RouterOS script and return its output."""
+def write_file(socket_path: Path, name: str, text: str) -> None:
+    """Create a file on the router."""
+    ch = _Channel(socket_path, timeout=10)
+    try:
+        token = random.randint(1, 2**31 - 1)
+        ch.call("guest-sync", {"id": token}, match=lambda r: r == token)
+        handle = ch.call("guest-file-open", {"path": name, "mode": "w"}).get("return")
+        if handle is None:
+            raise AgentError("the guest agent could not create the file")
+        data = text.encode()
+        for i in range(0, len(data), 32768):
+            ch.call("guest-file-write", {"handle": handle,
+                                         "buf-b64": base64.b64encode(data[i:i + 32768]).decode()})
+        ch.call("guest-file-close", {"handle": handle})
+    finally:
+        ch.close()
+
+
+def run_script(socket_path: Path, script: str, timeout: float = 60, wait: bool = True) -> str:
+    """Run a RouterOS script and return its output. wait=False for one that reboots the router."""
     ch = _Channel(socket_path, timeout=10)
     try:
         token = random.randint(1, 2**31 - 1)
@@ -74,6 +92,8 @@ def run_script(socket_path: Path, script: str, timeout: float = 60) -> str:
         pid = (started.get("return") or {}).get("pid")
         if pid is None:
             raise AgentError("the guest agent did not start the script")
+        if not wait:
+            return ""
         deadline = time.time() + timeout
         while time.time() < deadline:
             status = ch.call("guest-exec-status", {"pid": pid}).get("return") or {}

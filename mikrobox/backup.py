@@ -139,7 +139,13 @@ class Backups:
             return False
         folder = self.dir / f"n{node_id}"
         folder.mkdir(parents=True, exist_ok=True)
-        (folder / (time.strftime("%Y%m%dT%H%M%SZ", time.gmtime()) + ".rsc")).write_text(text)
+        stamp = int(time.time())
+        while True:  # never overwrite a revision saved in the same second
+            target = folder / (time.strftime("%Y%m%dT%H%M%SZ", time.gmtime(stamp)) + ".rsc")
+            if not target.exists():
+                break
+            stamp += 1
+        target.write_text(text)
         for old in self._files(node_id)[:-KEEP]:
             old.unlink(missing_ok=True)
         return True
@@ -202,6 +208,45 @@ class Backups:
             result["message"] = "; ".join(problems)
         self.status[node.id] = result
         return result
+
+    def restore(self, lab: Lab, node: Node, rev: str, replace: bool) -> dict:
+        """Load a saved revision back into the router. Saves the current config first."""
+        text = self.read(node.id, rev)
+        if not self.rt.node_running(node):
+            return {"ok": False, "message": f"Start {node.name} first."}
+        self.backup_node(lab, node)  # so this restore can itself be undone
+        s = self.settings(lab.id)
+        problems = []
+        agent = self.rt.agent_socket(node)
+        if agent.exists():
+            try:
+                qga.write_file(agent, routeros.RESTORE_FILE, text)
+                qga.run_script(agent, routeros.RESET_COMMAND if replace else routeros.MERGE_COMMAND,
+                               timeout=180, wait=not replace)
+                return {"ok": True, "via": "agent", "message": self._restored(node, replace)}
+            except qga.AgentError as e:
+                problems.append(f"guest agent: {e}")
+        if self.rt.cloud_port(lab, node) is not None:
+            host = self.rt.mgmt_ip(lab, node)
+            if host is None:
+                problems.append("its Cloud address is not known yet")
+            else:
+                try:
+                    routeros.restore_config(host, s["username"], s["password"], text, replace)
+                    return {"ok": True, "via": "ssh", "message": self._restored(node, replace)}
+                except routeros.RouterError as e:
+                    problems.append(str(e))
+        return {"ok": False, "message": "; ".join(problems) or
+                f"Stop and start {node.name} once, then it can be restored without a Cloud link"}
+
+    @staticmethod
+    def _restored(node: Node, replace: bool) -> str:
+        return (f"{node.name} is resetting and will load the revision when it comes back up."
+                if replace else f"The revision was applied on top of {node.name}'s current config.")
+
+    def latest(self, node_id: int) -> tuple[str, str] | None:
+        files = self._files(node_id)
+        return (files[-1].stem, files[-1].read_text(errors="replace")) if files else None
 
     def run(self, lab: Lab, only: int | None = None) -> list[dict]:
         nodes = [n for n in lab.nodes if n.kind == NodeKind.chr

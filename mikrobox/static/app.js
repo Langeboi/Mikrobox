@@ -145,10 +145,18 @@ async function act(fn) {
   await refresh(true);
 }
 
+const CLIENT = Math.random().toString(36).slice(2, 12) + Date.now().toString(36);
+const WHO_COLORS = ["purple", "green", "amber", "red", "blue"];
+const whoColor = (name) => WHO_COLORS[[...name].reduce((sum, ch) => sum + ch.charCodeAt(0), 0) % WHO_COLORS.length];
+
 async function refresh(force) {
-  const [labs, sys] = await Promise.all([api("GET", "/labs"), api("GET", "/system")]);
+  const beat = { client: CLIENT, lab: state.lab ? state.lab.id : null,
+    node: state.sel && state.sel.type === "node" ? state.sel.id : null };
+  const [labs, sys, pres] = await Promise.all([api("GET", "/labs"), api("GET", "/system"),
+    api("POST", "/presence", beat).catch(() => ({ others: [] }))]);
   state.labs = labs;
   state.sys = sys;
+  state.others = pres.others;
   const before = state.lab ? state.lab.id : null;
   const wanted = before ?? readStore("lab", null);
   state.lab = labs.find((l) => l.id === wanted) || labs[0] || null;
@@ -295,6 +303,11 @@ function renderTop() {
   if (state.lab) sel.value = String(state.lab.id);
   sel.hidden = !state.labs.length;
   for (const b of document.querySelectorAll("[data-needs-lab], #lab-start, #lab-stop")) b.disabled = !state.lab;
+
+  // Other people with this lab open, one badge per person.
+  const here = [...new Set((state.others || []).filter((o) => state.lab && o.lab === state.lab.id).map((o) => o.user))];
+  $("#who").replaceChildren(...here.map((name) =>
+    h("span", { class: `who c-${whoColor(name)}`, title: `${name} is in this lab`, role: "img", "aria-label": `${name} is in this lab` }, name.slice(0, 2))));
 
   const sys = state.sys;
   $("#sys").textContent = sys
@@ -479,6 +492,20 @@ function renderCanvas() {
         s("text", { class: "sub", y: 62 }, n.mgmt_ip || (n.kind === "client" && n.address) || ""),
       ),
     );
+  }
+
+  // Name tags over devices that other people have selected.
+  const watching = new Map();
+  for (const o of state.others || []) {
+    if (o.lab !== lab.id || o.node === null || !nodeById(o.node)) continue;
+    if (!watching.has(o.node)) watching.set(o.node, new Set());
+    watching.get(o.node).add(o.user);
+  }
+  for (const [id, names] of watching) {
+    const n = nodeById(id), label = [...names].join(", "), w = 14 + label.length * 6.4;
+    world.append(s("g", { class: `who-tag c-${whoColor([...names][0])}`, transform: `translate(${n.x},${n.y - 52})`, "aria-hidden": "true" },
+      s("rect", { x: -w / 2, y: -10, width: w, height: 20, rx: 10 }),
+      s("text", { y: 4 }, label)));
   }
 
   if (drag && drag.kind === "draw" && drag.moved) {
@@ -1110,16 +1137,20 @@ function dockClose(key) {
 
 function closeNodeTabs(nodeId) {
   for (const key of [...dock.keys()]) {
-    if (key === `c:${nodeId}` || key.startsWith(`p:${nodeId}:`)) dockClose(key);
+    if (key === `c:${nodeId}` || key.startsWith(`p:${nodeId}:`) || key.startsWith(`t:${nodeId}:`)) dockClose(key);
   }
+}
+
+function renderTabs() {
+  $("#tabs").replaceChildren(...[...dock].map(([key, d]) =>
+    h("div", { class: "tab" + (key === state.activeDock ? " on" : ""), title: d.tip || null },
+      h("button", { type: "button", class: "name", onclick: () => dockShow(key) }, d.name + (d.badge || "")),
+      h("button", { type: "button", "aria-label": `Close ${d.name}`, onclick: () => dockClose(key) }, "×"))));
 }
 
 function renderDock() {
   $("#dock").hidden = dock.size === 0;
-  $("#tabs").replaceChildren(...[...dock].map(([key, d]) =>
-    h("div", { class: "tab" + (key === state.activeDock ? " on" : "") },
-      h("button", { type: "button", class: "name", onclick: () => dockShow(key) }, d.name),
-      h("button", { type: "button", "aria-label": `Close ${d.name}`, onclick: () => dockClose(key) }, "×"))));
+  renderTabs();
   for (const [key, d] of dock) {
     d.pane.hidden = key !== state.activeDock;
     if (key === state.activeDock && d.onShow) requestAnimationFrame(d.onShow);
@@ -1143,7 +1174,19 @@ function openConsole(node) {
     const ws = new WebSocket(wsUrl(`${labPath()}/nodes/${node.id}/console`));
     ws.binaryType = "arraybuffer";
     ws.onopen = () => ws.send("\r");
-    ws.onmessage = (e) => term.write(typeof e.data === "string" ? e.data : new Uint8Array(e.data));
+    ws.onmessage = (e) => {
+      if (typeof e.data === "string" && e.data.charCodeAt(0) === 1) {
+        // The console is shared: the server says who else has it open.
+        const entry = dock.get(key), msg = JSON.parse(e.data.slice(1));
+        if (entry && msg.viewers) {
+          entry.badge = msg.viewers.length > 1 ? ` · ${msg.viewers.length} here` : "";
+          entry.tip = msg.viewers.length > 1 ? `Shared console: ${msg.viewers.join(", ")}` : null;
+          renderTabs();
+        }
+        return;
+      }
+      term.write(typeof e.data === "string" ? e.data : new Uint8Array(e.data));
+    };
     ws.onclose = () => term.write("\r\n[disconnected]\r\n");
     term.onData((data) => { if (ws.readyState === 1) ws.send(data); });
     dock.set(key, {
@@ -1231,6 +1274,66 @@ function openPackets(node, port) {
     $("#terms").append(pane);
     dock.set(key, { name: `${title} packets`, pane, onShow: null, close: () => { if (st.ws) { st.ws.onclose = null; st.ws.close(); } } });
     connect();
+  }
+  dockShow(key);
+}
+
+function reachDialog() {
+  const clients = state.lab.nodes.filter((n) => n.kind === "client" && n.running);
+  if (!clients.length) { toast("Start a client first. The test runs from a PC.", true); return; }
+  const known = [];
+  for (const n of state.lab.nodes) {
+    if (n.kind === "client" && n.address) known.push([n.address.split("/")[0], n.name]);
+    if (n.mgmt_ip) known.push([n.mgmt_ip, `${n.name} (Cloud)`]);
+  }
+  const sel = state.sel && state.sel.type === "node" ? clients.find((n) => n.id === state.sel.id) : null;
+  const to = h("input", { id: "m-to", type: "text", list: "m-to-list", autocomplete: "off", placeholder: "192.168.20.2" });
+  openModal("Connectivity test", [
+    { node: h("p", {}, "Runs ping, then traceroute, from a client to an address.") },
+    { key: "from", label: "From", type: "select", value: (sel || clients[0]).id,
+      options: clients.map((n) => ({ value: n.id, label: n.name + (n.address ? ` (${n.address})` : "") })) },
+    { node: h("div", { class: "field" }, h("label", { for: "m-to" }, "To (address or name)"), to,
+      h("datalist", { id: "m-to-list" }, known.map(([ip, name]) => h("option", { value: ip }, name)))) },
+  ], "Run test", async (v) => {
+    const target = to.value.trim();
+    if (!/^[A-Za-z0-9][A-Za-z0-9.:-]*$/.test(target)) throw new Error("Enter an IP address or a host name.");
+    openTest(nodeById(Number(v.from)), target);
+  });
+}
+
+function openTest(node, target) {
+  const key = `t:${node.id}:${target}`;
+  if (!dock.has(key)) {
+    const out = h("pre", { tabindex: 0 });
+    const status = h("span", { class: "pv-status" });
+    const again = h("button", { type: "button" }, "Run again");
+    const run = async () => {
+      again.disabled = true;
+      out.textContent = "";
+      const results = {};
+      for (const tool of ["ping", "traceroute"]) {
+        status.className = "pv-status";
+        status.textContent = `Running ${tool}`;
+        try {
+          const r = await api("POST", `${labPath()}/nodes/${node.id}/test`, { target, tool });
+          results[tool] = r.ok;
+          out.textContent += `$ ${r.command}\n${r.output || "(no output)"}\n\n`;
+        } catch (e) {
+          results[tool] = false;
+          out.textContent += `${tool}: ${e.message}\n\n`;
+        }
+        out.scrollTop = out.scrollHeight;
+      }
+      status.className = "pv-status " + (results.ping ? "good" : "bad");
+      status.textContent = results.ping ? `${target} answers` : `No answer from ${target}`;
+      again.disabled = false;
+    };
+    again.addEventListener("click", run);
+    const pane = h("div", { class: "pv" },
+      h("div", { class: "pv-bar" }, h("strong", {}, `${node.name} to ${target}`), again, status), out);
+    $("#terms").append(pane);
+    dock.set(key, { name: `${node.name} → ${target}`, pane, onShow: null, close: () => {} });
+    run();
   }
   dockShow(key);
 }
@@ -1397,6 +1500,23 @@ const ACTIONS = {
   "cfg-import": () => { const n = selectedRouter(); if (n) importConfig(n); },
   "cfg-identity": () => { const n = selectedRouter(); if (n) pushIdentity(n); },
   "tool-packets": () => packetDialog(),
+  "tool-test": () => reachDialog(),
+  "tool-docs": async () => {
+    toast("Building the documentation");
+    try {
+      const png = await topologyPng(2).catch(() => null);
+      const b64 = png ? await new Promise((ok, fail) => {
+        const reader = new FileReader();
+        reader.onload = () => ok(String(reader.result).split(",")[1]);
+        reader.onerror = () => fail(new Error("Could not read the topology image."));
+        reader.readAsDataURL(png);
+      }) : null;
+      const res = await apiRaw("POST", `${labPath()}/documentation`, { png: b64 });
+      saveBlob(await res.blob(), `${state.lab.name}-documentation.zip`);
+      toast("Documentation exported.");
+    } catch (e) { toast(e.message, true); }
+    refresh(true).catch(() => {});
+  },
   "bak-settings": () => backupDialog(),
   "bak-run": () => backupNow(null),
   "bak-compare": () => {
@@ -1484,13 +1604,33 @@ function revisionsDialog(nodeId) {
   pick.value = String(start.id);
   const selA = h("select", { id: "m-ra" }), selB = h("select", { id: "m-rb" });
   const summary = h("p", {}), view = h("div", { class: "diff", tabindex: 0 }), links = h("p", {});
+  const how = h("select", { id: "m-rhow", "aria-label": "How to restore" },
+    h("option", { value: "replace" }, "Replace the whole config (router restarts)"),
+    h("option", { value: "merge" }, "Apply on top of the current config"));
+  const restoreRow = h("div", { class: "restore" });
+  const restore = async (rev) => {
+    const name = nodeById(Number(pick.value)).name;
+    const what = how.value === "replace"
+      ? `${name} is reset and restarted, then loads this revision. Its current config is saved as a new revision first. User accounts and passwords are not part of a config export, so sign in as admin afterwards.`
+      : `The revision is imported on top of ${name}'s current config. Settings added since then stay.`;
+    if (!confirm(`Restore ${name} to the revision from ${revTime(rev)}?\n\n${what}`)) return;
+    try {
+      const r = await api("POST", `${base()}/${rev}/restore`, { mode: how.value });
+      toast(r.message, !r.ok);
+      if (r.ok) loadNode();
+    } catch (e) { toast(e.message, true); }
+  };
   const base = () => `${labPath()}/nodes/${pick.value}/revisions`;
 
   const showDiff = async () => {
     view.replaceChildren();
     links.replaceChildren();
+    restoreRow.replaceChildren();
     if (!selB.value) return;
     const name = nodeById(Number(pick.value)).name;
+    restoreRow.append("Restore:", how,
+      selA.value && selA.value !== selB.value && h("button", { type: "button", onclick: () => restore(selA.value) }, "Restore older"),
+      h("button", { type: "button", onclick: () => restore(selB.value) }, selA.value ? "Restore newer" : "Restore this revision"));
     links.append("Download: ",
       selA.value && h("a", { href: `/api${base()}/${selA.value}`, download: "" }, "older"), selA.value && " · ",
       h("a", { href: `/api${base()}/${selB.value}`, download: "" }, selA.value ? "newer" : "this revision"));
@@ -1514,6 +1654,7 @@ function revisionsDialog(nodeId) {
     selB.replaceChildren(...opts());
     view.replaceChildren();
     links.replaceChildren();
+    restoreRow.replaceChildren();
     if (!data.revisions.length) {
       summary.textContent = `No backups of ${data.name} yet. Use Back up now, or switch on automatic backups.`;
       return;
@@ -1531,7 +1672,7 @@ function revisionsDialog(nodeId) {
       h("div", { class: "field" }, h("label", { for: "m-rnode" }, "Router"), pick),
       h("div", { class: "field" }, h("label", { for: "m-ra" }, "Older revision"), selA),
       h("div", { class: "field" }, h("label", { for: "m-rb" }, "Newer revision"), selB)) },
-    { node: summary }, { node: view }, { node: links },
+    { node: summary }, { node: view }, { node: links }, { node: restoreRow },
   ], "", null, null, true);
   loadNode();
 }

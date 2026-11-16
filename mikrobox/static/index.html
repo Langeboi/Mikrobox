@@ -47,10 +47,14 @@
     <button type="button" class="menu-btn" aria-haspopup="true">Tools</button>
     <div class="menu-list" hidden>
       <button type="button" data-act="tool-packets" data-needs-lab>Packet view</button>
+      <button type="button" data-act="tool-test" data-needs-lab>Connectivity test</button>
+      <hr>
+      <button type="button" data-act="tool-docs" data-needs-lab>Export documentation</button>
       <button type="button" data-act="tool-png" data-needs-lab>Export topology as PNG</button>
     </div>
   </div>
   <span class="spacer"></span>
+  <span id="who" aria-label="Other people in this lab"></span>
   <span id="sys" class="chip"></span>
   <button id="lab-stop" type="button">Stop all</button>
   <button id="lab-start" type="button" class="primary">Start all</button>

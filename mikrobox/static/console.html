@@ -29,8 +29,10 @@
   );
   ws.binaryType = "arraybuffer";
   ws.onopen = () => ws.send("\r");
-  ws.onmessage = (e) =>
+  ws.onmessage = (e) => {
+    if (typeof e.data === "string" && e.data.charCodeAt(0) === 1) return; // who-is-watching notices
     term.write(typeof e.data === "string" ? e.data : new Uint8Array(e.data));
+  };
   ws.onclose = () => term.write("\r\n[disconnected]\r\n");
   term.onData((data) => ws.readyState === 1 && ws.send(data));
 </script>

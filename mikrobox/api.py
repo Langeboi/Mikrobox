@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import io
+import time
 import ipaddress
 import json
 import re
@@ -23,7 +25,8 @@ from . import __version__, routeros, templates
 from .backup import INTERVALS, Backups
 from .auth import COOKIE, SESSION_SECONDS, Auth, AuthError, AuthMiddleware
 from .config import Settings
-from .console import netns_console, serial_console
+from . import console as consoles
+from . import docs
 from .packets import parse_line
 from .models import (
     NAME_PATTERN, Annotation, Endpoint, Lab, Link, Node, NodeKind, default_chr_ram, free_id,
@@ -154,6 +157,26 @@ class BackupRun(BaseModel):
     node: Optional[int] = None  # omit for every included router
 
 
+class Restore(BaseModel):
+    mode: Literal["replace", "merge"] = "replace"
+
+
+class DocExport(BaseModel):
+    png: Optional[str] = Field(default=None, max_length=30_000_000)  # base64 topology image
+    refresh: bool = True  # take a fresh backup of running routers first
+
+
+class ReachTest(BaseModel):
+    target: str = Field(min_length=1, max_length=253, pattern=r"^[A-Za-z0-9][A-Za-z0-9.:-]*$")
+    tool: Literal["ping", "traceroute"] = "ping"
+
+
+class PresenceBeat(BaseModel):
+    client: str = Field(min_length=4, max_length=40)
+    lab: Optional[int] = None
+    node: Optional[int] = None
+
+
 class TemplateUse(BaseModel):
     name: Optional[str] = Field(default=None, pattern=NAME_PATTERN)
 
@@ -185,6 +208,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app = FastAPI(title="Mikrobox", version=__version__, lifespan=lifespan)
     app.state.rt = rt
     app.state.backups = backups
+    hubs: dict[str, consoles.Hub] = {}  # shared consoles, by "lab/node"
+    presence: dict[str, dict] = {}  # browser tab -> who, where, when
     auth = Auth(settings.data_dir, enabled=settings.auth_enabled)
     app.state.auth = auth
     app.add_middleware(AuthMiddleware, auth=auth)
@@ -333,6 +358,17 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             raise Invalid("The current password is wrong.")
         auth.set_password(me, body.new)
         return {"user": me}
+
+    @app.post("/api/presence")
+    def presence_beat(body: PresenceBeat, request: Request):
+        """Each open workspace reports in every few seconds; returns who else is around."""
+        now = time.time()
+        presence[body.client] = {"user": current_user(request) or "someone", "lab": body.lab,
+                                 "node": body.node, "ts": now}
+        for key in [k for k, v in presence.items() if now - v["ts"] > 12]:
+            del presence[key]
+        return {"others": [{"user": v["user"], "lab": v["lab"], "node": v["node"]}
+                           for k, v in presence.items() if k != body.client]}
 
     # -- system ----------------------------------------------------------
 
@@ -673,6 +709,54 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         except KeyError as e:
             raise NotFound(f"No revision {e.args[0]} for {node.name}.")
 
+    @app.post("/api/labs/{lab_id}/nodes/{node_id}/revisions/{rev}/restore")
+    def restore_revision(lab_id: int, node_id: int, rev: str, body: Restore):
+        """Load a saved revision into the router: replacing its config, or on top of it."""
+        lab = get_lab(lab_id)
+        node = get_node(lab, node_id)
+        try:
+            return backups.restore(lab, node, rev, replace=body.mode == "replace")
+        except KeyError:
+            raise NotFound(f"No revision {rev} for {node.name}.")
+
+    @app.post("/api/labs/{lab_id}/documentation")
+    def documentation(lab_id: int, body: DocExport):
+        """A zip with a Markdown description of the lab, its configs and the topology image."""
+        lab = get_lab(lab_id)
+        if body.refresh:
+            for node in lab.nodes:
+                if node.kind == NodeKind.chr and rt.node_running(node):
+                    backups.backup_node(lab, node)
+        png = None
+        if body.png:
+            try:
+                png = base64.b64decode(body.png, validate=True)
+            except ValueError:
+                raise Invalid("The topology image is not valid.")
+        data = docs.build_zip(lab, rt, backups, png)
+        return Response(data, media_type="application/zip", headers={
+            "Content-Disposition": f'attachment; filename="{lab.name}-documentation.zip"'})
+
+    @app.post("/api/labs/{lab_id}/nodes/{node_id}/test")
+    def reach_test(lab_id: int, node_id: int, body: ReachTest):
+        """Run ping or traceroute from a client."""
+        node = get_node(get_lab(lab_id), node_id)
+        if node.kind != NodeKind.client:
+            raise Invalid("Tests run from a client. Pick a PC as the source.")
+        if not rt.node_running(node):
+            raise Conflict(f"Start {node.name} first.")
+        tool = (["ping", "-c", "3", "-W", "2", body.target] if body.tool == "ping"
+                else ["traceroute", "-n", "-w", "2", "-q", "1", "-m", "15", body.target])
+        if settings.dry_run:
+            return {"ok": False, "command": " ".join(tool), "output": "Dry-run mode: nothing is running."}
+        try:
+            proc = subprocess.run(["ip", "netns", "exec", netns_name(node.id), *tool],
+                                  capture_output=True, text=True, timeout=70)
+            return {"ok": proc.returncode == 0, "command": " ".join(tool),
+                    "output": (proc.stdout + proc.stderr).strip()}
+        except subprocess.TimeoutExpired:
+            return {"ok": False, "command": " ".join(tool), "output": "Timed out after 70 seconds."}
+
     @app.get("/api/labs/{lab_id}/nodes/{node_id}/revisions/{rev}")
     def read_revision(lab_id: int, node_id: int, rev: str):
         node = get_node(get_lab(lab_id), node_id)
@@ -855,11 +939,13 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             await ws.send_text("\r\nNode is not running.\r\n")
             await ws.close()
             return
+        user = (ws.scope.get("state") or {}).get("user")
+        key = f"{lab_id}/{node_id}"
         try:
             if node.kind == NodeKind.chr:
-                await serial_console(ws, rt.serial_socket(node))
+                await consoles.join(hubs, key, lambda: consoles.SerialHub(key, hubs, rt.serial_socket(node)), ws, user)
             else:
-                await netns_console(ws, netns_name(node.id), node.name)
+                await consoles.join(hubs, key, lambda: consoles.ShellHub(key, hubs, netns_name(node.id), node.name), ws, user)
         except OSError as e:
             await ws.send_text(f"\r\nConsole unavailable: {e}\r\n")
         try:
