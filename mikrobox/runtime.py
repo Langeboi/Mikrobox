@@ -60,6 +60,10 @@ class Runtime:
     def serial_socket(self, node: Node) -> Path:
         return self._run(node, "serial")
 
+    def agent_socket(self, node: Node) -> Path:
+        """QEMU guest agent channel; present for routers started since it was added."""
+        return self._run(node, "qga")
+
     def disk_path(self, node: Node) -> Path:
         return self.s.data_dir / "disks" / f"n{node.id}.qcow2"
 
@@ -177,6 +181,10 @@ class Runtime:
             "-drive", f"file={self.disk_path(node)},if=virtio,format=qcow2",
             "-serial", f"unix:{self.serial_socket(node)},server=on,wait=off",
             "-monitor", f"unix:{self._run(node, 'monitor')},server=on,wait=off",
+            # Guest agent: lets Mikrobox read the config without any network path.
+            "-device", "virtio-serial-pci",
+            "-chardev", f"socket,id=qga0,path={self.agent_socket(node)},server=on,wait=off",
+            "-device", "virtserialport,chardev=qga0,name=org.qemu.guest_agent.0",
         ]
         for port in range(1, node.ports + 1):
             cmd += [
@@ -235,6 +243,7 @@ class Runtime:
             self.net.delete(iface)  # leftovers from a crash
             self.net.create_tap(iface)
         self.serial_socket(node).unlink(missing_ok=True)
+        self.agent_socket(node).unlink(missing_ok=True)
         try:
             self.sh.run(self.qemu_command(node))
         except CommandError:
@@ -250,7 +259,7 @@ class Runtime:
                     self.net.disconnect(iface_name(other.node, other.port))
             if node.kind == NodeKind.chr:
                 self._kill(self._run(node, "pid"))
-                for suffix in ("pid", "serial", "monitor"):
+                for suffix in ("pid", "serial", "monitor", "qga"):
                     self._run(node, suffix).unlink(missing_ok=True)
                 for port in range(1, node.ports + 1):
                     self.net.delete(iface_name(node.id, port))

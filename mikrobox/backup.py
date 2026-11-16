@@ -1,8 +1,9 @@
 """Automatic config backups and their revision history.
 
-Per lab you store one RouterOS login and an interval. A background loop runs
-/export on every included router that is running and reachable on the Cloud,
-and keeps the result as a new revision only when the config actually changed.
+A background loop runs /export on every included router that is running and
+keeps the result as a new revision only when the config actually changed. The
+config is read through the QEMU guest agent, which needs no network path or
+login; routers on the Cloud fall back to SSH with the login stored per lab.
 
 Revisions: <data>/backups/n<node id>/<UTC time>.rsc
 Settings:  <data>/backup.json (holds the RouterOS password, so it is mode 600)
@@ -20,7 +21,7 @@ import threading
 import time
 from pathlib import Path
 
-from . import routeros
+from . import qga, routeros
 from .models import Lab, Node, NodeKind
 
 log = logging.getLogger("mikrobox.backup")
@@ -162,22 +163,43 @@ class Backups:
                   "time": int(time.time()), "message": ""}
         if not self.rt.node_running(node):
             result["message"] = "Not running"
-        elif self.rt.cloud_port(lab, node) is None:
-            result["message"] = "Not linked to the Cloud"
-        else:
+            self.status[node.id] = result
+            return result
+
+        text, problems = None, []
+        # First through the hypervisor: no Cloud link and no login needed.
+        agent = self.rt.agent_socket(node)
+        if agent.exists():
+            try:
+                out = qga.run_script(agent, "/export show-sensitive;" if s["sensitive"] else "/export;")
+                if out.strip():
+                    text, result["via"] = out, "agent"
+                else:
+                    problems.append("the guest agent returned nothing")
+            except qga.AgentError as e:
+                problems.append(f"guest agent: {e}")
+        # Otherwise over SSH, for routers that are on the Cloud.
+        if text is None and self.rt.cloud_port(lab, node) is not None:
             host = self.rt.mgmt_ip(lab, node)
             if host is None:
-                result["message"] = "Address not known yet"
+                problems.append("its Cloud address is not known yet")
             else:
                 try:
-                    text = routeros.export_config(host, s["username"], s["password"], s["sensitive"])
-                    if not text.strip():
-                        result["message"] = "The router returned an empty config"
+                    out = routeros.export_config(host, s["username"], s["password"], s["sensitive"])
+                    if out.strip():
+                        text, result["via"] = out, "ssh"
                     else:
-                        result.update(ok=True, changed=self.store(node.id, text))
-                        result["message"] = "New revision saved" if result["changed"] else "No changes"
+                        problems.append("the router returned an empty config over SSH")
                 except routeros.RouterError as e:
-                    result["message"] = str(e)
+                    problems.append(str(e))
+
+        if text is not None:
+            result.update(ok=True, changed=self.store(node.id, text))
+            result["message"] = "New revision saved" if result["changed"] else "No changes"
+        elif not problems:
+            result["message"] = "Stop and start this router once, then it can be backed up without a Cloud link"
+        else:
+            result["message"] = "; ".join(problems)
         self.status[node.id] = result
         return result
 

@@ -621,7 +621,7 @@ def test_automatic_backups_and_revisions(client, monkeypatch):
     by_name = {r["name"]: r for r in results}
     assert set(by_name) == {"R1", "R2"}
     assert by_name["R1"]["ok"] and by_name["R1"]["changed"] and seen == [("10.99.1.1", "admin", "s3cret-pw")]
-    assert not by_name["R2"]["ok"] and by_name["R2"]["message"] == "Not linked to the Cloud"
+    assert not by_name["R2"]["ok"] and "Stop and start this router once" in by_name["R2"]["message"]
 
     # Same config with a new timestamp is not a new revision.
     import time as _time
@@ -666,3 +666,94 @@ def test_automatic_backups_and_revisions(client, monkeypatch):
     monkeypatch.undo()
     assert client.delete(f"{base}/nodes/{r1['id']}").status_code == 204
     assert not (client.tmp / "data" / "backups" / f"n{r1['id']}").exists()
+
+
+def _fake_agent(path, output, refuse=False):
+    """A stand-in for CHR's guest agent on a unix socket."""
+    import base64, json, socket, threading
+
+    server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    server.bind(str(path))
+    server.listen(4)
+    seen = []
+
+    def serve():
+        while True:
+            try:
+                conn, _ = server.accept()
+            except OSError:
+                return
+            f = conn.makefile("rwb")
+            polls = 0
+            for line in f:
+                msg = json.loads(line.strip().lstrip(b"\xff"))
+                cmd, args = msg["execute"], msg.get("arguments", {})
+                if cmd == "guest-sync":
+                    reply = {"return": args["id"]}
+                elif cmd == "guest-exec":
+                    seen.append(base64.b64decode(args["input-data"]).decode())
+                    reply = {"error": {"class": "CommandDisabled", "desc": "guest-exec is disabled"}} if refuse \
+                        else {"return": {"pid": 7}}
+                else:
+                    polls += 1
+                    reply = {"return": {"exited": False}} if polls < 2 else \
+                        {"return": {"exited": True, "exitcode": 0,
+                                    "out-data": base64.b64encode(output.encode()).decode()}}
+                f.write(json.dumps(reply).encode() + b"\n")
+                f.flush()
+            conn.close()
+
+    threading.Thread(target=serve, daemon=True).start()
+    return server, seen
+
+
+def test_backup_without_cloud_link_uses_the_guest_agent(client, monkeypatch):
+    from mikrobox import routeros
+
+    lab = make_lab(client)
+    leaf = add_node(client, lab, name="LEAF1")  # no link to the Cloud at all
+    node = client.rt.store.state.lab(lab).node(leaf["id"])
+    qemu = client.rt.qemu_command(node)
+    assert "virtserialport,chardev=qga0,name=org.qemu.guest_agent.0" in qemu
+    monkeypatch.setattr(client.rt, "node_running", lambda n: True)
+    monkeypatch.setattr(routeros, "export_config", lambda *a, **k: pytest.fail("SSH must not be used"))
+
+    client.rt.s.run_dir.mkdir(parents=True, exist_ok=True)
+    config = "# 2026-11-17 00:40:00 by RouterOS 7.20\n/system identity\nset name=LEAF1\n"
+    server, seen = _fake_agent(client.rt.agent_socket(node), config)
+    try:
+        r = client.post(f"/api/labs/{lab}/backup/run", json={"node": leaf["id"]}).json()["results"][0]
+        assert r["ok"] and r["changed"] and r["via"] == "agent", r
+        assert seen == ["/export;"]
+        rev = client.get(f"/api/labs/{lab}/nodes/{leaf['id']}/revisions").json()["revisions"][0]
+        assert "set name=LEAF1" in client.get(f"/api/labs/{lab}/nodes/{leaf['id']}/revisions/{rev['id']}").text
+        client.put(f"/api/labs/{lab}/backup", json={"sensitive": True})
+        client.post(f"/api/labs/{lab}/backup/run", json={"node": leaf["id"]})
+        assert seen[-1] == "/export show-sensitive;"
+    finally:
+        server.close()
+        client.rt.agent_socket(node).unlink()
+
+
+def test_backup_falls_back_to_ssh_when_the_agent_refuses(client, monkeypatch):
+    from mikrobox import routeros
+
+    lab = make_lab(client)
+    r1 = add_node(client, lab, name="R1")
+    r2 = add_node(client, lab, name="R2")
+    client.post(f"/api/labs/{lab}/links", json={"a": {"node": r1["id"], "port": 1}})
+    monkeypatch.setattr(client.rt, "node_running", lambda n: True)
+    monkeypatch.setattr(routeros, "export_config", lambda *a, **k: "/ip address\n")
+    client.rt.s.run_dir.mkdir(parents=True, exist_ok=True)
+    servers = []
+    for n in (r1, r2):
+        node = client.rt.store.state.lab(lab).node(n["id"])
+        servers.append((_fake_agent(client.rt.agent_socket(node), "", refuse=True)[0], client.rt.agent_socket(node)))
+    try:
+        results = {r["name"]: r for r in client.post(f"/api/labs/{lab}/backup/run", json={}).json()["results"]}
+        assert results["R1"]["ok"] and results["R1"]["via"] == "ssh"
+        assert not results["R2"]["ok"] and "guest-exec is disabled" in results["R2"]["message"]
+    finally:
+        for server, path in servers:
+            server.close()
+            path.unlink()

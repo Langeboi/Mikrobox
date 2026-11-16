@@ -154,6 +154,10 @@ Add `?seconds=30` for a capture that ends by itself; the workspace's Capture lin
 - Config export, import and hostname push are untested against a real router. They need
   the router running, linked to the Cloud, and its RouterOS login.
 - `cloudsetup` (bridged mode) is untested on a real VM.
+- Backups read the config through the QEMU guest agent, so routers need no Cloud link.
+  This is untested on a real CHR; if RouterOS refuses it, routers on the Cloud fall back
+  to SSH and the others report why they were skipped. Routers started before this was
+  added need one stop and start.
 - Automatic backups store the RouterOS login on the server in `backup.json` (readable by
   root only), because they run unattended.
 - A lab file carries the topology only. Export router configs separately.
