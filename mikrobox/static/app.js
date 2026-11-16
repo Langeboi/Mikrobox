@@ -32,6 +32,8 @@ const ICONS = {
   note: "M5 4h14v11l-5 5H5z M14 20v-5h5",
   gear: "M12 9a3 3 0 1 0 0 6a3 3 0 1 0 0-6 M12 2v3 M12 19v3 M2 12h3 M19 12h3 M4.9 4.9l2.1 2.1 M17 17l2.1 2.1 M4.9 19.1l2.1-2.1 M17 7l2.1-2.1",
   close: "M6 6l12 12 M18 6L6 18",
+  collapse: "M6 9l6 6 6-6",
+  expand: "M6 15l6-6 6 6",
 };
 const CLOUD = "M-34 26a20 20 0 0 1-5-39a27 27 0 0 1 51-9a23 23 0 0 1 27 48z";
 const icon = (name) => s("svg", { class: "icon", viewBox: "0 0 24 24", "aria-hidden": "true" }, s("path", { d: ICONS[name] }));
@@ -63,6 +65,7 @@ const state = {
   tool: "select",
   linkFrom: null,
   activeConsole: null,
+  collapsed: false, // details panel folded down to its title
 };
 const view = { x: 90, y: 20, k: 1 };
 const consoles = new Map(); // node id -> {term, fit, ws, pane, name}
@@ -237,12 +240,22 @@ function fitView() {
   for (const a of lab.annotations) { xs.push(a.x, a.x + a.w); ys.push(a.y, a.y + a.h); }
   const r = $("#canvas").getBoundingClientRect();
   const x0 = Math.min(...xs), x1 = Math.max(...xs), y0 = Math.min(...ys), y1 = Math.max(...ys);
-  const padL = 110, pad = 40, padR = state.sel ? 350 : 40;
-  const k = Math.min(1.5, Math.max(0.25,
-    Math.min((r.width - padL - padR) / (x1 - x0 || 1), (r.height - 2 * pad) / (y1 - y0 || 1))));
+  // Leave room for whatever floats over the canvas, wherever the layout put it.
+  const pad = { l: 30, r: 30, t: 30, b: 30 };
+  const tools = $("#tools").getBoundingClientRect();
+  if (tools.height > tools.width) pad.l = tools.right - r.left + 24;
+  else pad.t = tools.bottom - r.top + 24;
+  const insp = $("#inspector");
+  if (!insp.hidden) {
+    const ir = insp.getBoundingClientRect();
+    if (ir.width > r.width * 0.6) pad.b = ir.height + 24;
+    else pad.r = ir.width + 36;
+  }
+  const availW = Math.max(120, r.width - pad.l - pad.r), availH = Math.max(120, r.height - pad.t - pad.b);
+  const k = Math.min(1.5, Math.max(0.25, Math.min(availW / (x1 - x0 || 1), availH / (y1 - y0 || 1))));
   view.k = k;
-  view.x = padL + (r.width - padL - padR - (x1 - x0) * k) / 2 - x0 * k;
-  view.y = pad + (r.height - 2 * pad - (y1 - y0) * k) / 2 - y0 * k;
+  view.x = pad.l + (availW - (x1 - x0) * k) / 2 - x0 * k;
+  view.y = pad.t + (availH - (y1 - y0) * k) / 2 - y0 * k;
   saveView();
   renderCanvas();
 }
@@ -786,8 +799,12 @@ function captureUrl(node, port, seconds) {
 }
 
 function head(title) {
+  const fold = () => { state.collapsed = !state.collapsed; renderInspector(true); };
   return h("div", { class: "head" }, h("h3", {}, title),
-    h("button", { type: "button", class: "close", "aria-label": "Close details", onclick: () => select(null) }, icon("close")));
+    h("button", { type: "button", "aria-label": state.collapsed ? "Show details" : "Hide details",
+      title: state.collapsed ? "Show details" : "Hide details", "aria-expanded": String(!state.collapsed), onclick: fold },
+      icon(state.collapsed ? "expand" : "collapse")),
+    h("button", { type: "button", "aria-label": "Close details", title: "Close", onclick: () => select(null) }, icon("close")));
 }
 
 function renderInspector(force) {
@@ -796,6 +813,7 @@ function renderInspector(force) {
   if (!force && active && box.contains(active) && (active.tagName === "INPUT" || active.tagName === "TEXTAREA")) return;
   const lab = state.lab, sel = state.sel;
   box.hidden = !(lab && sel);
+  box.classList.toggle("collapsed", state.collapsed);
   if (box.hidden) { box.replaceChildren(); return; }
   if (sel.type === "mgmt") box.replaceChildren(...mgmtInspector());
   else if (sel.type === "link") box.replaceChildren(...linkInspector(lab.links.find((l) => l.id === sel.id)));
