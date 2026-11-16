@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import ipaddress
 from enum import Enum
-from typing import Optional
+from typing import Literal, Optional
 
 from pydantic import BaseModel, Field, field_validator
 
@@ -65,11 +65,25 @@ class Link(BaseModel):
         return [self.a] if self.b is None else [self.a, self.b]
 
 
+class Annotation(BaseModel):
+    """A drawing on the canvas: an area shape, a line of text, or a sticky note."""
+
+    id: int
+    kind: Literal["rect", "ellipse", "text", "note"]
+    x: float
+    y: float
+    w: float = Field(gt=0, le=20000)
+    h: float = Field(gt=0, le=20000)
+    text: str = Field(default="", max_length=2000)
+    color: Literal["gray", "blue", "green", "amber", "red", "purple"] = "blue"
+
+
 class Lab(BaseModel):
     id: int
     name: str = Field(pattern=NAME_PATTERN)
     nodes: list[Node] = Field(default_factory=list)
     links: list[Link] = Field(default_factory=list)
+    annotations: list[Annotation] = Field(default_factory=list)
     # Where the management network sits on the canvas.
     mgmt_x: float = 90
     mgmt_y: float = 80

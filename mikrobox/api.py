@@ -2,21 +2,23 @@
 
 from __future__ import annotations
 
+import io
 import subprocess
+import zipfile
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Optional
+from typing import Literal, Optional
 
 from fastapi import FastAPI, Query, WebSocket
-from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, ValidationError
 
-from . import __version__
+from . import __version__, routeros
 from .config import Settings
 from .console import netns_console, serial_console
 from .models import (
-    NAME_PATTERN, Endpoint, Lab, Link, Node, NodeKind, default_chr_ram, free_id,
+    NAME_PATTERN, Annotation, Endpoint, Lab, Link, Node, NodeKind, default_chr_ram, free_id,
 )
 from .runtime import Conflict, Invalid, NotFound, Runtime, iface_name, netns_name
 from .shell import CommandError
@@ -58,6 +60,48 @@ class NodeUpdate(BaseModel):
     y: Optional[float] = None
 
 
+class AnnotationCreate(BaseModel):
+    kind: Literal["rect", "ellipse", "text", "note"]
+    x: float
+    y: float
+    w: float
+    h: float
+    text: str = ""
+    color: Literal["gray", "blue", "green", "amber", "red", "purple"] = "blue"
+
+
+class AnnotationUpdate(BaseModel):
+    x: Optional[float] = None
+    y: Optional[float] = None
+    w: Optional[float] = None
+    h: Optional[float] = None
+    text: Optional[str] = None
+    color: Optional[Literal["gray", "blue", "green", "amber", "red", "purple"]] = None
+
+
+class LabImport(BaseModel):
+    format: Literal["mikrobox-lab"]
+    name: str = Field(pattern=NAME_PATTERN)
+    nodes: list[Node] = Field(default_factory=list)
+    links: list[Link] = Field(default_factory=list)
+    annotations: list[Annotation] = Field(default_factory=list)
+    mgmt_x: float = 90
+    mgmt_y: float = 80
+
+
+class Creds(BaseModel):
+    username: str = Field(default="admin", min_length=1, max_length=64)
+    password: str = Field(default="", max_length=256)
+
+
+class ConfigExport(Creds):
+    sensitive: bool = False
+
+
+class ConfigImport(Creds):
+    config: str = Field(min_length=1, max_length=2_000_000)
+
+
 class LinkCreate(BaseModel):
     a: Endpoint
     b: Optional[Endpoint] = None  # omit to plug "a" into the management bridge
@@ -76,7 +120,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app = FastAPI(title="Mikrobox", version=__version__, lifespan=lifespan)
     app.state.rt = rt
 
-    for exc, code in ((NotFound, 404), (Conflict, 409), (Invalid, 400), (CommandError, 500)):
+    for exc, code in ((NotFound, 404), (Conflict, 409), (Invalid, 400), (CommandError, 500),
+                      (routeros.RouterError, 502)):
         def handler(request, e, code=code):
             return JSONResponse({"detail": str(e)}, status_code=code)
         app.add_exception_handler(exc, handler)
@@ -128,7 +173,19 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             "mgmt_y": lab.mgmt_y,
             "nodes": [node_view(lab, n) for n in lab.nodes],
             "links": [l.model_dump(mode="json") for l in lab.links],
+            "annotations": [a.model_dump(mode="json") for a in lab.annotations],
         }
+
+    def router_host(lab: Lab, node: Node) -> str:
+        """Management address of a running router, or a clear reason why not."""
+        if node.kind != NodeKind.chr:
+            raise Invalid(f"{node.name} is not a router.")
+        if not rt.node_running(node):
+            raise Conflict(f"{node.name} is not running.")
+        ip = rt.mgmt_ip(lab, node)
+        if ip is None:
+            raise Conflict(f"{node.name} is not linked to Management, so it cannot be reached.")
+        return ip
 
     # -- system ----------------------------------------------------------
 
@@ -141,6 +198,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         return FileResponse(STATIC / "index.html")
 
     app.mount("/static", StaticFiles(directory=STATIC), name="static")
+
+    @app.get("/favicon.ico", include_in_schema=False)
+    def favicon():
+        return FileResponse(STATIC / "favicon.svg", media_type="image/svg+xml")
 
     @app.get("/console", include_in_schema=False)
     def console_page():
@@ -161,6 +222,76 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             store.state.labs.append(lab)
             store.save()
             return lab_view(lab)
+
+    @app.post("/api/labs/import", status_code=201)
+    def import_lab(body: LabImport):
+        """Recreate a lab from an export. Topology only; router disks start fresh."""
+        with rt.lock:
+            names = {l.name for l in store.state.labs}
+            name, n = body.name, 1
+            while name in names:
+                n += 1
+                name = f"{body.name}-{n}"[:63]
+            used = {x.id for x in store.state.all_nodes()}
+            idmap: dict[int, int] = {}
+            nodes = []
+            for node in body.nodes:
+                check_ports(node.kind, node.ports)
+                new = free_id(used)
+                used.add(new)
+                idmap[node.id] = new
+                nodes.append(node.model_copy(update={"id": new}))
+            lab = Lab(id=free_id({l.id for l in store.state.labs}), name=name, nodes=nodes,
+                      mgmt_x=body.mgmt_x, mgmt_y=body.mgmt_y)
+            used_links = {l.id for l in store.state.all_links()}
+            for link in body.links:
+                ends = []
+                for e in link.endpoints():
+                    if e.node not in idmap:
+                        raise Invalid(f"A link refers to node {e.node}, which is not in the file.")
+                    ep = Endpoint(node=idmap[e.node], port=e.port)
+                    rt.check_endpoint(lab, ep)
+                    ends.append(ep)
+                new = free_id(used_links)
+                used_links.add(new)
+                lab.links.append(Link(id=new, a=ends[0], b=ends[1] if len(ends) > 1 else None))
+            lab.annotations = [a.model_copy(update={"id": i + 1})
+                               for i, a in enumerate(body.annotations)]
+            store.state.labs.append(lab)
+            store.save()
+            rt.sync_dhcp()
+            return lab_view(lab)
+
+    @app.get("/api/labs/{lab_id}/export")
+    def export_lab(lab_id: int):
+        lab = get_lab(lab_id)
+        data = {"format": "mikrobox-lab", **lab.model_dump(mode="json", exclude={"id"})}
+        return JSONResponse(data, headers={
+            "Content-Disposition": f'attachment; filename="{lab.name}.mikrobox.json"'})
+
+    @app.post("/api/labs/{lab_id}/config/export")
+    def export_all_configs(lab_id: int, body: ConfigExport):
+        """Zip of /export from every running router that is on Management."""
+        lab = get_lab(lab_id)
+        buf, problems, done = io.BytesIO(), [], 0
+        with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+            for node in lab.nodes:
+                if node.kind != NodeKind.chr:
+                    continue
+                try:
+                    host = router_host(lab, node)
+                    z.writestr(f"{node.name}.rsc", routeros.export_config(
+                        host, body.username, body.password, body.sensitive))
+                    done += 1
+                except (Conflict, routeros.RouterError) as e:
+                    problems.append(f"{node.name}: {e}")
+            if problems:
+                z.writestr("SKIPPED.txt", "\n".join(problems) + "\n")
+        if not done:
+            raise Conflict("No router config could be exported. " + " ".join(problems))
+        return Response(buf.getvalue(), media_type="application/zip", headers={
+            "Content-Disposition": f'attachment; filename="{lab.name}-configs.zip"',
+            "X-Mikrobox-Skipped": str(len(problems))})
 
     @app.get("/api/labs/{lab_id}")
     def read_lab(lab_id: int):
@@ -277,6 +408,76 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         node = get_node(lab, node_id)
         rt.stop_node(lab, node)
         return node_view(lab, node)
+
+    @app.post("/api/labs/{lab_id}/nodes/{node_id}/reset")
+    def reset_node(lab_id: int, node_id: int):
+        """Throw away the router's disk so it boots with factory defaults."""
+        with rt.lock:
+            lab = get_lab(lab_id)
+            node = get_node(lab, node_id)
+            if rt.node_running(node):
+                raise Conflict(f"Stop {node.name} before resetting it.")
+            rt.delete_disk(node)
+            return node_view(lab, node)
+
+    @app.post("/api/labs/{lab_id}/nodes/{node_id}/config/export")
+    def export_config(lab_id: int, node_id: int, body: ConfigExport):
+        lab = get_lab(lab_id)
+        node = get_node(lab, node_id)
+        text = routeros.export_config(
+            router_host(lab, node), body.username, body.password, body.sensitive)
+        return PlainTextResponse(text, headers={
+            "Content-Disposition": f'attachment; filename="{node.name}.rsc"'})
+
+    @app.post("/api/labs/{lab_id}/nodes/{node_id}/config/import")
+    def import_config(lab_id: int, node_id: int, body: ConfigImport):
+        lab = get_lab(lab_id)
+        node = get_node(lab, node_id)
+        output = routeros.import_config(
+            router_host(lab, node), body.username, body.password, body.config)
+        return {"output": output}
+
+    @app.post("/api/labs/{lab_id}/nodes/{node_id}/identity")
+    def push_identity(lab_id: int, node_id: int, body: Creds):
+        """Set the router's RouterOS identity to the node's name."""
+        lab = get_lab(lab_id)
+        node = get_node(lab, node_id)
+        output = routeros.set_identity(
+            router_host(lab, node), body.username, body.password, node.name)
+        return {"output": output}
+
+    # -- annotations -----------------------------------------------------
+
+    @app.post("/api/labs/{lab_id}/annotations", status_code=201)
+    def create_annotation(lab_id: int, body: AnnotationCreate):
+        with rt.lock:
+            lab = get_lab(lab_id)
+            if len(lab.annotations) >= 500:
+                raise Conflict("This lab already has 500 shapes and notes.")
+            anno = Annotation(id=free_id({a.id for a in lab.annotations}), **body.model_dump())
+            lab.annotations.append(anno)
+            store.save()
+            return anno.model_dump(mode="json")
+
+    @app.patch("/api/labs/{lab_id}/annotations/{anno_id}")
+    def update_annotation(lab_id: int, anno_id: int, body: AnnotationUpdate):
+        with rt.lock:
+            lab = get_lab(lab_id)
+            anno = next((a for a in lab.annotations if a.id == anno_id), None)
+            if anno is None:
+                raise NotFound(f"Shape {anno_id} not found in lab {lab_id}.")
+            changes = body.model_dump(exclude_unset=True, exclude_none=True)
+            updated = Annotation.model_validate({**anno.model_dump(), **changes})
+            lab.annotations[lab.annotations.index(anno)] = updated
+            store.save()
+            return updated.model_dump(mode="json")
+
+    @app.delete("/api/labs/{lab_id}/annotations/{anno_id}", status_code=204)
+    def delete_annotation(lab_id: int, anno_id: int):
+        with rt.lock:
+            lab = get_lab(lab_id)
+            lab.annotations = [a for a in lab.annotations if a.id != anno_id]
+            store.save()
 
     # -- links -----------------------------------------------------------
 

@@ -13,7 +13,12 @@ available through the API (interactive docs at `/docs`).
 - Per router: name, number of ports (1-24), vCPUs and RAM.
 - Links between any two ports. Frames pass untouched, so STP, LACP and LLDP/MNDP work.
 - A management network (`10.99.0.0/16`) so you can SSH or WinBox to routers from your PC.
-- A browser workspace with a topology canvas, device settings and docked consoles.
+- A browser workspace with a topology canvas (pan, zoom, snap), device settings and docked consoles.
+- Areas, ellipses, text labels and sticky notes to mark sites, routing areas and tasks.
+- Lab export and import as a single JSON file (topology, shapes and notes).
+- Router config export (one router, or all as a zip), config import, hostname push and
+  factory reset, over SSH on the management network.
+- Settings: light or dark theme, grid, snapping, port labels, defaults for new routers.
 - Browser console for routers (serial port) and clients (shell), over a websocket.
 - Live packet capture of any port as a pcap stream you can pipe into Wireshark.
 - A hard cap of 128 running devices, and a free-memory check before each router starts.
@@ -99,7 +104,9 @@ Add `?seconds=30` for a capture that ends by itself; the workspace's Capture lin
 
 - **No login.** Anyone who can reach port 8080 controls the lab, and client consoles are
   root shells on the VM. Keep it on a trusted network.
-- The node name is not pushed into RouterOS as its identity yet.
+- Config export, import and hostname push are untested against a real router. They need
+  the router running, linked to Management, and its RouterOS login.
+- A lab file carries the topology only. Export router configs separately.
 - Clients share the VM's filesystem; they are namespaces, not full machines.
 - Stopping a router kills QEMU rather than shutting RouterOS down cleanly.
 - The free CHR license limits each interface to 1 Mbps upload.

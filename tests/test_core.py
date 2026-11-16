@@ -184,3 +184,93 @@ def test_running_node_can_move_but_not_change(client, monkeypatch):
     url = f"/api/labs/{lab}/nodes/{r1['id']}"
     assert client.patch(url, json={"x": 10, "y": 20}).status_code == 200
     assert client.patch(url, json={"ports": 4}).status_code == 409
+
+
+def test_annotations(client):
+    lab = make_lab(client)
+    r = client.post(f"/api/labs/{lab}/annotations",
+                    json={"kind": "rect", "x": 10, "y": 20, "w": 300, "h": 200, "text": "Area 0"})
+    assert r.status_code == 201
+    aid = r.json()["id"]
+    r = client.patch(f"/api/labs/{lab}/annotations/{aid}", json={"color": "green", "w": 400})
+    assert r.json()["color"] == "green" and r.json()["w"] == 400 and r.json()["text"] == "Area 0"
+    assert client.post(f"/api/labs/{lab}/annotations",
+                       json={"kind": "blob", "x": 0, "y": 0, "w": 1, "h": 1}).status_code == 422
+    assert len(client.get(f"/api/labs/{lab}").json()["annotations"]) == 1
+    assert client.delete(f"/api/labs/{lab}/annotations/{aid}").status_code == 204
+    assert client.get(f"/api/labs/{lab}").json()["annotations"] == []
+
+
+def test_lab_export_import_roundtrip(client):
+    lab = make_lab(client)
+    r1 = add_node(client, lab, name="R1", x=100, y=100)
+    pc = add_node(client, lab, kind="client", name="PC1", address="10.0.0.2/24")
+    client.post(f"/api/labs/{lab}/links",
+                json={"a": {"node": r1["id"], "port": 2}, "b": {"node": pc["id"], "port": 1}})
+    client.post(f"/api/labs/{lab}/links", json={"a": {"node": r1["id"], "port": 1}})
+    client.post(f"/api/labs/{lab}/annotations",
+                json={"kind": "note", "x": 0, "y": 0, "w": 100, "h": 80, "text": "hi"})
+    exported = client.get(f"/api/labs/{lab}/export")
+    assert "first.mikrobox.json" in exported.headers["content-disposition"]
+    r = client.post("/api/labs/import", json=exported.json())
+    assert r.status_code == 201, r.text
+    copy = r.json()
+    assert copy["name"] == "first-2" and copy["id"] != lab
+    assert [n["name"] for n in copy["nodes"]] == ["R1", "PC1"]
+    assert {n["id"] for n in copy["nodes"]}.isdisjoint({r1["id"], pc["id"]})
+    assert len(copy["links"]) == 2 and copy["annotations"][0]["text"] == "hi"
+    new_r1 = copy["nodes"][0]
+    assert copy["links"][0]["a"]["node"] == new_r1["id"]
+    assert new_r1["mgmt_ip"] is not None
+    bad = exported.json()
+    bad["links"][0]["a"]["node"] = 999
+    assert client.post("/api/labs/import", json=bad).status_code == 400
+
+
+def test_config_export_and_import(client, monkeypatch):
+    from mikrobox import routeros
+
+    lab = make_lab(client)
+    r1 = add_node(client, lab, name="R1")
+    url = f"/api/labs/{lab}/nodes/{r1['id']}"
+    assert client.post(url + "/config/export", json={}).status_code == 409  # stopped
+    monkeypatch.setattr(client.rt, "node_running", lambda node: True)
+    assert client.post(url + "/config/export", json={}).status_code == 409  # no management
+    client.post(f"/api/labs/{lab}/links", json={"a": {"node": r1["id"], "port": 1}})
+
+    calls = []
+    monkeypatch.setattr(routeros, "export_config",
+                        lambda host, u, p, s=False: calls.append((host, u, p, s)) or "/ip address\n")
+    monkeypatch.setattr(routeros, "import_config",
+                        lambda host, u, p, cfg: calls.append((host, cfg)) or "ok")
+    monkeypatch.setattr(routeros, "set_identity",
+                        lambda host, u, p, name: calls.append((host, name)) or "")
+    r = client.post(url + "/config/export", json={"password": "x", "sensitive": True})
+    assert r.status_code == 200 and r.text == "/ip address\n"
+    assert calls[-1] == ("10.99.1.1", "admin", "x", True)
+    assert "R1.rsc" in r.headers["content-disposition"]
+    r = client.post(url + "/config/import", json={"config": "/system identity set name=x"})
+    assert r.json() == {"output": "ok"}
+    assert client.post(url + "/identity", json={}).status_code == 200
+    assert calls[-1] == ("10.99.1.1", "R1")
+
+    add_node(client, lab, name="R2")  # not on management: skipped in the zip
+    r = client.post(f"/api/labs/{lab}/config/export", json={})
+    assert r.status_code == 200 and r.headers["x-mikrobox-skipped"] == "1"
+    import io, zipfile
+    names = zipfile.ZipFile(io.BytesIO(r.content)).namelist()
+    assert names == ["R1.rsc", "SKIPPED.txt"]
+
+    def boom(*a, **k):
+        raise routeros.RouterError("Login refused")
+    monkeypatch.setattr(routeros, "export_config", boom)
+    assert client.post(url + "/config/export", json={}).status_code == 502
+
+
+def test_factory_reset_needs_stopped_router(client, monkeypatch):
+    lab = make_lab(client)
+    r1 = add_node(client, lab, name="R1")
+    url = f"/api/labs/{lab}/nodes/{r1['id']}/reset"
+    assert client.post(url).status_code == 200
+    monkeypatch.setattr(client.rt, "node_running", lambda node: True)
+    assert client.post(url).status_code == 409

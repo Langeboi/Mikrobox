@@ -4,46 +4,66 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Mikrobox</title>
+<link rel="icon" href="/static/favicon.svg" type="image/svg+xml">
 <link rel="stylesheet" href="/static/vendor/xterm.css">
 <link rel="stylesheet" href="/static/app.css">
 </head>
 <body>
 <header id="top">
-  <div class="brand">Mikrobox</div>
+  <div class="brand">
+    <svg aria-hidden="true" width="26" height="26" viewBox="0 0 24 24"><rect width="24" height="24" rx="6" fill="var(--accent)"/><path d="M6 16V8l6 5 6-5v8" fill="none" stroke="#fff" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+    <span>Mikrobox</span>
+  </div>
   <label class="sr" for="lab-select">Lab</label>
   <select id="lab-select"></select>
-  <button id="lab-new" type="button">New lab</button>
-  <button id="lab-delete" type="button">Delete lab</button>
+  <div class="menu">
+    <button type="button" class="menu-btn" aria-haspopup="true">Lab</button>
+    <div class="menu-list" hidden>
+      <button type="button" data-act="lab-new">New lab</button>
+      <button type="button" data-act="lab-rename" data-needs-lab>Rename lab</button>
+      <hr>
+      <button type="button" data-act="lab-import">Import lab from file</button>
+      <button type="button" data-act="lab-export" data-needs-lab>Export lab to file</button>
+      <hr>
+      <button type="button" data-act="lab-delete" data-needs-lab class="danger">Delete lab</button>
+    </div>
+  </div>
+  <div class="menu">
+    <button type="button" class="menu-btn" aria-haspopup="true">Configs</button>
+    <div class="menu-list" hidden>
+      <button type="button" data-act="cfg-export" data-needs-lab>Export selected router's config</button>
+      <button type="button" data-act="cfg-export-all" data-needs-lab>Export all router configs (zip)</button>
+      <hr>
+      <button type="button" data-act="cfg-import" data-needs-lab>Import config into selected router</button>
+      <button type="button" data-act="cfg-identity" data-needs-lab>Push hostname to selected router</button>
+    </div>
+  </div>
   <span class="spacer"></span>
-  <span id="sys"></span>
+  <span id="sys" class="chip"></span>
   <button id="lab-stop" type="button">Stop all</button>
   <button id="lab-start" type="button" class="primary">Start all</button>
+  <button id="settings" type="button" class="icon-btn" aria-label="Settings" title="Settings"></button>
 </header>
 <div id="banner" hidden></div>
-<div id="body">
-  <aside id="palette" aria-label="Tools">
-    <h2>Tool</h2>
-    <div class="row">
-      <button id="tool-select" type="button" class="toggle on">Select</button>
-      <button id="tool-link" type="button" class="toggle">Link</button>
+<main>
+  <div id="stage">
+    <svg id="canvas" role="img" aria-label="Lab topology"><g id="world"></g></svg>
+    <div id="empty" hidden></div>
+    <nav id="tools" aria-label="Tools"></nav>
+    <div id="hint" role="status"></div>
+    <div id="zoom" aria-label="Zoom">
+      <button type="button" id="zoom-out" aria-label="Zoom out">−</button>
+      <button type="button" id="zoom-reset" title="Reset zoom">100%</button>
+      <button type="button" id="zoom-in" aria-label="Zoom in">+</button>
+      <button type="button" id="zoom-fit">Fit</button>
     </div>
-    <h2>Add</h2>
-    <button id="add-chr" type="button" class="add">Router <small>MikroTik CHR</small></button>
-    <button id="add-client" type="button" class="add">Client <small>Linux, ping and traceroute</small></button>
-    <p id="hint"></p>
-  </aside>
-  <main>
-    <div id="canvas-wrap">
-      <svg id="canvas" role="img" aria-label="Lab topology"></svg>
-      <div id="empty" hidden></div>
-    </div>
-    <section id="dock" hidden aria-label="Consoles">
-      <div id="tabs"></div>
-      <div id="terms"></div>
-    </section>
-  </main>
-  <aside id="inspector" aria-label="Details"></aside>
-</div>
+    <aside id="inspector" aria-label="Details" hidden></aside>
+  </div>
+  <section id="dock" hidden aria-label="Consoles">
+    <div id="tabs"></div>
+    <div id="terms"></div>
+  </section>
+</main>
 <div id="modal" hidden>
   <form id="modal-box">
     <h2 id="modal-title"></h2>

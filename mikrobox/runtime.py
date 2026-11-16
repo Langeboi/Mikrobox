@@ -9,6 +9,7 @@ import threading
 import time
 from pathlib import Path
 
+from . import __version__
 from .config import Settings
 from .models import Endpoint, Lab, Link, Node, NodeKind
 from .network import Net, pid_alive
@@ -89,6 +90,7 @@ class Runtime:
 
     def system_info(self) -> dict:
         return {
+            "version": __version__,
             "max_devices": self.s.max_devices,
             "running_devices": self.running_count(),
             "kvm": self.kvm_available(),
@@ -97,7 +99,15 @@ class Runtime:
             "mgmt_network": self.s.mgmt_net,
             "mgmt_host_ip": self.s.mgmt_host_ip,
             "dry_run": self.s.dry_run,
+            "chr_version": self._chr_version(),
+            "max_chr_ports": self.s.max_chr_ports,
         }
+
+    def _chr_version(self) -> str | None:
+        try:
+            return (self.s.base_image.parent / "chr.version").read_text().strip() or None
+        except OSError:
+            return None
 
     # -- host setup ------------------------------------------------------
 
