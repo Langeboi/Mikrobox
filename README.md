@@ -20,6 +20,9 @@ available through the API (interactive docs at `/docs`).
 - Lab export and import as a single JSON file (topology, shapes and notes).
 - Router config export (one router, or all as a zip), config import, hostname push and
   factory reset, over SSH on the management network.
+- Templates: ready-made layouts for multi-area OSPF, a collapsed core, spine and leaf, an
+  ISP with MPLS, and BGP multihoming. Topology and a suggested plan, not router configs.
+- Clients take an optional DNS server setting next to address and gateway.
 - A live packet view in the browser (Tools menu, or Packets on any running port), with
   capture filters, alongside pcap download for Wireshark.
 - Topology export as a PNG image, device duplication, double-click to open a console.

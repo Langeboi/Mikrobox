@@ -18,7 +18,7 @@ from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse, Res
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, ValidationError
 
-from . import __version__, routeros
+from . import __version__, routeros, templates
 from .config import Settings
 from .console import netns_console, serial_console
 from .packets import parse_line
@@ -51,6 +51,7 @@ class NodeCreate(BaseModel):
     ram_mb: Optional[int] = Field(default=None, ge=128, le=16384)
     address: Optional[str] = None
     gateway: Optional[str] = None
+    dns: Optional[str] = None
     x: float = 0
     y: float = 0
 
@@ -62,6 +63,7 @@ class NodeUpdate(BaseModel):
     ram_mb: Optional[int] = Field(default=None, ge=128, le=16384)
     address: Optional[str] = None
     gateway: Optional[str] = None
+    dns: Optional[str] = None
     x: Optional[float] = None
     y: Optional[float] = None
 
@@ -120,6 +122,10 @@ class ConfigExport(Creds):
 
 class ConfigImport(Creds):
     config: str = Field(min_length=1, max_length=2_000_000)
+
+
+class TemplateUse(BaseModel):
+    name: Optional[str] = Field(default=None, pattern=NAME_PATTERN)
 
 
 class NodeDuplicate(BaseModel):
@@ -296,6 +302,18 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             rt.sync_dhcp()
             return lab_view(lab)
 
+    @app.get("/api/templates")
+    def list_templates():
+        return templates.describe()
+
+    @app.post("/api/templates/{template_id}", status_code=201)
+    def use_template(template_id: str, body: TemplateUse):
+        """Create a new lab from a ready-made layout."""
+        if template_id not in templates.TEMPLATES:
+            raise NotFound(f"No template called {template_id}.")
+        data = templates.TEMPLATES[template_id][2]().data(body.name or template_id)
+        return import_lab(LabImport.model_validate(data))
+
     @app.get("/api/labs/{lab_id}/export")
     def export_lab(lab_id: int):
         lab = get_lab(lab_id)
@@ -379,13 +397,13 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 raise Invalid("Only a CHR can be a switch.")
             ports = body.ports or ((24 if body.role == "switch" else 8) if is_chr else 1)
             check_ports(body.kind, ports)
-            if is_chr and (body.address or body.gateway):
-                raise Invalid("address and gateway apply to client nodes only.")
+            if is_chr and (body.address or body.gateway or body.dns):
+                raise Invalid("address, gateway and dns apply to client nodes only.")
             ram = body.ram_mb or (default_chr_ram(body.cpus, ports) if is_chr else 128)
             node = Node(
                 id=free_id({n.id for n in store.state.all_nodes()}),
                 kind=body.kind, role=body.role, name=body.name, ports=ports, cpus=body.cpus,
-                ram_mb=ram, address=body.address, gateway=body.gateway,
+                ram_mb=ram, address=body.address, gateway=body.gateway, dns=body.dns,
                 x=body.x, y=body.y,
             )
             lab.nodes.append(node)

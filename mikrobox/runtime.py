@@ -214,6 +214,7 @@ class Runtime:
                     [iface_name(node.id, p) for p in range(1, node.ports + 1)],
                     node.address,
                     node.gateway,
+                    node.dns,
                 )
             for link in lab.links:
                 if link.touches(node.id):

@@ -19,6 +19,7 @@ import ipaddress
 import json
 import os
 import re
+import shutil
 import signal
 from pathlib import Path
 
@@ -112,9 +113,21 @@ class Net:
             self.sh.run(["ip", "link", "del", iface], check=False)
 
     def create_client(
-        self, ns: str, ifaces: list[str], address: str | None, gateway: str | None
+        self, ns: str, ifaces: list[str], address: str | None, gateway: str | None,
+        dns: str | None = None,
     ) -> None:
         self.sh.run(["ip", "netns", "add", ns])
+        # `ip netns exec` shows this file to the client as its /etc/resolv.conf.
+        conf = self.s.netns_etc / ns
+        try:
+            if dns:
+                conf.mkdir(parents=True, exist_ok=True)
+                (conf / "resolv.conf").write_text(
+                    "".join(f"nameserver {server}\n" for server in dns.split(", ")))
+            else:
+                shutil.rmtree(conf, ignore_errors=True)
+        except OSError:
+            pass
         self.sh.run(["ip", "-n", ns, "link", "set", "lo", "up"])
         for i, host_if in enumerate(ifaces):
             self.sh.run(
@@ -131,6 +144,7 @@ class Net:
 
     def delete_client(self, ns: str) -> None:
         self.sh.run(["ip", "netns", "del", ns], check=False)
+        shutil.rmtree(self.s.netns_etc / ns, ignore_errors=True)
 
     def client_addr(self, ns: str, port: int, cidr: str) -> None:
         self.sh.run(

@@ -71,7 +71,7 @@ input:disabled { background: var(--surface-2); color: var(--muted); }
 .brand { display: flex; align-items: center; gap: 8px; font-weight: 650; font-size: 16px; margin-right: 6px; }
 #top select { width: auto; max-width: 220px; font-weight: 600; }
 .menu { position: relative; }
-.menu-btn { border-color: transparent; background: none; }
+.menu-btn, .plain-btn { border-color: transparent; background: none; }
 .menu-btn::after { content: ""; display: inline-block; margin-left: 6px; border: 4px solid transparent; border-top-color: currentColor; transform: translateY(2px); }
 .menu-btn[aria-expanded="true"] { background: var(--accent-soft); color: var(--accent-fg); }
 .menu-list {
@@ -213,6 +213,9 @@ pre.out { max-height: 180px; overflow: auto; background: var(--surface-2); paddi
 #modal-box { width: 420px; max-width: 100%; max-height: 100%; overflow: auto; background: var(--surface); border-radius: 14px; padding: 20px; box-shadow: var(--shadow); }
 #modal-title { font-size: 17px; letter-spacing: 0; color: var(--text); margin-bottom: 14px; }
 #modal-fields h2 { margin-top: 14px; }
+.tpl { padding: 10px 12px; background: var(--surface-2); border-radius: 8px; margin-bottom: 10px; font-size: 13px; }
+.tpl p { margin: 0 0 6px; }
+.tpl .warn { color: var(--danger); }
 #modal-error { color: var(--danger); min-height: 1.2em; margin: 4px 0 8px; font-size: 13px; }
 #toast { position: fixed; z-index: 30; left: 50%; bottom: 20px; transform: translateX(-50%); background: #17212f; color: #fff; padding: 10px 16px; border-radius: 10px; max-width: 90vw; box-shadow: var(--shadow); }
 #toast.error { background: #b42318; }

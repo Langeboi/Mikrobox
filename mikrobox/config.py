@@ -27,6 +27,7 @@ class Settings:
 
     sys_net: Path = Path("/sys/class/net")
     netns_dir: Path = Path("/run/netns")
+    netns_etc: Path = Path("/etc/netns")  # per-client resolv.conf lives here
     kvm_device: Path = Path("/dev/kvm")
     qemu_binary: str = "qemu-system-x86_64"
 

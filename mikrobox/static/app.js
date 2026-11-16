@@ -24,9 +24,9 @@ const s = (tag, attrs, ...kids) => make(SVGNS, tag, attrs, kids);
 const ICONS = {
   select: "M5 3l14 7-6 2-2 6z",
   link: "M9 15l6-6 M10 6l1-1a4 4 0 0 1 6 6l-1 1 M14 18l-1 1a4 4 0 0 1-6-6l1-1",
-  chr: "M3 12a9 9 0 1 0 18 0a9 9 0 1 0-18 0 M7 12h10 M12 7v10 M7 12l2-2 M7 12l2 2 M17 12l-2-2 M17 12l-2 2 M12 7l-2 2 M12 7l2 2 M12 17l-2-2 M12 17l2-2",
+  chr: "M2 12a10 10 0 1 0 20 0a10 10 0 1 0-20 0 M6 12h12 M12 6v12 M6 12l2.6-2.6 M6 12l2.6 2.6 M18 12l-2.6-2.6 M18 12l-2.6 2.6 M12 6l-2.6 2.6 M12 6l2.6 2.6 M12 18l-2.6-2.6 M12 18l2.6-2.6",
   client: "M4 5h16v11H4z M9 20h6 M12 16v4",
-  switch: "M3 7h18v10H3z M6.5 10.5h7 M11.5 8.5l2 2-2 2 M17.5 13.5h-7 M12.5 11.5l-2 2 2 2",
+  switch: "M3 8.5h18 M17 5l4 3.5-4 3.5 M21 15.5H3 M7 12l-4 3.5 4 3.5",
   rect: "M4 6h16v12H4z",
   ellipse: "M3 12a9 6.5 0 1 0 18 0a9 6.5 0 1 0-18 0",
   text: "M5 6h14 M12 6v13 M9 19h6",
@@ -273,6 +273,13 @@ function point(e) {
 // ------------------------------------------------------------- render
 
 function render(force) {
+  if (state.fitNext) {
+    state.fitNext = false;
+    renderTop();
+    fitView(); // a new lab opens framed, whatever the window size
+    renderInspector(force);
+    return;
+  }
   renderTop();
   renderCanvas();
   renderInspector(force);
@@ -462,7 +469,7 @@ function renderCanvas() {
       s("g", { class: cls(ref, n.running ? " running" : ""), transform: `translate(${n.x},${n.y})`, ...handlers(ref) },
         s("title", {}, `${n.name} (${n.running ? "running" : "stopped"})`),
         s("rect", { class: "box", x: -30, y: -30, width: 60, height: 60, rx: 14 }),
-        s("path", { class: "glyph", d: ICONS[n.role === "switch" ? "switch" : n.kind], transform: "translate(-15.6,-15.6) scale(1.3)" }),
+        s("path", { class: "glyph", d: ICONS[n.role === "switch" ? "switch" : n.kind], transform: "translate(-19.2,-19.2) scale(1.6)", "vector-effect": "non-scaling-stroke" }),
         s("circle", { class: "dot", cx: 26, cy: -26, r: 6.5 }),
         s("text", { y: 48 }, n.name),
         s("text", { class: "sub", y: 62 }, n.mgmt_ip || (n.kind === "client" && n.address) || ""),
@@ -714,12 +721,13 @@ function addNodeDialog(kind) {
         { key: "name", label: "Hostname", value: nextName("PC") },
         { key: "address", label: "IP address (optional)", placeholder: "192.168.10.2/24" },
         { key: "gateway", label: "Gateway (optional)", placeholder: "192.168.10.1" },
+        { key: "dns", label: "DNS servers (optional)", placeholder: "1.1.1.1, 9.9.9.9" },
       ];
   openModal(isSwitch ? "Add switch" : kind === "chr" ? "Add router" : "Add client", fields.filter(Boolean), "Add", async (v) => {
     const body = { kind: isSwitch ? "chr" : kind, name: v.name, ...at };
     if (isSwitch) body.role = "switch";
     for (const k of ["ports", "cpus", "ram_mb"]) if (v[k]) body[k] = Number(v[k]);
-    for (const k of ["address", "gateway"]) if (v[k]) body[k] = v[k];
+    for (const k of ["address", "gateway", "dns"]) if (v[k]) body[k] = v[k];
     const node = await api("POST", `${labPath()}/nodes`, body);
     state.sel = { type: "node", id: node.id };
   });
@@ -1004,7 +1012,8 @@ function nodeInspector(n) {
             field("cpus", "vCPUs", "number", { min: 1, max: 8 }),
             field("ram_mb", "RAM (MB)", "number", { min: 128 }))
         : [field("address", "IP address", "text", { placeholder: "192.168.10.2/24" }),
-           field("gateway", "Gateway", "text", { placeholder: "192.168.10.1" })],
+           field("gateway", "Gateway", "text", { placeholder: "192.168.10.1" }),
+           field("dns", "DNS servers", "text", { placeholder: "1.1.1.1, 9.9.9.9" })],
       n.running
         ? h("p", {}, "Stop the device to change its settings.")
         : h("button", { type: "button", onclick: save }, "Save changes")),
@@ -1406,6 +1415,36 @@ for (const m of document.querySelectorAll(".menu")) {
   });
 }
 document.addEventListener("click", closeMenus);
+
+$("#templates").addEventListener("click", async () => {
+  let list;
+  try { list = await api("GET", "/templates"); } catch (e) { toast(e.message, true); return; }
+  const free = state.sys ? state.sys.mem_available_mb : null;
+  const pick = h("select", { id: "m-template" }, list.map((t) => h("option", { value: t.id }, t.title)));
+  const name = h("input", { id: "m-tname", type: "text", autocomplete: "off" });
+  const info = h("div", { class: "tpl" });
+  const show = () => {
+    const t = list.find((x) => x.id === pick.value);
+    name.value = t.id;
+    info.replaceChildren(
+      h("p", {}, t.summary),
+      h("p", {}, `${t.routers} routers and switches, ${t.devices - t.routers} clients. Needs about ${(t.ram_mb / 1024).toFixed(1)} GB of memory when everything is running.`),
+      free !== null && t.ram_mb > free && h("p", { class: "warn" }, `This server has ${(free / 1024).toFixed(1)} GB free, so not all of it can run at once.`));
+  };
+  pick.addEventListener("change", show);
+  show();
+  openModal("New lab from a template", [
+    { node: h("div", { class: "field" }, h("label", { for: "m-template" }, "Template"), pick) },
+    { node: info },
+    { node: h("div", { class: "field" }, h("label", { for: "m-tname" }, "Lab name"), name) },
+    { node: h("p", {}, "You get the devices, cabling, areas and a note with a suggested plan. Routers start unconfigured, with ether1 left free for the Cloud.") },
+  ], "Create lab", async () => {
+    const lab = await api("POST", `/templates/${pick.value}`, { name: name.value.trim() || null });
+    switchLab(lab);
+    state.fitNext = true;
+    toast(`Created ${lab.name}.`);
+  });
+});
 
 $("#lab-select").addEventListener("change", (e) => {
   const lab = state.labs.find((l) => l.id === Number(e.target.value));

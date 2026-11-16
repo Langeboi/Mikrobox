@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ipaddress
+import re
 from enum import Enum
 from typing import Literal, Optional
 
@@ -28,6 +29,7 @@ class Node(BaseModel):
     # Clients only: applied to eth0 when the client starts.
     address: Optional[str] = None
     gateway: Optional[str] = None
+    dns: Optional[str] = None  # one to three resolver addresses, comma separated
     # Position on the topology canvas.
     x: float = 0
     y: float = 0
@@ -40,6 +42,16 @@ class Node(BaseModel):
             if "/" not in v:
                 raise ValueError("address needs a prefix length, e.g. 192.168.10.2/24")
         return v
+
+    @field_validator("dns")
+    @classmethod
+    def _check_dns(cls, v: Optional[str]) -> Optional[str]:
+        if v is None or not v.strip():
+            return None
+        servers = [str(ipaddress.ip_address(part)) for part in re.split(r"[,\s]+", v.strip()) if part]
+        if len(servers) > 3:
+            raise ValueError("at most three DNS servers")
+        return ", ".join(servers)
 
     @field_validator("gateway")
     @classmethod

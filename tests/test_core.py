@@ -17,6 +17,7 @@ def client(tmp_path: Path):
         dry_run=True,
         sys_net=tmp_path / "sysnet",
         netns_dir=tmp_path / "netns",
+        netns_etc=tmp_path / "etcns",
         kvm_device=tmp_path / "kvm",
     )
     (tmp_path / "sysnet").mkdir()
@@ -478,3 +479,53 @@ def test_switch_is_a_chr_with_24_ports(client):
     assert sum(1 for arg in qemu if arg.startswith("virtio-net-pci")) == 24
     dup = client.post(f"/api/labs/{lab}/nodes/{sw['id']}/duplicate", json={"name": "SW2"}).json()
     assert dup["role"] == "switch" and dup["ports"] == 24
+
+
+def test_client_dns(client):
+    lab = make_lab(client)
+    pc = add_node(client, lab, kind="client", name="PC1", address="10.0.0.2/24",
+                  gateway="10.0.0.1", dns="1.1.1.1 9.9.9.9")
+    assert pc["dns"] == "1.1.1.1, 9.9.9.9"
+    assert client.post(f"/api/labs/{lab}/nodes",
+                       json={"kind": "client", "name": "PC2", "dns": "example.com"}).status_code == 400
+    assert client.post(f"/api/labs/{lab}/nodes", json={"name": "R1", "dns": "1.1.1.1"}).status_code == 400
+    assert client.post(f"/api/labs/{lab}/nodes/{pc['id']}/start").status_code == 200
+    conf = client.tmp / "etcns" / f"mbc{pc['id']}" / "resolv.conf"
+    assert conf.read_text() == "nameserver 1.1.1.1\nnameserver 9.9.9.9\n"
+    r = client.patch(f"/api/labs/{lab}/nodes/{pc['id']}", json={"dns": None})
+    assert r.json()["dns"] is None
+    client.post(f"/api/labs/{lab}/nodes/{pc['id']}/stop")
+    assert not conf.exists()
+
+
+def test_templates_build_valid_labs(client):
+    listed = client.get("/api/templates").json()
+    assert [t["id"] for t in listed] == ["ospf-multi-area", "collapsed-core", "spine-leaf",
+                                          "isp-mpls", "bgp-multihoming"]
+    for t in listed:
+        r = client.post(f"/api/templates/{t['id']}", json={})
+        assert r.status_code == 201, r.text
+        lab = r.json()
+        assert lab["name"] == t["id"] and len(lab["nodes"]) == t["devices"]
+        names = [n["name"] for n in lab["nodes"]]
+        assert len(set(names)) == len(names)
+        ports = {n["id"]: n["ports"] for n in lab["nodes"]}
+        seen = set()
+        for link in lab["links"]:
+            for end in (link["a"], link["b"]):
+                if end:
+                    assert 1 <= end["port"] <= ports[end["node"]]
+                    assert (end["node"], end["port"]) not in seen
+                    seen.add((end["node"], end["port"]))
+        # ether1 is kept for the Cloud on every router.
+        chr_ids = {n["id"] for n in lab["nodes"] if n["kind"] == "chr"}
+        assert not any(l["b"] and e["node"] in chr_ids and e["port"] == 1
+                       for l in lab["links"] for e in (l["a"], l["b"]))
+        assert lab["annotations"] and any(a["kind"] == "note" for a in lab["annotations"])
+    # Using one twice gives a second lab with a new name.
+    assert client.post("/api/templates/spine-leaf", json={}).json()["name"] == "spine-leaf-2"
+    assert client.post("/api/templates/spine-leaf", json={"name": "dc1"}).json()["name"] == "dc1"
+    assert client.post("/api/templates/nope", json={}).status_code == 404
+    core = next(l for l in client.get("/api/labs").json() if l["name"] == "collapsed-core")
+    assert sum(1 for n in core["nodes"] if n["role"] == "switch") == 3
+    assert any(l["b"] is None for l in core["links"])
