@@ -162,3 +162,25 @@ def test_delete_node_removes_its_links(client):
     assert client.delete(f"/api/labs/{lab}/nodes/{r2['id']}").status_code == 204
     view = client.get(f"/api/labs/{lab}").json()
     assert view["links"] == [] and len(view["nodes"]) == 1
+
+
+def test_ui_is_served_and_positions_are_saved(client):
+    assert "Mikrobox" in client.get("/").text
+    assert client.get("/static/app.js").status_code == 200
+    assert client.get("/static/vendor/xterm.js").status_code == 200
+    lab = make_lab(client)
+    r1 = add_node(client, lab, name="R1", x=300, y=200)
+    assert (r1["x"], r1["y"]) == (300, 200)
+    r = client.patch(f"/api/labs/{lab}/nodes/{r1['id']}", json={"x": 420.0, "y": 110.0})
+    assert r.status_code == 200 and r.json()["x"] == 420
+    r = client.patch(f"/api/labs/{lab}", json={"mgmt_x": 150, "name": "renamed"})
+    assert r.json()["mgmt_x"] == 150 and r.json()["name"] == "renamed"
+
+
+def test_running_node_can_move_but_not_change(client, monkeypatch):
+    lab = make_lab(client)
+    r1 = add_node(client, lab, name="R1")
+    monkeypatch.setattr(client.rt, "node_running", lambda node: True)
+    url = f"/api/labs/{lab}/nodes/{r1['id']}"
+    assert client.patch(url, json={"x": 10, "y": 20}).status_code == 200
+    assert client.patch(url, json={"ports": 4}).status_code == 409

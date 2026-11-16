@@ -68,11 +68,12 @@ KillMode=process
 WantedBy=multi-user.target
 EOF
 systemctl daemon-reload
-systemctl enable --now mikrobox.service
+systemctl enable mikrobox.service
+systemctl restart mikrobox.service  # running routers survive the restart
 
 IP="$(hostname -I | awk '{print $1}')"
 echo
-echo "Mikrobox is running:  http://$IP:8080/docs"
+echo "Mikrobox is running:  http://$IP:8080/"
 echo "To reach routers from your PC, add a route to the management network:"
 echo "  Windows:  route add 10.99.0.0 mask 255.255.0.0 $IP"
 echo "  Linux:    sudo ip route add 10.99.0.0/16 via $IP"

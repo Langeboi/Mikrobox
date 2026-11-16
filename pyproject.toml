@@ -23,7 +23,7 @@ mikrobox = "mikrobox.__main__:main"
 packages = ["mikrobox"]
 
 [tool.setuptools.package-data]
-mikrobox = ["static/*"]
+mikrobox = ["static/*", "static/vendor/*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

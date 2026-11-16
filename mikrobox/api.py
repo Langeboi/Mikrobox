@@ -7,8 +7,9 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Optional
 
-from fastapi import FastAPI, WebSocket
+from fastapi import FastAPI, Query, WebSocket
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, ValidationError
 
 from . import __version__
@@ -28,6 +29,12 @@ class LabCreate(BaseModel):
     name: str = Field(pattern=NAME_PATTERN)
 
 
+class LabUpdate(BaseModel):
+    name: Optional[str] = Field(default=None, pattern=NAME_PATTERN)
+    mgmt_x: Optional[float] = None
+    mgmt_y: Optional[float] = None
+
+
 class NodeCreate(BaseModel):
     kind: NodeKind = NodeKind.chr
     name: str = Field(pattern=NAME_PATTERN)
@@ -36,6 +43,8 @@ class NodeCreate(BaseModel):
     ram_mb: Optional[int] = Field(default=None, ge=128, le=16384)
     address: Optional[str] = None
     gateway: Optional[str] = None
+    x: float = 0
+    y: float = 0
 
 
 class NodeUpdate(BaseModel):
@@ -45,6 +54,8 @@ class NodeUpdate(BaseModel):
     ram_mb: Optional[int] = Field(default=None, ge=128, le=16384)
     address: Optional[str] = None
     gateway: Optional[str] = None
+    x: Optional[float] = None
+    y: Optional[float] = None
 
 
 class LinkCreate(BaseModel):
@@ -113,6 +124,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         return {
             "id": lab.id,
             "name": lab.name,
+            "mgmt_x": lab.mgmt_x,
+            "mgmt_y": lab.mgmt_y,
             "nodes": [node_view(lab, n) for n in lab.nodes],
             "links": [l.model_dump(mode="json") for l in lab.links],
         }
@@ -122,6 +135,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     @app.get("/api/system")
     def system():
         return rt.system_info()
+
+    @app.get("/", include_in_schema=False)
+    def index_page():
+        return FileResponse(STATIC / "index.html")
+
+    app.mount("/static", StaticFiles(directory=STATIC), name="static")
 
     @app.get("/console", include_in_schema=False)
     def console_page():
@@ -146,6 +165,19 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     @app.get("/api/labs/{lab_id}")
     def read_lab(lab_id: int):
         return lab_view(get_lab(lab_id))
+
+    @app.patch("/api/labs/{lab_id}")
+    def update_lab(lab_id: int, body: LabUpdate):
+        with rt.lock:
+            lab = get_lab(lab_id)
+            changes = body.model_dump(exclude_unset=True, exclude_none=True)
+            name = changes.get("name")
+            if name and any(l.name == name and l.id != lab.id for l in store.state.labs):
+                raise Conflict(f"A lab named {name} already exists.")
+            for key, value in changes.items():
+                setattr(lab, key, value)
+            store.save()
+            return lab_view(lab)
 
     @app.delete("/api/labs/{lab_id}", status_code=204)
     def delete_lab(lab_id: int):
@@ -187,6 +219,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 id=free_id({n.id for n in store.state.all_nodes()}),
                 kind=body.kind, name=body.name, ports=ports, cpus=body.cpus,
                 ram_mb=ram, address=body.address, gateway=body.gateway,
+                x=body.x, y=body.y,
             )
             lab.nodes.append(node)
             store.save()
@@ -197,9 +230,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         with rt.lock:
             lab = get_lab(lab_id)
             node = get_node(lab, node_id)
-            if rt.node_running(node):
-                raise Conflict(f"Stop {node.name} before changing it.")
             changes = body.model_dump(exclude_unset=True)
+            for key in ("x", "y", "name", "ports", "cpus", "ram_mb"):
+                if changes.get(key, 0) is None:
+                    del changes[key]
+            if rt.node_running(node) and set(changes) - {"x", "y"}:
+                raise Conflict(f"Stop {node.name} before changing it.")
             if "name" in changes:
                 check_name(lab, changes["name"], skip=node.id)
             if "ports" in changes:
@@ -277,16 +313,22 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     # -- capture ---------------------------------------------------------
 
     @app.get("/api/labs/{lab_id}/nodes/{node_id}/ports/{port}/capture")
-    def capture(lab_id: int, node_id: int, port: int):
-        """Live pcap stream. Pipe it into Wireshark: curl -sN URL | wireshark -k -i -"""
+    def capture(
+        lab_id: int, node_id: int, port: int,
+        seconds: Optional[int] = Query(default=None, ge=1, le=3600),
+    ):
+        """Pcap stream. Live: curl -sN URL | wireshark -k -i -   Timed file: add ?seconds=30"""
         node = get_node(get_lab(lab_id), node_id)
         iface = iface_name(node.id, port)
         if port < 1 or port > node.ports or not rt.net.exists(iface):
             raise Conflict(f"{node.name} port {port} is not up. Start the node first.")
 
         def stream():
+            cmd = ["tcpdump", "-U", "-n", "-i", iface, "-w", "-"]
+            if seconds:
+                cmd = ["timeout", str(seconds)] + cmd
             proc = subprocess.Popen(
-                ["tcpdump", "-U", "-n", "-i", iface, "-w", "-"],
+                cmd,
                 stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
             )
             try:

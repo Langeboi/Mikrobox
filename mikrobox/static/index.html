@@ -1,0 +1,63 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Mikrobox</title>
+<link rel="stylesheet" href="/static/vendor/xterm.css">
+<link rel="stylesheet" href="/static/app.css">
+</head>
+<body>
+<header id="top">
+  <div class="brand">Mikrobox</div>
+  <label class="sr" for="lab-select">Lab</label>
+  <select id="lab-select"></select>
+  <button id="lab-new" type="button">New lab</button>
+  <button id="lab-delete" type="button">Delete lab</button>
+  <span class="spacer"></span>
+  <span id="sys"></span>
+  <button id="lab-stop" type="button">Stop all</button>
+  <button id="lab-start" type="button" class="primary">Start all</button>
+</header>
+<div id="banner" hidden></div>
+<div id="body">
+  <aside id="palette" aria-label="Tools">
+    <h2>Tool</h2>
+    <div class="row">
+      <button id="tool-select" type="button" class="toggle on">Select</button>
+      <button id="tool-link" type="button" class="toggle">Link</button>
+    </div>
+    <h2>Add</h2>
+    <button id="add-chr" type="button" class="add">Router <small>MikroTik CHR</small></button>
+    <button id="add-client" type="button" class="add">Client <small>Linux, ping and traceroute</small></button>
+    <p id="hint"></p>
+  </aside>
+  <main>
+    <div id="canvas-wrap">
+      <svg id="canvas" role="img" aria-label="Lab topology"></svg>
+      <div id="empty" hidden></div>
+    </div>
+    <section id="dock" hidden aria-label="Consoles">
+      <div id="tabs"></div>
+      <div id="terms"></div>
+    </section>
+  </main>
+  <aside id="inspector" aria-label="Details"></aside>
+</div>
+<div id="modal" hidden>
+  <form id="modal-box">
+    <h2 id="modal-title"></h2>
+    <div id="modal-fields"></div>
+    <p id="modal-error" role="alert"></p>
+    <div class="row end">
+      <button type="button" id="modal-cancel">Cancel</button>
+      <button type="submit" class="primary" id="modal-ok">OK</button>
+    </div>
+  </form>
+</div>
+<div id="toast" role="status" hidden></div>
+<script src="/static/vendor/xterm.js"></script>
+<script src="/static/vendor/xterm-addon-fit.js"></script>
+<script src="/static/app.js"></script>
+</body>
+</html>

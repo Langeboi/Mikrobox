@@ -26,6 +26,9 @@ class Node(BaseModel):
     # Clients only: applied to eth0 when the client starts.
     address: Optional[str] = None
     gateway: Optional[str] = None
+    # Position on the topology canvas.
+    x: float = 0
+    y: float = 0
 
     @field_validator("address")
     @classmethod
@@ -67,6 +70,9 @@ class Lab(BaseModel):
     name: str = Field(pattern=NAME_PATTERN)
     nodes: list[Node] = Field(default_factory=list)
     links: list[Link] = Field(default_factory=list)
+    # Where the management network sits on the canvas.
+    mgmt_x: float = 90
+    mgmt_y: float = 80
 
     def node(self, node_id: int) -> Optional[Node]:
         return next((n for n in self.nodes if n.id == node_id), None)

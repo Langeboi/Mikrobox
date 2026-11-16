@@ -3,8 +3,9 @@
 A virtual lab for MikroTik CHR routers, run on a Linux VM and driven from the browser.
 Think GNS3 or EVE-NG, but only for RouterOS, with the CHR image installed for you.
 
-This is the backend groundwork (v0.1). The topology UI comes later; for now you drive it
-through the API (interactive docs at `/docs`) and a simple console test page.
+Open `http://<vm-ip>:8080/` for the lab workspace: add routers and clients, drag them
+around, link ports, start and stop devices, and open consoles. The same things are
+available through the API (interactive docs at `/docs`).
 
 ## What works in this version
 
@@ -12,6 +13,7 @@ through the API (interactive docs at `/docs`) and a simple console test page.
 - Per router: name, number of ports (1-24), vCPUs and RAM.
 - Links between any two ports. Frames pass untouched, so STP, LACP and LLDP/MNDP work.
 - A management network (`10.99.0.0/16`) so you can SSH or WinBox to routers from your PC.
+- A browser workspace with a topology canvas, device settings and docked consoles.
 - Browser console for routers (serial port) and clients (shell), over a websocket.
 - Live packet capture of any port as a pcap stream you can pipe into Wireshark.
 - A hard cap of 128 running devices, and a free-memory check before each router starts.
@@ -34,6 +36,8 @@ The installer downloads the current stable CHR image from MikroTik. Pin a versio
 `sudo CHR_VERSION=7.x.y ./scripts/install.sh`, or put a raw CHR image at
 `/var/lib/mikrobox/images/chr.img` yourself.
 
+To update later: `git pull && sudo ./scripts/install.sh`. Running routers keep running.
+
 ## First lab
 
 ```bash
@@ -54,7 +58,7 @@ curl -s -X POST $API/labs/1/start
 curl -s $API/labs/1
 ```
 
-Then open `http://<vm-ip>:8080/console?lab=1&node=1` for R1's console.
+Then open `http://<vm-ip>:8080/` to see the lab, or build the same thing there by hand.
 
 ## Reaching routers from your PC
 
@@ -76,6 +80,8 @@ routing tables stay clean.
 ```bash
 curl -sN http://<vm-ip>:8080/api/labs/1/nodes/1/ports/2/capture | wireshark -k -i -
 ```
+
+Add `?seconds=30` for a capture that ends by itself; the workspace's Capture links use that.
 
 ## How it fits together
 

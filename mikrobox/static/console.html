@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <title>Mikrobox console</title>
-<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/xterm@5.3.0/css/xterm.css">
+<link rel="stylesheet" href="/static/vendor/xterm.css">
 <style>
   html, body { height: 100%; margin: 0; background: #111; }
   #term { height: 100%; padding: 8px; box-sizing: border-box; }
@@ -11,8 +11,8 @@
 </head>
 <body>
 <div id="term"></div>
-<script src="https://cdn.jsdelivr.net/npm/xterm@5.3.0/lib/xterm.js"></script>
-<script src="https://cdn.jsdelivr.net/npm/xterm-addon-fit@0.8.0/lib/xterm-addon-fit.js"></script>
+<script src="/static/vendor/xterm.js"></script>
+<script src="/static/vendor/xterm-addon-fit.js"></script>
 <script>
   // Temporary test page until the real UI exists. Usage: /console?lab=1&node=1
   const q = new URLSearchParams(location.search);
