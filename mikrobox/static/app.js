@@ -51,6 +51,11 @@ const TOOLS = [
 const DRAW = { rect: [260, 180], ellipse: [260, 180], text: [180, 36], note: [200, 120] };
 const KIND_NAME = { rect: "Area", ellipse: "Ellipse", text: "Text", note: "Note" };
 const COLORS = ["gray", "blue", "green", "amber", "red", "purple"];
+const FILL = { light: 9, medium: 20, strong: 36 };
+const FONT = {
+  s: { area: 11, text: 13, note: 11 }, m: { area: 13, text: 16, note: 13 },
+  l: { area: 17, text: 22, note: 16 }, xl: { area: 24, text: 32, note: 20 },
+};
 
 const state = {
   labs: [], lab: null, sys: null,
@@ -300,17 +305,41 @@ function annoElement(a, selected) {
     onpointerdown: (e) => annoDown(e, a),
     onkeydown: (e) => { if (e.key === "Enter") select({ type: "anno", id: a.id }); },
   }, s("title", {}, `${KIND_NAME[a.kind]}${a.text ? ": " + a.text : ""}`));
-  if (a.kind === "ellipse") {
-    g.append(s("ellipse", { class: "shape", cx: a.x + a.w / 2, cy: a.y + a.h / 2, rx: a.w / 2, ry: a.h / 2 }));
-  } else {
-    g.append(s("rect", { class: "shape", x: a.x, y: a.y, width: a.w, height: a.h, rx: a.kind === "note" ? 8 : 12 }));
-  }
   const area = a.kind === "rect" || a.kind === "ellipse";
-  if (a.text || !area) {
-    const fo = area
-      ? s("foreignObject", { x: a.kind === "ellipse" ? a.x + a.w * 0.15 : a.x, y: a.kind === "ellipse" ? a.y + a.h * 0.12 : a.y, width: a.kind === "ellipse" ? a.w * 0.7 : a.w, height: 32 })
-      : s("foreignObject", { x: a.x, y: a.y, width: a.w, height: a.h });
-    fo.append(h("div", { class: area ? "label" : "body", style: a.kind === "ellipse" ? "text-align:center" : null },
+  // Only areas take the fill and border options; the defaults come from the stylesheet.
+  let look = null;
+  if (area) {
+    const parts = [];
+    if (a.fill !== "light") parts.push(`fill:${a.fill === "none" ? "transparent" : `color-mix(in srgb, var(--c) ${FILL[a.fill]}%, transparent)`}`);
+    if (a.border === "none") parts.push("stroke:none");
+    else {
+      if (a.border !== "dashed") parts.push(`stroke-dasharray:${a.border === "solid" ? "none" : `0.1 ${a.border_width * 3.5}`}`, "stroke-linecap:round");
+      if (a.border_width !== 1.5) parts.push(`stroke-width:${a.border_width}`);
+    }
+    look = parts.join(";") || null;
+  }
+  if (a.kind === "ellipse") {
+    g.append(s("ellipse", { class: "shape", style: look, cx: a.x + a.w / 2, cy: a.y + a.h / 2, rx: a.w / 2, ry: a.h / 2 }));
+  } else {
+    g.append(s("rect", { class: "shape", style: look, x: a.x, y: a.y, width: a.w, height: a.h,
+      rx: a.kind === "note" ? 8 : a.kind === "rect" ? Math.min(a.radius, a.w / 2, a.h / 2) : 12 }));
+  }
+  const size = FONT[a.label_size] || FONT.m;
+  if (area && a.text) {
+    const round = a.kind === "ellipse";
+    const pos = a.label_pos === "auto" ? (round ? "top" : "top-left") : a.label_pos;
+    const boxH = size.area + 20;
+    const inset = round ? a.h * 0.12 : 0;
+    const y = pos.startsWith("top") ? a.y + inset
+      : pos === "center" ? a.y + a.h / 2 - boxH / 2
+      : a.y + a.h - boxH - inset;
+    const narrow = round && pos !== "center";
+    const fo = s("foreignObject", { x: narrow ? a.x + a.w * 0.15 : a.x, y, width: narrow ? a.w * 0.7 : a.w, height: boxH });
+    fo.append(h("div", { class: "label", style: `font-size:${size.area}px;text-align:${pos.endsWith("left") ? "left" : "center"}` }, a.text));
+    g.append(fo);
+  } else if (!area) {
+    const fo = s("foreignObject", { x: a.x, y: a.y, width: a.w, height: a.h });
+    fo.append(h("div", { class: "body", style: a.label_size !== "m" ? `font-size:${a.kind === "text" ? size.text : size.note}px` : null },
       a.text || (a.kind === "text" ? "Text" : "Note")));
     g.append(fo);
   }
@@ -439,11 +468,24 @@ function drawBox() {
   };
 }
 
+let lastDown = { id: null, t: 0 };
+
 function nodeDown(e, ref) {
   if (DRAW[state.tool]) return; // let the canvas start drawing
   e.preventDefault();
   e.stopPropagation();
   if (state.tool === "link") { linkClick(ref); return; }
+  // Double click on a device opens its console. Tracked by hand because the
+  // canvas is redrawn on the first click, which swallows the native event.
+  const now = Date.now();
+  if (ref.type === "node" && lastDown.id === ref.id && now - lastDown.t < 450) {
+    lastDown = { id: null, t: 0 };
+    const n = nodeById(ref.id);
+    if (n.running) openConsole(n);
+    else toast(`Start ${n.name} to open its console.`);
+    return;
+  }
+  lastDown = { id: ref.type === "node" ? ref.id : null, t: now };
   const p = point(e);
   const at = ref.type === "mgmt" ? { x: state.lab.mgmt_x, y: state.lab.mgmt_y } : nodeById(ref.id);
   drag = { kind: ref.type, id: ref.id, dx: p.x - at.x, dy: p.y - at.y, moved: false };
@@ -685,7 +727,7 @@ function exportConfig(n) {
     { key: "sensitive", label: "Include passwords and keys", type: "checkbox", value: false },
   ], "Export", async (v) => {
     const res = await apiRaw("POST", `${labPath()}/nodes/${n.id}/config/export`, { ...creds(v), sensitive: v.sensitive });
-    saveBlob(await res.blob(), `${n.name}.rsc`);
+    saveBlob(await res.blob(), `${n.name}.txt`);
   });
 }
 
@@ -705,12 +747,12 @@ function exportAllConfigs() {
 function importConfig(n) {
   const out = h("pre", { class: "out", hidden: true });
   openModal(`Import a config into ${n.name}`, [
-    { node: h("p", {}, "Uploads a .rsc file and runs /import on the router. It is applied on top of the current config.") },
-    { key: "file", label: "Config file (.rsc)", type: "file", accept: ".rsc,.txt" },
+    { node: h("p", {}, "Uploads an exported config (.txt or .rsc) and runs /import on the router. It is applied on top of the current config.") },
+    { key: "file", label: "Config file (.txt or .rsc)", type: "file", accept: ".txt,.rsc" },
     ...credFields(n),
     { node: out },
   ], "Import", async (v) => {
-    if (!v.file) throw new Error("Choose a .rsc file first.");
+    if (!v.file) throw new Error("Choose a config file first.");
     const config = await v.file.text();
     const res = await api("POST", `${labPath()}/nodes/${n.id}/config/import`, { ...creds(v), config });
     out.hidden = false;
@@ -814,6 +856,18 @@ function linkInspector(link) {
   ];
 }
 
+function styleSelect(a, key, label, options) {
+  const id = "i-" + key;
+  const numeric = typeof options[0][0] === "number";
+  const sel = h("select", { id, onchange: (e) => act(() => api("PATCH", `${labPath()}/annotations/${a.id}`,
+    { [key]: numeric ? Number(e.target.value) : e.target.value })) },
+    options.map(([value, text]) => h("option", { value }, text)));
+  // A value set through the API that is not in the list is still shown.
+  if (!options.some(([value]) => value === a[key])) sel.append(h("option", { value: a[key] }, String(a[key])));
+  sel.value = String(a[key]);
+  return h("div", { class: "field" }, h("label", { for: id }, label), sel);
+}
+
 function annoInspector(a) {
   const path = `${labPath()}/annotations/${a.id}`;
   const area = a.kind === "rect" || a.kind === "ellipse";
@@ -828,6 +882,13 @@ function annoInspector(a) {
         h("button", { type: "button", class: `c-${c}` + (a.color === c ? " on" : ""), "aria-label": c, title: c,
           "aria-pressed": String(a.color === c),
           onclick: () => act(() => api("PATCH", path, { color: c })) })))),
+    h("section", {}, h("h2", {}, area ? "Style" : "Size"),
+      area && styleSelect(a, "fill", "Fill", [["none", "None"], ["light", "Light"], ["medium", "Medium"], ["strong", "Strong"]]),
+      area && styleSelect(a, "border", "Border", [["dashed", "Dashed"], ["solid", "Solid"], ["dotted", "Dotted"], ["none", "None"]]),
+      area && styleSelect(a, "border_width", "Border thickness", [[1, "Thin"], [1.5, "Normal"], [3, "Thick"], [5, "Heavy"]]),
+      a.kind === "rect" && styleSelect(a, "radius", "Corners", [[0, "Square"], [12, "Rounded"], [28, "Very round"]]),
+      area && styleSelect(a, "label_pos", "Label position", [["auto", "Default"], ["top-left", "Top left"], ["top", "Top centre"], ["center", "Centre"], ["bottom-left", "Bottom left"], ["bottom", "Bottom centre"]]),
+      styleSelect(a, "label_size", area ? "Label size" : "Text size", [["s", "Small"], ["m", "Normal"], ["l", "Large"], ["xl", "Extra large"]])),
     h("p", {}, "Drag it to move. Drag the corner handle to resize."),
     h("section", {},
       h("button", { type: "button", class: "danger", onclick: () => deleteSelected() }, `Delete ${KIND_NAME[a.kind].toLowerCase()}`)),

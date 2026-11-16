@@ -248,7 +248,7 @@ def test_config_export_and_import(client, monkeypatch):
     r = client.post(url + "/config/export", json={"password": "x", "sensitive": True})
     assert r.status_code == 200 and r.text == "/ip address\n"
     assert calls[-1] == ("10.99.1.1", "admin", "x", True)
-    assert "R1.rsc" in r.headers["content-disposition"]
+    assert "R1.txt" in r.headers["content-disposition"]
     r = client.post(url + "/config/import", json={"config": "/system identity set name=x"})
     assert r.json() == {"output": "ok"}
     assert client.post(url + "/identity", json={}).status_code == 200
@@ -259,7 +259,7 @@ def test_config_export_and_import(client, monkeypatch):
     assert r.status_code == 200 and r.headers["x-mikrobox-skipped"] == "1"
     import io, zipfile
     names = zipfile.ZipFile(io.BytesIO(r.content)).namelist()
-    assert names == ["R1.rsc", "SKIPPED.txt"]
+    assert names == ["R1.txt", "SKIPPED.txt"]
 
     def boom(*a, **k):
         raise routeros.RouterError("Login refused")
@@ -368,3 +368,19 @@ def test_cloudsetup_rewrites_netplan():
     assert br["addresses"] == ["10.0.0.5/24"] and br["routes"][0]["via"] == "10.0.0.1"
     assert "dhcp-identifier" not in br
     assert rewrite_netplan({"network": {"ethernets": {"eth1": {}}}}, "eth0", "aa:aa:aa:aa:aa:aa") is None
+
+
+def test_area_style_defaults_and_changes(client):
+    lab = make_lab(client)
+    a = client.post(f"/api/labs/{lab}/annotations",
+                    json={"kind": "rect", "x": 0, "y": 0, "w": 200, "h": 100}).json()
+    assert (a["fill"], a["border"], a["border_width"], a["radius"], a["label_pos"], a["label_size"]) \
+        == ("light", "dashed", 1.5, 12, "auto", "m")
+    r = client.patch(f"/api/labs/{lab}/annotations/{a['id']}",
+                     json={"fill": "strong", "border": "solid", "border_width": 3, "radius": 0,
+                           "label_pos": "center", "label_size": "l"})
+    assert r.status_code == 200 and r.json()["fill"] == "strong" and r.json()["radius"] == 0
+    assert client.patch(f"/api/labs/{lab}/annotations/{a['id']}",
+                        json={"border": "wavy"}).status_code == 422
+    assert client.patch(f"/api/labs/{lab}/annotations/{a['id']}",
+                        json={"border_width": 50}).status_code == 400

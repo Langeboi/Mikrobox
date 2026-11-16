@@ -69,6 +69,12 @@ class AnnotationCreate(BaseModel):
     h: float
     text: str = ""
     color: Literal["gray", "blue", "green", "amber", "red", "purple"] = "blue"
+    fill: Literal["none", "light", "medium", "strong"] = "light"
+    border: Literal["dashed", "solid", "dotted", "none"] = "dashed"
+    border_width: float = 1.5
+    radius: float = 12
+    label_pos: Literal["auto", "top-left", "top", "center", "bottom-left", "bottom"] = "auto"
+    label_size: Literal["s", "m", "l", "xl"] = "m"
 
 
 class AnnotationUpdate(BaseModel):
@@ -78,6 +84,12 @@ class AnnotationUpdate(BaseModel):
     h: Optional[float] = None
     text: Optional[str] = None
     color: Optional[Literal["gray", "blue", "green", "amber", "red", "purple"]] = None
+    fill: Optional[Literal["none", "light", "medium", "strong"]] = None
+    border: Optional[Literal["dashed", "solid", "dotted", "none"]] = None
+    border_width: Optional[float] = None
+    radius: Optional[float] = None
+    label_pos: Optional[Literal["auto", "top-left", "top", "center", "bottom-left", "bottom"]] = None
+    label_size: Optional[Literal["s", "m", "l", "xl"]] = None
 
 
 class LabImport(BaseModel):
@@ -292,7 +304,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     continue
                 try:
                     host = router_host(lab, node)  # per-router: the override does not apply
-                    z.writestr(f"{node.name}.rsc", routeros.export_config(
+                    z.writestr(f"{node.name}.txt", routeros.export_config(
                         host, body.username, body.password, body.sensitive))
                     done += 1
                 except (Conflict, routeros.RouterError) as e:
@@ -439,7 +451,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         text = routeros.export_config(
             router_host(lab, node, body.host), body.username, body.password, body.sensitive)
         return PlainTextResponse(text, headers={
-            "Content-Disposition": f'attachment; filename="{node.name}.rsc"'})
+            "Content-Disposition": f'attachment; filename="{node.name}.txt"'})
 
     @app.post("/api/labs/{lab_id}/nodes/{node_id}/config/import")
     def import_config(lab_id: int, node_id: int, body: ConfigImport):

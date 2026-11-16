@@ -76,6 +76,13 @@ class Annotation(BaseModel):
     h: float = Field(gt=0, le=20000)
     text: str = Field(default="", max_length=2000)
     color: Literal["gray", "blue", "green", "amber", "red", "purple"] = "blue"
+    # Look of the shape. The defaults are the original appearance.
+    fill: Literal["none", "light", "medium", "strong"] = "light"
+    border: Literal["dashed", "solid", "dotted", "none"] = "dashed"
+    border_width: float = Field(default=1.5, ge=0.5, le=8)
+    radius: float = Field(default=12, ge=0, le=80)
+    label_pos: Literal["auto", "top-left", "top", "center", "bottom-left", "bottom"] = "auto"
+    label_size: Literal["s", "m", "l", "xl"] = "m"
 
 
 class Lab(BaseModel):
