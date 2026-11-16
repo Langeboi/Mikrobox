@@ -1,0 +1,44 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Sign in to Mikrobox</title>
+<link rel="icon" href="/static/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/static/app.css">
+<style>
+  body { align-items: center; justify-content: center; padding: 16px; }
+  #card { width: 380px; max-width: 100%; background: var(--surface); border: 1px solid var(--line); border-radius: 14px; box-shadow: var(--shadow); padding: 28px; }
+  #card .brand { font-size: 20px; margin-bottom: 18px; }
+  #card h1 { font-size: 18px; margin: 0 0 4px; }
+  #card p { color: var(--muted); margin: 0 0 16px; font-size: 13px; }
+  #card button { width: 100%; margin-top: 6px; }
+  #error { color: var(--danger); min-height: 1.3em; margin: 6px 0 0; }
+</style>
+</head>
+<body>
+<form id="card" hidden>
+  <div class="brand">
+    <svg aria-hidden="true" width="30" height="30" viewBox="0 0 24 24"><rect width="24" height="24" rx="6" fill="var(--accent)"/><path d="M6 16V8l6 5 6-5v8" fill="none" stroke="#fff" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+    <span>Mikrobox</span>
+  </div>
+  <h1 id="title">Sign in</h1>
+  <p id="lead"></p>
+  <div class="field">
+    <label for="username">Username</label>
+    <input id="username" name="username" type="text" autocomplete="username" autocapitalize="none" spellcheck="false" required>
+  </div>
+  <div class="field">
+    <label for="password">Password</label>
+    <input id="password" name="password" type="password" autocomplete="current-password" required>
+  </div>
+  <div class="field" id="again-field" hidden>
+    <label for="again">Password again</label>
+    <input id="again" name="again" type="password" autocomplete="new-password">
+  </div>
+  <button type="submit" class="primary" id="go">Sign in</button>
+  <p id="error" role="alert"></p>
+</form>
+<script src="/static/login.js"></script>
+</body>
+</html>

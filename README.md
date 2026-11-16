@@ -51,11 +51,26 @@ The installer downloads the current stable CHR image from MikroTik. Pin a versio
 
 To update later: `git pull && sudo ./scripts/install.sh`. Running routers keep running.
 
+## Accounts
+
+The first visit asks you to create an account; after that the workspace and the API need
+a sign-in. More accounts are added from the menu with your username at the top right.
+Scripts use HTTP Basic auth, e.g. `curl -u yourname http://<vm-ip>:8080/api/labs`.
+
+Locked out? Reset a password on the VM, then restart the service:
+
+```bash
+sudo /opt/mikrobox/venv/bin/python -m mikrobox.auth passwd <username>
+sudo systemctl restart mikrobox
+```
+
+Set `MIKROBOX_AUTH=off` in the service's environment to switch accounts off entirely.
+
 ## First lab
 
 ```bash
 API=http://<vm-ip>:8080/api
-J='-H content-type:application/json'
+J='-u yourname:yourpassword -H content-type:application/json'
 
 curl -s $J $API/labs -d '{"name":"first"}'                                   # lab 1
 curl -s $J $API/labs/1/nodes -d '{"name":"R1","ports":4}'                    # node 1
@@ -67,8 +82,8 @@ curl -s $J $API/labs/1/links -d '{"a":{"node":2,"port":1}}'                     
 curl -s $J $API/labs/1/links -d '{"a":{"node":1,"port":2},"b":{"node":2,"port":2}}'   # R1 ether2 <-> R2 ether2
 curl -s $J $API/labs/1/links -d '{"a":{"node":1,"port":3},"b":{"node":3,"port":1}}'   # R1 ether3 <-> PC1
 
-curl -s -X POST $API/labs/1/start
-curl -s $API/labs/1
+curl -s $J -X POST $API/labs/1/start
+curl -s $J $API/labs/1
 ```
 
 Then open `http://<vm-ip>:8080/` to see the lab, or build the same thing there by hand.
@@ -112,7 +127,7 @@ hypervisor console at hand anyway. Notes:
 ## Packet capture
 
 ```bash
-curl -sN http://<vm-ip>:8080/api/labs/1/nodes/1/ports/2/capture | wireshark -k -i -
+curl -sN -u yourname http://<vm-ip>:8080/api/labs/1/nodes/1/ports/2/capture | wireshark -k -i -
 ```
 
 Add `?seconds=30` for a capture that ends by itself; the workspace's Capture links use that.
@@ -131,8 +146,9 @@ Add `?seconds=30` for a capture that ends by itself; the workspace's Capture lin
 
 ## Known gaps
 
-- **No login.** Anyone who can reach port 8080 controls the lab, and client consoles are
-  root shells on the VM. Keep it on a trusted network.
+- Sign-in is by username and password over plain HTTP, so keep the server on a network
+  you trust. Anyone with an account controls every lab, and client consoles are root
+  shells on the VM.
 - Config export, import and hostname push are untested against a real router. They need
   the router running, linked to the Cloud, and its RouterOS login.
 - `cloudsetup` (bridged mode) is untested on a real VM.
@@ -146,7 +162,7 @@ Add `?seconds=30` for a capture that ends by itself; the workspace's Capture lin
 ```bash
 pip install -e '.[dev]'
 pytest
-MIKROBOX_DRY_RUN=1 MIKROBOX_DATA=/tmp/mb MIKROBOX_RUN=/tmp/mbrun python -m mikrobox
+MIKROBOX_DRY_RUN=1 MIKROBOX_AUTH=off MIKROBOX_DATA=/tmp/mb MIKROBOX_RUN=/tmp/mbrun python -m mikrobox
 ```
 
 Dry-run mode logs host commands instead of running them, so the API works on any machine.

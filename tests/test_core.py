@@ -26,6 +26,8 @@ def client(tmp_path: Path):
     with TestClient(app) as c:
         c.rt = app.state.rt
         c.tmp = tmp_path
+        assert c.post("/api/auth/setup", json={"username": "tester", "password": "correct-horse"}).status_code == 200
+        c.rt.sh.history[:] = [cmd for cmd in c.rt.sh.history]
         yield c
 
 
@@ -288,7 +290,7 @@ def test_cloud_nat_mode_reports_private_network(client):
 def test_cloud_bridged_mode(tmp_path):
     settings = Settings(data_dir=tmp_path / "d", run_dir=tmp_path / "r", dry_run=True,
                         sys_net=tmp_path / "sys", netns_dir=tmp_path / "ns",
-                        kvm_device=tmp_path / "kvm", cloud_mode="bridged")
+                        kvm_device=tmp_path / "kvm", cloud_mode="bridged", auth_enabled=False)
     (tmp_path / "sys").mkdir()
     app = create_app(settings)
     with TestClient(app) as c:
@@ -529,3 +531,60 @@ def test_templates_build_valid_labs(client):
     core = next(l for l in client.get("/api/labs").json() if l["name"] == "collapsed-core")
     assert sum(1 for n in core["nodes"] if n["role"] == "switch") == 3
     assert any(l["b"] is None for l in core["links"])
+
+
+def test_everything_needs_an_account(client):
+    anon = TestClient(client.app)
+    assert anon.get("/api/labs").status_code == 401
+    assert anon.get("/api/system").status_code == 401
+    assert anon.post("/api/labs", json={"name": "x"}).status_code == 401
+    assert anon.get("/static/app.js").status_code == 200
+    assert anon.get("/login").status_code == 200
+    r = anon.get("/", follow_redirects=False)
+    assert r.status_code == 302 and r.headers["location"] == "/login"
+    assert anon.get("/docs", follow_redirects=False).status_code == 302
+    from starlette.websockets import WebSocketDisconnect
+    with pytest.raises(WebSocketDisconnect):
+        with anon.websocket_connect("/api/labs/1/nodes/1/console"):
+            pass
+    assert anon.get("/api/auth/status").json() == {"enabled": True, "setup_needed": False, "user": None}
+
+
+def test_login_logout_and_accounts(client):
+    assert client.get("/api/auth/status").json()["user"] == "tester"
+    # The first-account route closes once an account exists.
+    assert client.post("/api/auth/setup", json={"username": "eve", "password": "long-enough"}).status_code == 409
+
+    anon = TestClient(client.app)
+    assert anon.post("/api/auth/login", json={"username": "tester", "password": "nope"}).status_code == 401
+    assert anon.post("/api/auth/login", json={"username": "ghost", "password": "correct-horse"}).status_code == 401
+    r = anon.post("/api/auth/login", json={"username": "TESTER", "password": "correct-horse"})
+    assert r.status_code == 200 and "httponly" in r.headers["set-cookie"].lower()
+    assert anon.get("/api/labs").status_code == 200
+    assert anon.post("/api/auth/logout").status_code == 200
+    assert anon.get("/api/labs").status_code == 401
+
+    assert client.post("/api/users", json={"username": "anna", "password": "short"}).status_code == 400
+    assert client.post("/api/users", json={"username": "bad name", "password": "long-enough"}).status_code == 400
+    assert client.post("/api/users", json={"username": "anna", "password": "long-enough"}).status_code == 201
+    assert client.post("/api/users", json={"username": "Anna", "password": "long-enough"}).status_code == 400
+    assert client.get("/api/users").json() == {"users": ["anna", "tester"], "me": "tester"}
+    assert client.delete("/api/users/tester").status_code == 409
+    assert client.delete("/api/users/anna").status_code == 204
+
+    assert client.post("/api/account/password", json={"current": "wrong", "new": "another-one"}).status_code == 400
+    assert client.post("/api/account/password", json={"current": "correct-horse", "new": "another-one"}).status_code == 200
+    assert anon.post("/api/auth/login", json={"username": "tester", "password": "another-one"}).status_code == 200
+    # Passwords are not stored in the clear.
+    stored = (client.tmp / "data" / "users.json").read_text()
+    assert "another-one" not in stored and "correct-horse" not in stored
+
+
+def test_basic_auth_for_scripts_and_throttling(client):
+    anon = TestClient(client.app)
+    assert anon.get("/api/labs", auth=("tester", "correct-horse")).status_code == 200
+    assert anon.get("/api/labs", auth=("tester", "wrong")).status_code == 401
+    for _ in range(8):
+        anon.post("/api/auth/login", json={"username": "tester", "password": "wrong"})
+    r = anon.post("/api/auth/login", json={"username": "tester", "password": "correct-horse"})
+    assert r.status_code == 400 and "Too many" in r.json()["detail"]

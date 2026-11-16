@@ -13,12 +13,13 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Literal, Optional
 
-from fastapi import FastAPI, Query, WebSocket
+from fastapi import FastAPI, Query, Request, WebSocket
 from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, ValidationError
 
 from . import __version__, routeros, templates
+from .auth import COOKIE, SESSION_SECONDS, Auth, AuthError, AuthMiddleware
 from .config import Settings
 from .console import netns_console, serial_console
 from .packets import parse_line
@@ -124,6 +125,16 @@ class ConfigImport(Creds):
     config: str = Field(min_length=1, max_length=2_000_000)
 
 
+class Login(BaseModel):
+    username: str = Field(max_length=64)
+    password: str = Field(max_length=256)
+
+
+class PasswordChange(BaseModel):
+    current: str = Field(max_length=256)
+    new: str = Field(max_length=256)
+
+
 class TemplateUse(BaseModel):
     name: Optional[str] = Field(default=None, pattern=NAME_PATTERN)
 
@@ -150,8 +161,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     app = FastAPI(title="Mikrobox", version=__version__, lifespan=lifespan)
     app.state.rt = rt
+    auth = Auth(settings.data_dir, enabled=settings.auth_enabled)
+    app.state.auth = auth
+    app.add_middleware(AuthMiddleware, auth=auth)
 
-    for exc, code in ((NotFound, 404), (Conflict, 409), (Invalid, 400), (CommandError, 500),
+    for exc, code in ((NotFound, 404), (Conflict, 409), (Invalid, 400), (CommandError, 500), (AuthError, 400),
                       (routeros.RouterError, 502)):
         def handler(request, e, code=code):
             return JSONResponse({"detail": str(e)}, status_code=code)
@@ -226,6 +240,73 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             raise Conflict(f"{node.name}'s address is not known yet. Enter it, or check the "
                            "router's console with /ip address print.")
         return ip
+
+    # -- accounts --------------------------------------------------------
+
+    def signed_in(response: JSONResponse, name: str) -> JSONResponse:
+        response.set_cookie(COOKIE, auth.new_session(name), max_age=SESSION_SECONDS,
+                            httponly=True, samesite="lax", path="/")
+        return response
+
+    def current_user(request: Request) -> str | None:
+        return getattr(request.state, "user", None)
+
+    @app.get("/login", include_in_schema=False)
+    def login_page():
+        return FileResponse(STATIC / "login.html")
+
+    @app.get("/api/auth/status")
+    def auth_status(request: Request):
+        user = auth.user_from_headers(dict(request.scope["headers"])) if auth.enabled else None
+        return {"enabled": auth.enabled, "setup_needed": auth.enabled and not auth.users, "user": user}
+
+    @app.post("/api/auth/setup")
+    def auth_setup(body: Login):
+        """Create the very first account. Refused once any account exists."""
+        with auth.lock:
+            if auth.users:
+                raise Conflict("An account already exists. Sign in instead.")
+            name = auth.create_user(body.username, body.password)
+        return signed_in(JSONResponse({"user": name}), name)
+
+    @app.post("/api/auth/login")
+    def auth_login(body: Login):
+        name = auth.verify(body.username, body.password)
+        if name is None:
+            return JSONResponse({"detail": "Wrong username or password."}, status_code=401)
+        return signed_in(JSONResponse({"user": name}), name)
+
+    @app.post("/api/auth/logout")
+    def auth_logout(request: Request):
+        auth.end_session(auth.cookie_token(dict(request.scope["headers"])))
+        response = JSONResponse({"user": None})
+        response.delete_cookie(COOKIE, path="/")
+        return response
+
+    @app.get("/api/users")
+    def list_users(request: Request):
+        return {"users": auth.names(), "me": current_user(request)}
+
+    @app.post("/api/users", status_code=201)
+    def create_user(body: Login):
+        return {"user": auth.create_user(body.username, body.password)}
+
+    @app.delete("/api/users/{name}", status_code=204)
+    def delete_user(name: str, request: Request):
+        me = current_user(request)
+        if me and me.lower() == name.lower():
+            raise Conflict("You cannot remove the account you are signed in with.")
+        auth.delete_user(name)
+
+    @app.post("/api/account/password")
+    def change_password(body: PasswordChange, request: Request):
+        me = current_user(request)
+        if me is None:
+            raise Conflict("Accounts are switched off on this server.")
+        if auth.verify(me, body.current) is None:
+            raise Invalid("The current password is wrong.")
+        auth.set_password(me, body.new)
+        return {"user": me}
 
     # -- system ----------------------------------------------------------
 

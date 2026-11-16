@@ -101,6 +101,10 @@ async function apiRaw(method, path, body) {
     headers: body ? { "content-type": "application/json" } : {},
     body: body ? JSON.stringify(body) : undefined,
   });
+  if (res.status === 401) {
+    location.replace("/login"); // signed out, or the session ran out
+    throw new Error("Sign in first.");
+  }
   if (!res.ok) {
     const data = await res.json().catch(() => null);
     let msg = res.statusText || `Request failed (${res.status})`;
@@ -884,7 +888,7 @@ function linkInspector(link) {
             h("button", { type: "button", onclick: () => openPackets(live[0], live[1]) }, "Open packet view"),
             h("p", {}, h("a", { href: captureUrl(live[0], live[1], 30), download: "" }, "Download a 30 second capture")),
             h("p", {}, "Or watch it live in Wireshark:"),
-            copyRow(`curl -sN ${location.origin}${captureUrl(live[0], live[1])} | wireshark -k -i -`),
+            copyRow(`curl -sN ${state.user ? `-u ${state.user} ` : ""}${location.origin}${captureUrl(live[0], live[1])} | wireshark -k -i -`),
           ]
         : h("p", {}, "Start a device on this link to capture its traffic.")),
     h("section", {},
@@ -1375,6 +1379,20 @@ const ACTIONS = {
   "cfg-import": () => { const n = selectedRouter(); if (n) importConfig(n); },
   "cfg-identity": () => { const n = selectedRouter(); if (n) pushIdentity(n); },
   "tool-packets": () => packetDialog(),
+  "acct-logout": async () => {
+    try { await api("POST", "/auth/logout"); } catch (e) { /* going to the sign-in page anyway */ }
+    location.replace("/login");
+  },
+  "acct-password": () => openModal("Change my password", [
+    { key: "current", label: "Current password", type: "password" },
+    { key: "fresh", label: "New password (at least 8 characters)", type: "password" },
+    { key: "again", label: "New password again", type: "password" },
+  ], "Change password", async (v) => {
+    if (v.fresh !== v.again) throw new Error("The two new passwords are not the same.");
+    await api("POST", "/account/password", { current: v.current, new: v.fresh });
+    toast("Password changed.");
+  }),
+  "acct-users": () => accountsDialog(),
   "tool-png": async () => {
     try {
       saveBlob(await topologyPng(2), `${state.lab.name}.png`);
@@ -1382,6 +1400,32 @@ const ACTIONS = {
     } catch (e) { toast(e.message, true); }
   },
 };
+
+async function accountsDialog() {
+  let data;
+  try { data = await api("GET", "/users"); } catch (e) { toast(e.message, true); return; }
+  const list = h("ul", { class: "users" }, data.users.map((name) =>
+    h("li", {}, h("span", {}, name + (name === data.me ? " (you)" : "")),
+      name !== data.me && h("button", { type: "button", class: "danger", onclick: async () => {
+        if (!confirm(`Remove the account ${name}?`)) return;
+        try { await api("DELETE", `/users/${encodeURIComponent(name)}`); toast(`Removed ${name}.`); accountsDialog(); }
+        catch (e) { toast(e.message, true); }
+      } }, "Remove"))));
+  openModal("Accounts", [
+    { node: h("p", {}, "Everyone with an account can use all labs on this server.") },
+    { node: list },
+    { node: h("h2", {}, "Add an account") },
+    { key: "username", label: "Username" },
+    { key: "password", label: "Password (at least 8 characters)", type: "password" },
+    { key: "again", label: "Password again", type: "password" },
+  ], "Add account", async (v) => {
+    if (v.password !== v.again) throw new Error("The two passwords are not the same.");
+    await api("POST", "/users", { username: v.username, password: v.password });
+    toast(`Added ${v.username}.`);
+  });
+  // Nothing typed yet, so do not let the browser put the saved login here.
+  for (const id of ["#m-username", "#m-password", "#m-again"]) $(id).autocomplete = "new-password";
+}
 
 function switchLab(lab) {
   state.lab = lab;
@@ -1511,4 +1555,9 @@ setInterval(() => {
 }, 3000);
 
 applyPrefs();
+fetch("/api/auth/status").then((r) => r.json()).then((st) => {
+  state.user = st.user;
+  $("#account").hidden = !st.enabled;
+  if (st.user) $("#account-btn").textContent = st.user;
+}).catch(() => {});
 refresh(true).catch((e) => toast(e.message, true));

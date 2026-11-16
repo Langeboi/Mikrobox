@@ -51,6 +51,15 @@
   <button id="lab-stop" type="button">Stop all</button>
   <button id="lab-start" type="button" class="primary">Start all</button>
   <button id="settings" type="button" class="icon-btn" aria-label="Settings" title="Settings"></button>
+  <div class="menu right" id="account" hidden>
+    <button type="button" class="menu-btn" aria-haspopup="true" id="account-btn">Account</button>
+    <div class="menu-list" hidden>
+      <button type="button" data-act="acct-users">Accounts</button>
+      <button type="button" data-act="acct-password">Change my password</button>
+      <hr>
+      <button type="button" data-act="acct-logout">Sign out</button>
+    </div>
+  </div>
 </header>
 <div id="banner" hidden></div>
 <main>

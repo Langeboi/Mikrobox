@@ -79,7 +79,12 @@ input:disabled { background: var(--surface-2); color: var(--muted); }
   background: var(--surface); border: 1px solid var(--line); border-radius: var(--radius); box-shadow: var(--shadow);
   display: flex; flex-direction: column;
 }
+.menu.right .menu-list { left: auto; right: 0; min-width: 200px; }
 .menu-list button { border: 0; text-align: left; background: none; font-weight: 400; }
+.users { list-style: none; margin: 0 0 12px; padding: 0; }
+.users li { display: flex; align-items: center; gap: 8px; padding: 6px 0; border-top: 1px solid var(--line); }
+.users li span { flex: 1; }
+.users li button { min-height: 30px; padding: 0 10px; }
 .menu-list button:hover:not(:disabled) { background: var(--surface-2); }
 .chip { padding: 6px 12px; border-radius: 999px; background: var(--surface-2); color: var(--muted); font-size: 13px; font-variant-numeric: tabular-nums; }
 .icon-btn { padding: 0; width: 36px; display: inline-flex; align-items: center; justify-content: center; }

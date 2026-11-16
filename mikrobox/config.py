@@ -13,6 +13,7 @@ class Settings:
     run_dir: Path = Path("/run/mikrobox")
     base_image: Path | None = None  # defaults to <data_dir>/images/chr.img
     dry_run: bool = False  # log host commands instead of running them
+    auth_enabled: bool = True  # require an account to use the web interface and API
 
     max_devices: int = 128  # running routers + clients, across all labs
     max_chr_ports: int = 24  # PCI slots run out beyond this without extra buses
@@ -49,6 +50,8 @@ class Settings:
             kwargs["base_image"] = Path(env["MIKROBOX_CHR_IMAGE"])
         if env.get("MIKROBOX_DRY_RUN") == "1":
             kwargs["dry_run"] = True
+        if env.get("MIKROBOX_AUTH", "").lower() in ("off", "0", "false"):
+            kwargs["auth_enabled"] = False
         if env.get("MIKROBOX_CLOUD_MODE") in ("auto", "nat", "bridged"):
             kwargs["cloud_mode"] = env["MIKROBOX_CLOUD_MODE"]
         if "MIKROBOX_MAX_DEVICES" in env:
