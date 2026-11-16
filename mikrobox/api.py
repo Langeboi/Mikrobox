@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import io
+import ipaddress
 import subprocess
 import zipfile
 from contextlib import asynccontextmanager
@@ -90,6 +91,8 @@ class LabImport(BaseModel):
 
 
 class Creds(BaseModel):
+    # Address to reach the router on; needed when it is not known automatically.
+    host: Optional[str] = None
     username: str = Field(default="admin", min_length=1, max_length=64)
     password: str = Field(default="", max_length=256)
 
@@ -161,6 +164,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         view = node.model_dump(mode="json")
         view["running"] = rt.node_running(node)
         view["mgmt_ip"] = ip
+        view["cloud_port"] = rt.cloud_port(lab, node)
         view["ssh"] = f"ssh admin@{ip}" if ip and node.kind == NodeKind.chr else None
         view["console"] = f"/console?lab={lab.id}&node={node.id}"
         return view
@@ -176,15 +180,23 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             "annotations": [a.model_dump(mode="json") for a in lab.annotations],
         }
 
-    def router_host(lab: Lab, node: Node) -> str:
-        """Management address of a running router, or a clear reason why not."""
+    def router_host(lab: Lab, node: Node, override: str | None = None) -> str:
+        """Address of a running router on the Cloud, or a clear reason why not."""
         if node.kind != NodeKind.chr:
             raise Invalid(f"{node.name} is not a router.")
         if not rt.node_running(node):
             raise Conflict(f"{node.name} is not running.")
+        if override:
+            try:
+                return str(ipaddress.ip_address(override.strip()))
+            except ValueError:
+                raise Invalid(f"{override} is not an IP address.")
+        if rt.cloud_port(lab, node) is None:
+            raise Conflict(f"{node.name} is not linked to the Cloud, so it cannot be reached.")
         ip = rt.mgmt_ip(lab, node)
         if ip is None:
-            raise Conflict(f"{node.name} is not linked to Management, so it cannot be reached.")
+            raise Conflict(f"{node.name}'s address is not known yet. Enter it, or check the "
+                           "router's console with /ip address print.")
         return ip
 
     # -- system ----------------------------------------------------------
@@ -279,7 +291,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 if node.kind != NodeKind.chr:
                     continue
                 try:
-                    host = router_host(lab, node)
+                    host = router_host(lab, node)  # per-router: the override does not apply
                     z.writestr(f"{node.name}.rsc", routeros.export_config(
                         host, body.username, body.password, body.sensitive))
                     done += 1
@@ -425,7 +437,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         lab = get_lab(lab_id)
         node = get_node(lab, node_id)
         text = routeros.export_config(
-            router_host(lab, node), body.username, body.password, body.sensitive)
+            router_host(lab, node, body.host), body.username, body.password, body.sensitive)
         return PlainTextResponse(text, headers={
             "Content-Disposition": f'attachment; filename="{node.name}.rsc"'})
 
@@ -434,7 +446,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         lab = get_lab(lab_id)
         node = get_node(lab, node_id)
         output = routeros.import_config(
-            router_host(lab, node), body.username, body.password, body.config)
+            router_host(lab, node, body.host), body.username, body.password, body.config)
         return {"output": output}
 
     @app.post("/api/labs/{lab_id}/nodes/{node_id}/identity")
@@ -443,7 +455,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         lab = get_lab(lab_id)
         node = get_node(lab, node_id)
         output = routeros.set_identity(
-            router_host(lab, node), body.username, body.password, node.name)
+            router_host(lab, node, body.host), body.username, body.password, node.name)
         return {"output": output}
 
     # -- annotations -----------------------------------------------------

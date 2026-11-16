@@ -167,6 +167,7 @@ pre.out { max-height: 180px; overflow: auto; background: var(--surface-2); paddi
 
 .node { cursor: pointer; }
 .node .box { fill: var(--surface); stroke: var(--line); stroke-width: 1.5; filter: drop-shadow(0 2px 4px rgba(16, 24, 40, .12)); }
+.node .cloud { stroke-linejoin: round; }
 .node.sel .box { stroke: var(--accent-fg); stroke-width: 2.5; }
 .node.from .box { stroke: var(--accent-fg); stroke-dasharray: 5 3; stroke-width: 2.5; }
 .node .glyph { fill: none; stroke: var(--muted); stroke-width: 1.5; stroke-linecap: round; stroke-linejoin: round; }

@@ -48,6 +48,8 @@ class Runtime:
         self.sh = sh or Shell(dry_run=settings.dry_run)
         self.net = Net(settings, self.sh)
         self.lock = threading.RLock()
+        self.cloud_ips: dict[str, str] = {}  # MAC -> address, discovered in bridged mode
+        self._scanner: threading.Thread | None = None
 
     # -- paths -----------------------------------------------------------
 
@@ -84,9 +86,17 @@ class Runtime:
 
     def mgmt_ip(self, lab: Lab, node: Node) -> str | None:
         """Address the node gets on the management bridge, if it is plugged in."""
-        if not any(l.b is None and l.a.node == node.id for l in lab.links):
+        port = self.cloud_port(lab, node)
+        if port is None:
             return None
+        if self.net.bridged():
+            # Your own network hands out the address; we only know it once it is seen.
+            return self.cloud_ips.get(mac_for(node.id, port))
         return str(ipaddress.ip_address(self.s.mgmt_first_ip) + node.id)
+
+    def cloud_port(self, lab: Lab, node: Node) -> int | None:
+        """The node's port that is linked to the Cloud, if any."""
+        return next((l.a.port for l in lab.links if l.b is None and l.a.node == node.id), None)
 
     def system_info(self) -> dict:
         return {
@@ -96,8 +106,9 @@ class Runtime:
             "kvm": self.kvm_available(),
             "chr_image": self.s.base_image.exists(),
             "mem_available_mb": self.mem_available_mb(),
-            "mgmt_network": self.s.mgmt_net,
-            "mgmt_host_ip": self.s.mgmt_host_ip,
+            "cloud": (cloud := self.net.cloud_info()),
+            "mgmt_network": cloud["network"],
+            "mgmt_host_ip": cloud["gateway"],
             "dry_run": self.s.dry_run,
             "chr_version": self._chr_version(),
             "max_chr_ports": self.s.max_chr_ports,
@@ -116,6 +127,23 @@ class Runtime:
         (self.s.data_dir / "disks").mkdir(parents=True, exist_ok=True)
         self.net.ensure_mgmt()
         self.sync_dhcp()
+        if self.net.bridged() and not self.s.dry_run and self._scanner is None:
+            self._scanner = threading.Thread(target=self._scan_loop, daemon=True)
+            self._scanner.start()
+
+    def _scan_loop(self) -> None:
+        """Bridged mode: learn which address each Cloud-linked device ended up with."""
+        while True:
+            try:
+                wanted = any(
+                    self.cloud_port(lab, n) is not None and self.node_running(n)
+                    for lab in self.store.state.labs for n in lab.nodes
+                )
+                if wanted:
+                    self.cloud_ips = self.net.scan_addresses()
+            except Exception:
+                pass
+            time.sleep(15)
 
     def sync_dhcp(self) -> None:
         hosts = []
@@ -258,7 +286,7 @@ class Runtime:
                 return
             self.net.attach_mgmt(a)
             node = lab.node(link.a.node)
-            if node is not None and node.kind == NodeKind.client:
+            if node is not None and node.kind == NodeKind.client and not self.net.bridged():
                 prefix = self.s.mgmt_net.split("/")[1]
                 self.net.client_addr(
                     netns_name(node.id), link.a.port, f"{self.mgmt_ip(lab, node)}/{prefix}"

@@ -14,7 +14,7 @@ echo "==> Installing packages"
 export DEBIAN_FRONTEND=noninteractive
 apt-get update
 apt-get install -y --no-install-recommends \
-  qemu-system-x86 qemu-utils iproute2 dnsmasq-base nftables tcpdump \
+  qemu-system-x86 qemu-utils iproute2 dnsmasq-base nftables tcpdump arp-scan bridge-utils \
   traceroute iputils-ping bash python3 python3-venv unzip curl ca-certificates
 
 if [ ! -e /dev/kvm ]; then
@@ -74,6 +74,7 @@ systemctl restart mikrobox.service  # running routers survive the restart
 IP="$(hostname -I | awk '{print $1}')"
 echo
 echo "Mikrobox is running:  http://$IP:8080/"
-echo "To reach routers from your PC, add a route to the management network:"
-echo "  Windows:  route add 10.99.0.0 mask 255.255.0.0 $IP"
-echo "  Linux:    sudo ip route add 10.99.0.0/16 via $IP"
+echo
+echo "The Cloud currently gives lab devices internet through this VM (NAT)."
+echo "To put them directly on your own network instead, see what would change with:"
+echo "  sudo $PREFIX/venv/bin/python -m mikrobox.cloudsetup enable"

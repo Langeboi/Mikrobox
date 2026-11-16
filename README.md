@@ -12,7 +12,8 @@ available through the API (interactive docs at `/docs`).
 - Labs made of CHR routers and lightweight Linux clients, stored in one JSON file.
 - Per router: name, number of ports (1-24), vCPUs and RAM.
 - Links between any two ports. Frames pass untouched, so STP, LACP and LLDP/MNDP work.
-- A management network (`10.99.0.0/16`) so you can SSH or WinBox to routers from your PC.
+- A Cloud that gives linked devices internet and makes them reachable from your PC,
+  either through the VM (NAT) or directly on your own network (bridged).
 - A browser workspace with a topology canvas (pan, zoom, snap), device settings and docked consoles.
 - Areas, ellipses, text labels and sticky notes to mark sites, routing areas and tasks.
 - Lab export and import as a single JSON file (topology, shapes and notes).
@@ -54,8 +55,8 @@ curl -s $J $API/labs/1/nodes -d '{"name":"R1","ports":4}'                    # n
 curl -s $J $API/labs/1/nodes -d '{"name":"R2","ports":4}'                    # node 2
 curl -s $J $API/labs/1/nodes -d '{"kind":"client","name":"PC1","address":"192.168.10.2/24","gateway":"192.168.10.1"}'  # node 3
 
-curl -s $J $API/labs/1/links -d '{"a":{"node":1,"port":1}}'                           # R1 ether1 -> management
-curl -s $J $API/labs/1/links -d '{"a":{"node":2,"port":1}}'                           # R2 ether1 -> management
+curl -s $J $API/labs/1/links -d '{"a":{"node":1,"port":1}}'                           # R1 ether1 -> Cloud
+curl -s $J $API/labs/1/links -d '{"a":{"node":2,"port":1}}'                           # R2 ether1 -> Cloud
 curl -s $J $API/labs/1/links -d '{"a":{"node":1,"port":2},"b":{"node":2,"port":2}}'   # R1 ether2 <-> R2 ether2
 curl -s $J $API/labs/1/links -d '{"a":{"node":1,"port":3},"b":{"node":3,"port":1}}'   # R1 ether3 <-> PC1
 
@@ -65,20 +66,41 @@ curl -s $API/labs/1
 
 Then open `http://<vm-ip>:8080/` to see the lab, or build the same thing there by hand.
 
-## Reaching routers from your PC
+## The Cloud: internet and access from your PC
 
-A fresh CHR runs a DHCP client on ether1. Plug ether1 into the management bridge and the
-router gets a fixed address (`10.99.1.<node id>`, shown as `mgmt_ip` in the API). Add one
-route on your PC, pointing the management network at the lab VM:
+Every lab has a Cloud. Link a port to it and that device gets internet and becomes
+reachable from your PC. It works in one of two modes.
+
+**NAT (default).** The Cloud is a private network, `10.99.0.0/16`, behind the VM. A fresh
+CHR runs a DHCP client on ether1, so it gets `10.99.1.<node id>` plus a default route and
+DNS. To reach it from your PC, add one route pointing that range at the VM:
 
 ```
 Windows:  route add 10.99.0.0 mask 255.255.0.0 <vm-ip>
 Linux:    sudo ip route add 10.99.0.0/16 via <vm-ip>
 ```
 
-After that `ssh admin@10.99.1.1`, WinBox and MobaXterm sessions work directly. The VM
-source-NATs your traffic onto the bridge, so routers need no default route and your lab's
-routing tables stay clean.
+**Bridged.** The VM's own network card becomes a port of the Cloud bridge, so linked
+devices sit directly on your network: DHCP from your own router, or a static address in
+the same range, with no route needed on your PC.
+
+```bash
+sudo /opt/mikrobox/venv/bin/python -m mikrobox.cloudsetup enable            # show the plan
+sudo /opt/mikrobox/venv/bin/python -m mikrobox.cloudsetup enable --apply    # do it
+sudo /opt/mikrobox/venv/bin/python -m mikrobox.cloudsetup disable --apply   # undo
+```
+
+This rewrites the VM's network configuration (ifupdown or netplan), moving its address
+from the card onto a bridge named `mbcloud`. The original file is backed up, and if the
+gateway cannot be reached afterwards the change is rolled back by itself. Keep the
+hypervisor console at hand anyway. Notes:
+
+- On Ubuntu with DHCP, the VM may be given a different address afterwards.
+- The hypervisor must allow several MAC addresses on the VM's network card. On Proxmox
+  that means the firewall's MAC filter must be off for that card.
+- In bridged mode Mikrobox learns each device's address by scanning the network, which
+  takes a few seconds and is skipped on networks larger than a /22. You can always type
+  the address into the config dialogs.
 
 ## Packet capture
 
@@ -96,7 +118,7 @@ Add `?seconds=30` for a capture that ends by itself; the workspace's Capture lin
 | Client | A network namespace with a veth pair; the console is a shell inside it |
 | Port | One host interface per port, named `mb<node>p<port>` |
 | Link | A pair of `tc` redirects between the two port interfaces |
-| Management | Linux bridge `mbmgmt` with dnsmasq handing out fixed leases |
+| Cloud | Linux bridge `mbcloud`: NAT with dnsmasq, or bridged to the VM's network card |
 | Console | QEMU serial socket or a pty, relayed over a websocket |
 | Capture | `tcpdump` on the port interface, streamed as pcap |
 
@@ -105,7 +127,8 @@ Add `?seconds=30` for a capture that ends by itself; the workspace's Capture lin
 - **No login.** Anyone who can reach port 8080 controls the lab, and client consoles are
   root shells on the VM. Keep it on a trusted network.
 - Config export, import and hostname push are untested against a real router. They need
-  the router running, linked to Management, and its RouterOS login.
+  the router running, linked to the Cloud, and its RouterOS login.
+- `cloudsetup` (bridged mode) is untested on a real VM.
 - A lab file carries the topology only. Export router configs separately.
 - Clients share the VM's filesystem; they are namespaces, not full machines.
 - Stopping a router kills QEMU rather than shutting RouterOS down cleanly.

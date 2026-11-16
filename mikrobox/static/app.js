@@ -33,6 +33,7 @@ const ICONS = {
   gear: "M12 9a3 3 0 1 0 0 6a3 3 0 1 0 0-6 M12 2v3 M12 19v3 M2 12h3 M19 12h3 M4.9 4.9l2.1 2.1 M17 17l2.1 2.1 M4.9 19.1l2.1-2.1 M17 7l2.1-2.1",
   close: "M6 6l12 12 M18 6L6 18",
 };
+const CLOUD = "M-34 26a20 20 0 0 1-5-39a27 27 0 0 1 51-9a23 23 0 0 1 27 48z";
 const icon = (name) => s("svg", { class: "icon", viewBox: "0 0 24 24", "aria-hidden": "true" }, s("path", { d: ICONS[name] }));
 
 const TOOLS = [
@@ -171,12 +172,18 @@ function peerText(node, port) {
   for (const l of state.lab.links) {
     const mine = [l.a, l.b].find((e) => e && e.node === node.id && e.port === port);
     if (!mine) continue;
-    if (!l.b) return "Management";
+    if (!l.b) return "Cloud";
     const other = mine === l.a ? l.b : l.a;
     const peer = nodeById(other.node);
     return peer ? `${peer.name} ${portName(peer, other.port)}` : "?";
   }
   return "Not connected";
+}
+
+function cloudLabel() {
+  const c = state.sys && state.sys.cloud;
+  if (!c) return "";
+  return c.mode === "bridged" ? (c.network || "your network") : `${c.network} (NAT)`;
 }
 
 function selectedRouter() {
@@ -220,7 +227,7 @@ function zoomBy(factor) {
 function fitView() {
   const lab = state.lab;
   if (!lab) return;
-  const xs = [lab.mgmt_x - 70, lab.mgmt_x + 70], ys = [lab.mgmt_y - 30, lab.mgmt_y + 45];
+  const xs = [lab.mgmt_x - 60, lab.mgmt_x + 60], ys = [lab.mgmt_y - 40, lab.mgmt_y + 55];
   for (const n of lab.nodes) { xs.push(n.x - 50, n.x + 50); ys.push(n.y - 40, n.y + 70); }
   for (const a of lab.annotations) { xs.push(a.x, a.x + a.w); ys.push(a.y, a.y + a.h); }
   const r = $("#canvas").getBoundingClientRect();
@@ -282,7 +289,7 @@ function renderTop() {
   canvas.classList.toggle("tool-draw", draw);
   $("#hint").textContent =
     state.tool === "link"
-      ? (state.linkFrom ? "Now click the device to connect it to." : "Click the first device, then the second. Link to Management to reach a device from your PC.")
+      ? (state.linkFrom ? "Now click the device to connect it to." : "Click the first device, then the second. Link a port to the Cloud to give it internet and reach it from your PC.")
       : draw ? `Drag on the canvas to place the ${KIND_NAME[state.tool].toLowerCase()}, or just click.` : "";
   $("#zoom-reset").textContent = Math.round(view.k * 100) + "%";
 }
@@ -395,10 +402,10 @@ function renderCanvas() {
   const mref = { type: "mgmt", id: 0 };
   world.append(
     s("g", { class: cls(mref), transform: `translate(${lab.mgmt_x},${lab.mgmt_y})`, ...handlers(mref) },
-      s("title", {}, "Management network"),
-      s("rect", { class: "box", x: -60, y: -20, width: 120, height: 40, rx: 20 }),
-      s("text", { y: 5 }, "Management"),
-      s("text", { class: "sub", y: 37 }, state.sys ? state.sys.mgmt_network : ""),
+      s("title", {}, "Cloud: your network and the internet"),
+      s("path", { class: "box cloud", d: CLOUD }),
+      s("text", { y: 9 }, "Cloud"),
+      s("text", { class: "sub", y: 46 }, cloudLabel()),
     ),
   );
   for (const n of lab.nodes) {
@@ -547,7 +554,7 @@ function linkDialog(r1, r2) {
   const opts = (node, ports) => ports.map((p) => ({ value: p, label: portName(node, p) }));
   const fields = [{ key: "pa", label: `Port on ${a.name}`, type: "select", options: opts(a, fa) }];
   if (b) fields.push({ key: "pb", label: `Port on ${b.name}`, type: "select", options: opts(b, fb) });
-  openModal(b ? `Link ${a.name} to ${b.name}` : `Connect ${a.name} to Management`, fields, "Create link",
+  openModal(b ? `Link ${a.name} to ${b.name}` : `Connect ${a.name} to the Cloud`, fields, "Create link",
     async (v) => {
       const body = { a: { node: a.id, port: Number(v.pa) } };
       if (b) body.b = { node: b.id, port: Number(v.pb) };
@@ -656,9 +663,11 @@ function addNodeDialog(kind) {
 
 // ------------------------------------------------- router config tools
 
-function credFields() {
+function credFields(n) {
   const saved = (() => { try { return JSON.parse(sessionStorage.getItem("mikrobox.creds")) || {}; } catch (e) { return {}; } })();
+  const host = n ? [{ key: "host", label: n.mgmt_ip ? "Router address" : "Router address (not detected yet, enter it)", value: n.mgmt_ip || "" }] : [];
   return [
+    ...host,
     { key: "username", label: "RouterOS user", value: saved.username || "admin" },
     { key: "password", label: "Password (blank on a fresh CHR)", type: "password", value: saved.password || "" },
   ];
@@ -666,12 +675,13 @@ function credFields() {
 function creds(v) {
   const c = { username: v.username || "admin", password: v.password || "" };
   try { sessionStorage.setItem("mikrobox.creds", JSON.stringify(c)); } catch (e) { /* ignore */ }
+  if (v.host) c.host = v.host;
   return c;
 }
 
 function exportConfig(n) {
   openModal(`Export ${n.name}'s config`, [
-    ...credFields(),
+    ...credFields(n),
     { key: "sensitive", label: "Include passwords and keys", type: "checkbox", value: false },
   ], "Export", async (v) => {
     const res = await apiRaw("POST", `${labPath()}/nodes/${n.id}/config/export`, { ...creds(v), sensitive: v.sensitive });
@@ -681,7 +691,7 @@ function exportConfig(n) {
 
 function exportAllConfigs() {
   openModal("Export all router configs", [
-    { node: h("p", {}, "Runs /export on every running router that is linked to Management and downloads one zip. The same login is used for all of them.") },
+    { node: h("p", {}, "Runs /export on every running router that is linked to the Cloud and has a known address, and downloads one zip. The same login is used for all of them.") },
     ...credFields(),
     { key: "sensitive", label: "Include passwords and keys", type: "checkbox", value: false },
   ], "Export zip", async (v) => {
@@ -697,7 +707,7 @@ function importConfig(n) {
   openModal(`Import a config into ${n.name}`, [
     { node: h("p", {}, "Uploads a .rsc file and runs /import on the router. It is applied on top of the current config.") },
     { key: "file", label: "Config file (.rsc)", type: "file", accept: ".rsc,.txt" },
-    ...credFields(),
+    ...credFields(n),
     { node: out },
   ], "Import", async (v) => {
     if (!v.file) throw new Error("Choose a .rsc file first.");
@@ -713,7 +723,7 @@ function importConfig(n) {
 function pushIdentity(n) {
   openModal(`Push hostname to ${n.name}`, [
     { node: h("p", {}, `Sets the RouterOS identity to "${n.name}".`) },
-    ...credFields(),
+    ...credFields(n),
   ], "Push", async (v) => {
     await api("POST", `${labPath()}/nodes/${n.id}/identity`, creds(v));
     toast(`Identity set to ${n.name}.`);
@@ -752,16 +762,33 @@ function renderInspector(force) {
 }
 
 function mgmtInspector() {
-  const sys = state.sys || {};
+  const c = (state.sys && state.sys.cloud) || { mode: "nat", network: "10.99.0.0/16" };
+  if (c.mode === "bridged") {
+    return [
+      head("Cloud"),
+      h("div", { class: "status running" }, h("i", {}), "On your network"),
+      h("p", {}, "A port linked here sits directly on the same network as this server. A fresh router asks for an address by DHCP on ether1, or you can set a static one in the same range. It has internet through your normal gateway, and your PC reaches it with no extra setup."),
+      h("section", {}, h("h2", {}, "Network"),
+        h("dl", { class: "info" },
+          h("dt", {}, "Range"), h("dd", {}, c.network || "unknown"),
+          h("dt", {}, "Gateway"), h("dd", {}, c.gateway || "unknown"),
+          h("dt", {}, "Through"), h("dd", {}, c.uplink || "unknown"))),
+      h("p", {}, "If devices get no address, check that the hypervisor allows more than one MAC address on this server's network card (on Proxmox: the firewall's MAC filter)."),
+    ];
+  }
   const host = location.hostname;
-  const [net, bits] = (sys.mgmt_network || "10.99.0.0/16").split("/");
+  const [net, bits] = (c.network || "10.99.0.0/16").split("/");
   const mask = bits === "16" ? "255.255.0.0" : "255.255.255.0";
   return [
-    head("Management"),
-    h("div", { class: "status" }, sys.mgmt_network || ""),
-    h("p", {}, "Link a router's ether1 here and it gets an address by DHCP that you can SSH or WinBox to from your PC. Add this route on your PC once:"),
-    h("section", {}, h("h2", {}, "Windows"), copyRow(`route add ${net} mask ${mask} ${host}`)),
-    h("section", {}, h("h2", {}, "Linux or macOS"), copyRow(`sudo ip route add ${net}/${bits} via ${host}`)),
+    head("Cloud"),
+    h("div", { class: "status" }, h("i", {}), "Internet through this server (NAT)"),
+    h("p", {}, `A port linked here gets an address in ${c.network} by DHCP, with internet through this server. It is a private range, not your own network.`),
+    h("section", {}, h("h2", {}, "Put devices on your own network"),
+      h("p", {}, "Run this on the server to see what would change, then again with --apply:"),
+      copyRow("sudo /opt/mikrobox/venv/bin/python -m mikrobox.cloudsetup enable")),
+    h("section", {}, h("h2", {}, "Reach devices from your PC meanwhile"),
+      h("p", {}, "Windows:"), copyRow(`route add ${net} mask ${mask} ${host}`),
+      h("p", {}, "Linux or macOS:"), copyRow(`sudo ip route add ${net}/${bits} via ${host}`)),
   ];
 }
 
@@ -773,7 +800,7 @@ function linkInspector(link) {
   return [
     head("Link"),
     h("div", { class: "status" },
-      `${a.name} ${portName(a, link.a.port)} to ` + (b ? `${b.name} ${portName(b, link.b.port)}` : "Management")),
+      `${a.name} ${portName(a, link.a.port)} to ` + (b ? `${b.name} ${portName(b, link.b.port)}` : "the Cloud")),
     h("section", {}, h("h2", {}, "Packet capture"),
       live
         ? [
@@ -825,7 +852,7 @@ function nodeInspector(n) {
     if (Object.keys(body).length) await api("PATCH", `${labPath()}/nodes/${n.id}`, body);
   });
   const path = `${labPath()}/nodes/${n.id}`;
-  const reachable = n.running && !!n.mgmt_ip;
+  const reachable = n.running && !!n.cloud_port;
 
   const rows = [];
   for (let p = 1; p <= n.ports; p++) {
@@ -841,8 +868,12 @@ function nodeInspector(n) {
       ". WinBox and MobaXterm can connect to the same address."));
   } else if (n.mgmt_ip) {
     access.push(copyRow(n.mgmt_ip));
+  } else if (n.cloud_port) {
+    access.push(h("p", {}, n.running
+      ? `Waiting to see which address ${portName(n, n.cloud_port)} was given. You can also check on the console${isChr ? " with /ip address print" : ""}.`
+      : "Start the device to get an address."));
   } else {
-    access.push(h("p", {}, "Link a port to Management to reach this device from your PC."));
+    access.push(h("p", {}, "Link a port to the Cloud to give this device internet and reach it from your PC."));
   }
 
   return [
@@ -874,7 +905,7 @@ function nodeInspector(n) {
         h("button", { type: "button", disabled: !reachable, onclick: () => exportConfig(n) }, "Export"),
         h("button", { type: "button", disabled: !reachable, onclick: () => importConfig(n) }, "Import"),
         h("button", { type: "button", disabled: !reachable, onclick: () => pushIdentity(n) }, "Push hostname")),
-      !reachable && h("p", {}, "These need the router running and linked to Management."),
+      !reachable && h("p", {}, "These need the router running and linked to the Cloud."),
       h("div", { class: "row", style: "margin-top:8px" },
         h("button", { type: "button", disabled: n.running, onclick: () => {
           if (!confirm(`Reset ${n.name} to factory defaults? Its configuration is erased.`)) return;
@@ -1056,7 +1087,7 @@ $("#settings").addEventListener("click", () => {
       row("KVM acceleration", sys.kvm ? "available" : "not available"),
       row("Device limit", `${sys.max_devices ?? "?"} running at once`),
       row("Free memory", sys.mem_available_mb != null ? `${sys.mem_available_mb} MB` : "?"),
-      row("Management network", sys.mgmt_network || "?"),
+      row("Cloud", sys.cloud ? (sys.cloud.mode === "bridged" ? `your network ${sys.cloud.network || ""}` : `NAT, ${sys.cloud.network}`) : "?"),
       row("API reference", h("a", { href: "/docs", target: "_blank", rel: "noopener" }, "/docs"))) },
   ], "Save", async (v) => {
     Object.assign(prefs, {

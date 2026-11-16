@@ -42,8 +42,8 @@ def add_node(client, lab, **body) -> dict:
 
 def test_host_setup_creates_management_bridge(client):
     cmds = [" ".join(c) for c in client.rt.sh.history]
-    assert "ip link add mbmgmt type bridge" in cmds
-    assert "ip addr add 10.99.0.1/16 dev mbmgmt" in cmds
+    assert "ip link add mbcloud type bridge" in cmds
+    assert "ip addr add 10.99.0.1/16 dev mbcloud" in cmds
 
 
 def test_node_defaults_and_validation(client):
@@ -274,3 +274,97 @@ def test_factory_reset_needs_stopped_router(client, monkeypatch):
     assert client.post(url).status_code == 200
     monkeypatch.setattr(client.rt, "node_running", lambda node: True)
     assert client.post(url).status_code == 409
+
+
+def test_cloud_nat_mode_reports_private_network(client):
+    info = client.get("/api/system").json()["cloud"]
+    assert info == {"mode": "nat", "bridge": "mbcloud", "uplink": None,
+                    "network": "10.99.0.0/16", "gateway": "10.99.0.1"}
+    nft = [c for c in client.rt.sh.history if c[0] == "nft"]
+    assert nft, "NAT rules are loaded"
+
+
+def test_cloud_bridged_mode(tmp_path):
+    settings = Settings(data_dir=tmp_path / "d", run_dir=tmp_path / "r", dry_run=True,
+                        sys_net=tmp_path / "sys", netns_dir=tmp_path / "ns",
+                        kvm_device=tmp_path / "kvm", cloud_mode="bridged")
+    (tmp_path / "sys").mkdir()
+    app = create_app(settings)
+    with TestClient(app) as c:
+        rt = app.state.rt
+        assert not any("add" in cmd and "bridge" in cmd for cmd in rt.sh.history)
+        assert c.get("/api/system").json()["cloud"]["mode"] == "bridged"
+        lab = c.post("/api/labs", json={"name": "b"}).json()["id"]
+        r1 = c.post(f"/api/labs/{lab}/nodes", json={"name": "R1"}).json()
+        c.post(f"/api/labs/{lab}/links", json={"a": {"node": r1["id"], "port": 1}})
+        node = c.get(f"/api/labs/{lab}").json()["nodes"][0]
+        assert node["cloud_port"] == 1 and node["mgmt_ip"] is None
+        assert not (tmp_path / "r" / "dhcp-hosts").exists()
+        rt.cloud_ips = {"52:54:00:00:01:01": "192.168.1.57"}
+        node = c.get(f"/api/labs/{lab}").json()["nodes"][0]
+        assert node["mgmt_ip"] == "192.168.1.57" and node["ssh"] == "ssh admin@192.168.1.57"
+
+
+def test_config_tools_accept_a_typed_address(client, monkeypatch):
+    from mikrobox import routeros
+
+    lab = make_lab(client)
+    r1 = add_node(client, lab, name="R1")
+    monkeypatch.setattr(client.rt, "node_running", lambda node: True)
+    seen = []
+    monkeypatch.setattr(routeros, "export_config",
+                        lambda host, u, p, s=False: seen.append(host) or "cfg")
+    url = f"/api/labs/{lab}/nodes/{r1['id']}/config/export"
+    assert client.post(url, json={"host": "192.168.1.80"}).status_code == 200
+    assert seen == ["192.168.1.80"]
+    assert client.post(url, json={"host": "not-an-ip"}).status_code == 400
+
+
+def test_cloudsetup_rewrites_ifupdown():
+    from mikrobox.cloudsetup import Unsupported, rewrite_interfaces
+
+    old = """source /etc/network/interfaces.d/*
+
+auto lo
+iface lo inet loopback
+
+allow-hotplug ens18
+iface ens18 inet static
+    address 192.168.1.50/24
+    gateway 192.168.1.1
+iface ens18 inet6 auto
+"""
+    new = rewrite_interfaces(old, "ens18", "bc:24:11:aa:bb:cc")
+    assert "allow-hotplug ens18" not in new
+    assert "iface ens18 inet manual" in new
+    block = new.split("auto mbcloud\n")[1]
+    assert block.startswith("iface mbcloud inet static\n    bridge_ports ens18\n")
+    assert "bridge_hw bc:24:11:aa:bb:cc" in block
+    # The address lines still follow, so they now belong to the bridge.
+    assert block.index("bridge_hw") < block.index("address 192.168.1.50/24") < block.index("gateway")
+    assert "iface mbcloud inet6 auto" in new and "iface lo inet loopback" in new
+    with pytest.raises(Unsupported):
+        rewrite_interfaces(old, "eth9", "00:00:00:00:00:00")
+
+
+def test_cloudsetup_rewrites_netplan():
+    from mikrobox.cloudsetup import rewrite_netplan
+
+    doc = {"network": {"version": 2, "ethernets": {"ens18": {
+        "dhcp4": True, "match": {"macaddress": "bc:24:11:aa:bb:cc"}, "set-name": "ens18"}}}}
+    new = rewrite_netplan(doc, "ens18", "bc:24:11:aa:bb:cc")
+    eth = new["network"]["ethernets"]["ens18"]
+    assert eth == {"match": {"macaddress": "bc:24:11:aa:bb:cc"}, "set-name": "ens18",
+                   "dhcp4": False, "dhcp6": False}
+    br = new["network"]["bridges"]["mbcloud"]
+    assert br["interfaces"] == ["ens18"] and br["dhcp4"] is True
+    assert br["macaddress"] == "bc:24:11:aa:bb:cc" and br["dhcp-identifier"] == "mac"
+    assert br["parameters"] == {"stp": False, "forward-delay": 0}
+
+    static = {"network": {"ethernets": {"eth0": {
+        "addresses": ["10.0.0.5/24"], "routes": [{"to": "default", "via": "10.0.0.1"}],
+        "nameservers": {"addresses": ["10.0.0.1"]}}}}}
+    br = rewrite_netplan(static, "eth0", "aa:aa:aa:aa:aa:aa")["network"]["bridges"]["mbcloud"]
+    assert br["addresses"] == ["10.0.0.5/24"] and br["routes"][0]["via"] == "10.0.0.1"
+    assert "dhcp-identifier" not in br
+    assert rewrite_netplan({"network": {"ethernets": {"eth1": {}}}}, "eth0", "aa:aa:aa:aa:aa:aa") is None

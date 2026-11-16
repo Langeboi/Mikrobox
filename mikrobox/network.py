@@ -3,18 +3,29 @@
 Every node port has one host-side interface: a tap for a router port, the host
 end of a veth pair for a client port. A link between two ports is a pair of tc
 redirects, so every frame (including STP, LACP and LLDP, which a Linux bridge
-would swallow) passes untouched. The management network is a real bridge with
-DHCP so routers get a reachable address on first boot.
+would swallow) passes untouched.
+
+The Cloud is a real bridge. It runs in one of two modes:
+
+* bridged: the VM's own network card is a port of the bridge (set up once with
+  `python -m mikrobox.cloudsetup`). Anything linked to the Cloud sits directly
+  on your network and uses its DHCP server and gateway.
+* nat: a private network with DHCP, with internet through the VM.
 """
 
 from __future__ import annotations
 
+import ipaddress
+import json
 import os
+import re
 import signal
 from pathlib import Path
 
 from .config import Settings
 from .shell import Shell
+
+OLD_BRIDGE = "mbmgmt"
 
 NFT_RULES = """\
 table ip mikrobox
@@ -23,9 +34,11 @@ table ip mikrobox {{
     chain post {{
         type nat hook postrouting priority 100;
         oifname "{bridge}" masquerade
+        ip saddr {net} oifname != "{bridge}" masquerade
     }}
 }}
 """
+NFT_CLEAR = "table ip mikrobox\ndelete table ip mikrobox\n"
 
 
 def pid_alive(pidfile: Path, must_contain: str) -> int | None:
@@ -36,6 +49,27 @@ def pid_alive(pidfile: Path, must_contain: str) -> int | None:
     except (OSError, ValueError):
         return None
     return pid if must_contain in cmdline else None
+
+
+def host_nameservers(resolv: Path = Path("/etc/resolv.conf")) -> list[str]:
+    """Resolvers the VM uses, minus local stubs a router could not reach."""
+    servers = []
+    for candidate in (Path("/run/systemd/resolve/resolv.conf"), resolv):
+        try:
+            for line in candidate.read_text().splitlines():
+                parts = line.split()
+                if len(parts) >= 2 and parts[0] == "nameserver":
+                    try:
+                        ip = ipaddress.ip_address(parts[1])
+                    except ValueError:
+                        continue
+                    if ip.version == 4 and not ip.is_loopback and str(ip) not in servers:
+                        servers.append(str(ip))
+        except OSError:
+            continue
+        if servers:
+            break
+    return servers[:3] or ["1.1.1.1", "9.9.9.9"]
 
 
 class Net:
@@ -59,6 +93,12 @@ class Net:
     def _quiet(self, iface: str) -> None:
         # Stop the host from sending its own IPv6 chatter into a lab link.
         self._write(f"/proc/sys/net/ipv6/conf/{iface}/disable_ipv6", "1")
+
+    def _ports(self, bridge: str) -> list[str]:
+        try:
+            return sorted(p.name for p in (self.s.sys_net / bridge / "brif").iterdir())
+        except OSError:
+            return []
 
     # -- node interfaces -------------------------------------------------
 
@@ -119,10 +159,56 @@ class Net:
         if self.exists(iface):
             self.sh.run(["ip", "link", "set", iface, "nomaster"], check=False)
 
-    # -- management network ---------------------------------------------
+    # -- the Cloud -------------------------------------------------------
+
+    def uplink(self) -> str | None:
+        """The physical network card inside the Cloud bridge, if there is one."""
+        for port in self._ports(self.s.mgmt_bridge):
+            if (self.s.sys_net / port / "device").exists():
+                return port
+        return None
+
+    def bridged(self) -> bool:
+        if self.s.cloud_mode != "auto":
+            return self.s.cloud_mode == "bridged"
+        return self.uplink() is not None
+
+    def cloud_info(self) -> dict:
+        br = self.s.mgmt_bridge
+        if not self.bridged():
+            return {"mode": "nat", "bridge": br, "uplink": None,
+                    "network": self.s.mgmt_net, "gateway": self.s.mgmt_host_ip}
+        network = gateway = None
+        if not self.s.dry_run:
+            try:
+                addrs = json.loads(self.sh.run(["ip", "-j", "-4", "addr", "show", "dev", br]))
+                for info in (addrs[0].get("addr_info", []) if addrs else []):
+                    iface = ipaddress.ip_interface(f"{info['local']}/{info['prefixlen']}")
+                    network = str(iface.network)
+                    break
+                routes = json.loads(self.sh.run(["ip", "-j", "-4", "route", "show", "default"]))
+                gateway = routes[0].get("gateway") if routes else None
+            except Exception:  # display only; never break the API over this
+                pass
+        return {"mode": "bridged", "bridge": br, "uplink": self.uplink(),
+                "network": network, "gateway": gateway}
+
+    def _adopt_old_bridge(self) -> None:
+        """Earlier versions called the bridge mbmgmt; move its ports across."""
+        if not self.exists(OLD_BRIDGE) or OLD_BRIDGE == self.s.mgmt_bridge:
+            return
+        for port in self._ports(OLD_BRIDGE):
+            self.sh.run(["ip", "link", "set", port, "master", self.s.mgmt_bridge], check=False)
+        self.sh.run(["ip", "link", "del", OLD_BRIDGE], check=False)
 
     def ensure_mgmt(self) -> None:
         br = self.s.mgmt_bridge
+        self._stop_dhcp()  # restarted with current options by reload_dhcp
+        if self.bridged():
+            # Your own network provides addresses and routing; stay out of the way.
+            self.sh.run(["nft", "-f", "-"], input=NFT_CLEAR, check=False)
+            self._adopt_old_bridge()
+            return
         prefix = self.s.mgmt_net.split("/")[1]
         if not self.exists(br):
             self.sh.run(["ip", "link", "add", br, "type", "bridge"])
@@ -130,17 +216,32 @@ class Net:
                 ["ip", "addr", "add", f"{self.s.mgmt_host_ip}/{prefix}", "dev", br]
             )
             self.sh.run(["ip", "link", "set", br, "up"])
+        self._adopt_old_bridge()
         self._write("/proc/sys/net/ipv4/ip_forward", "1")
-        # Traffic from your PC is source-NATed onto the bridge, so routers can
-        # answer without needing a default route that would pollute the lab.
-        self.sh.run(["nft", "-f", "-"], input=NFT_RULES.format(bridge=br), check=False)
+        # Lab devices reach the internet through the VM, and your PC reaches them
+        # through it, both source-NATed so no return routes are needed.
+        self.sh.run(["nft", "-f", "-"],
+                    input=NFT_RULES.format(bridge=br, net=self.s.mgmt_net), check=False)
+
+    def _stop_dhcp(self) -> None:
+        if self.s.dry_run:
+            return
+        pid = pid_alive(self.s.run_dir / "dnsmasq.pid", "dnsmasq")
+        if pid:
+            try:
+                os.kill(pid, signal.SIGTERM)
+            except OSError:
+                pass
 
     def reload_dhcp(self, hosts: list[str]) -> None:
-        """hosts: 'mac,ip,name' lines, one per port on the management bridge."""
+        """hosts: 'mac,ip,name' lines, one per router port on the Cloud (nat mode)."""
         run = self.s.run_dir
         run.mkdir(parents=True, exist_ok=True)
         hostsfile = run / "dhcp-hosts"
         pidfile = run / "dnsmasq.pid"
+        if self.bridged():
+            hostsfile.unlink(missing_ok=True)
+            return
         hostsfile.write_text("".join(line + "\n" for line in hosts))
         if self.s.dry_run:
             return
@@ -148,8 +249,6 @@ class Net:
         if pid:
             os.kill(pid, signal.SIGHUP)
             return
-        import ipaddress
-
         net = ipaddress.ip_network(self.s.mgmt_net)
         self.sh.run(
             [
@@ -158,9 +257,10 @@ class Net:
                 f"--interface={self.s.mgmt_bridge}",
                 "--bind-interfaces",
                 "--except-interface=lo",
-                "--port=0",  # DHCP only, no DNS
+                "--port=0",  # DHCP only, no DNS server of our own
                 f"--dhcp-range={net.network_address},static,{net.netmask},12h",
-                "--dhcp-option=3",  # hand out no default route
+                f"--dhcp-option=3,{self.s.mgmt_host_ip}",
+                "--dhcp-option=6," + ",".join(host_nameservers()),
                 "--dhcp-authoritative",
                 f"--dhcp-hostsfile={hostsfile}",
                 f"--dhcp-leasefile={run / 'dnsmasq.leases'}",
@@ -168,3 +268,26 @@ class Net:
             ],
             check=False,
         )
+
+    def scan_addresses(self) -> dict[str, str]:
+        """MAC -> IPv4 for devices on the Cloud's network (bridged mode)."""
+        found: dict[str, str] = {}
+        br = self.s.mgmt_bridge
+        pattern = re.compile(r"^(\d+\.\d+\.\d+\.\d+)\s+([0-9a-fA-F:]{17})")
+        try:
+            info = self.cloud_info()
+            net = ipaddress.ip_network(info["network"]) if info.get("network") else None
+            # A sweep of anything bigger than a /22 would take too long to be useful.
+            if net is not None and net.prefixlen >= 22:
+                out = self.sh.run(["arp-scan", "-q", "-x", "-I", br, "--localnet"], check=False)
+                for line in out.splitlines():
+                    m = pattern.match(line.strip())
+                    if m:
+                        found[m.group(2).lower()] = m.group(1)
+            for entry in json.loads(self.sh.run(["ip", "-j", "-4", "neigh", "show", "dev", br],
+                                                check=False) or "[]"):
+                if entry.get("lladdr") and entry.get("dst"):
+                    found.setdefault(entry["lladdr"].lower(), entry["dst"])
+        except Exception:
+            pass
+        return found

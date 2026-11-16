@@ -19,7 +19,8 @@ class Settings:
     max_client_ports: int = 4
     mem_reserve_mb: int = 512  # host memory that must stay free after a start
 
-    mgmt_bridge: str = "mbmgmt"
+    mgmt_bridge: str = "mbcloud"  # the Cloud
+    cloud_mode: str = "auto"  # auto | nat | bridged (auto: bridged if a real NIC is in the bridge)
     mgmt_net: str = "10.99.0.0/16"
     mgmt_host_ip: str = "10.99.0.1"
     mgmt_first_ip: str = "10.99.1.0"  # node N gets this address + N
@@ -47,6 +48,8 @@ class Settings:
             kwargs["base_image"] = Path(env["MIKROBOX_CHR_IMAGE"])
         if env.get("MIKROBOX_DRY_RUN") == "1":
             kwargs["dry_run"] = True
+        if env.get("MIKROBOX_CLOUD_MODE") in ("auto", "nat", "bridged"):
+            kwargs["cloud_mode"] = env["MIKROBOX_CLOUD_MODE"]
         if "MIKROBOX_MAX_DEVICES" in env:
             kwargs["max_devices"] = min(128, int(env["MIKROBOX_MAX_DEVICES"]))
         return cls(**kwargs)
