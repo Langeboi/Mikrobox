@@ -588,3 +588,81 @@ def test_basic_auth_for_scripts_and_throttling(client):
         anon.post("/api/auth/login", json={"username": "tester", "password": "wrong"})
     r = anon.post("/api/auth/login", json={"username": "tester", "password": "correct-horse"})
     assert r.status_code == 400 and "Too many" in r.json()["detail"]
+
+
+def test_automatic_backups_and_revisions(client, monkeypatch):
+    from mikrobox import routeros
+
+    lab = make_lab(client)
+    r1 = add_node(client, lab, name="R1")
+    r2 = add_node(client, lab, name="R2")
+    pc = add_node(client, lab, kind="client", name="PC1")
+    client.post(f"/api/labs/{lab}/links", json={"a": {"node": r1["id"], "port": 1}})
+    base = f"/api/labs/{lab}"
+
+    view = client.get(base).json()
+    assert view["backup"]["enabled"] is False and view["backup"]["interval"] == 60
+    assert view["nodes"][0]["backup"] == {"included": True, "revisions": 0, "last": None}
+    assert view["nodes"][2]["backup"] is None  # clients have no config
+
+    r = client.put(base + "/backup", json={"enabled": True, "username": "admin", "password": "s3cret-pw"})
+    assert r.json()["has_password"] is True and "password" not in r.json()
+    assert "s3cret-pw" not in client.get(base).text
+    assert client.put(base + "/backup", json={"interval": 7}).status_code == 400
+    assert oct((client.tmp / "data" / "backup.json").stat().st_mode)[-3:] == "600"
+
+    config = {"text": "# 2026-11-17 00:30:00 by RouterOS 7.20\n/ip address\nadd address=10.0.0.1/24 interface=ether2\n"}
+    seen = []
+    monkeypatch.setattr(routeros, "export_config",
+                        lambda host, u, p, s=False: seen.append((host, u, p)) or config["text"])
+    monkeypatch.setattr(client.rt, "node_running", lambda node: True)
+
+    results = client.post(base + "/backup/run", json={}).json()["results"]
+    by_name = {r["name"]: r for r in results}
+    assert set(by_name) == {"R1", "R2"}
+    assert by_name["R1"]["ok"] and by_name["R1"]["changed"] and seen == [("10.99.1.1", "admin", "s3cret-pw")]
+    assert not by_name["R2"]["ok"] and by_name["R2"]["message"] == "Not linked to the Cloud"
+
+    # Same config with a new timestamp is not a new revision.
+    import time as _time
+    config["text"] = config["text"].replace("00:30:00", "01:30:00")
+    again = client.post(base + "/backup/run", json={"node": r1["id"]}).json()["results"][0]
+    assert again["ok"] and not again["changed"] and again["message"] == "No changes"
+    revs = client.get(f"{base}/nodes/{r1['id']}/revisions").json()["revisions"]
+    assert len(revs) == 1
+
+    _time.sleep(1.1)
+    config["text"] += "/ip route\nadd gateway=10.0.0.254\n"
+    config["text"] = config["text"].replace("10.0.0.1/24", "10.0.0.2/24")
+    assert client.post(base + "/backup/run", json={"node": r1["id"]}).json()["results"][0]["changed"]
+    revs = client.get(f"{base}/nodes/{r1['id']}/revisions").json()["revisions"]
+    assert len(revs) == 2 and revs[0]["id"] > revs[1]["id"]  # newest first
+
+    d = client.get(f"{base}/nodes/{r1['id']}/revisions/diff", params={"a": revs[1]["id"], "b": revs[0]["id"]}).json()
+    assert (d["added"], d["removed"]) == (3, 1)
+    assert {"t": "-", "s": "add address=10.0.0.1/24 interface=ether2"} in d["lines"]
+    assert {"t": "+", "s": "add gateway=10.0.0.254"} in d["lines"]
+    assert not any("by RouterOS" in line["s"] for line in d["lines"])
+
+    r = client.get(f"{base}/nodes/{r1['id']}/revisions/{revs[0]['id']}")
+    assert "10.0.0.254" in r.text and f"R1-{revs[0]['id']}.txt" in r.headers["content-disposition"]
+    assert client.get(f"{base}/nodes/{r1['id']}/revisions/..%2Fbackup").status_code == 404
+    assert client.get(f"{base}/nodes/{r1['id']}/revisions/diff", params={"a": "x", "b": "y"}).status_code == 404
+
+    # Only chosen routers.
+    client.put(base + "/backup", json={"scope": "selected"})
+    assert client.post(base + "/backup/run", json={}).json()["results"] == []
+    client.put(f"{base}/nodes/{r1['id']}/backup", json={"included": True})
+    assert [r["name"] for r in client.post(base + "/backup/run", json={}).json()["results"]] == ["R1"]
+    assert client.post(base + "/backup/run", json={"node": pc["id"]}).status_code == 400
+
+    def refuse(*a, **k):
+        raise routeros.RouterError("Login to 10.99.1.1 as admin was refused. Check the password.")
+    monkeypatch.setattr(routeros, "export_config", refuse)
+    failed = client.post(base + "/backup/run", json={"node": r1["id"]}).json()["results"][0]
+    assert not failed["ok"] and "refused" in failed["message"]
+    assert client.get(base).json()["nodes"][0]["backup"]["last"]["ok"] is False
+
+    monkeypatch.undo()
+    assert client.delete(f"{base}/nodes/{r1['id']}").status_code == 204
+    assert not (client.tmp / "data" / "backups" / f"n{r1['id']}").exists()

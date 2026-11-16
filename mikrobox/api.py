@@ -8,6 +8,7 @@ import ipaddress
 import json
 import re
 import subprocess
+import threading
 import zipfile
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -19,6 +20,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, ValidationError
 
 from . import __version__, routeros, templates
+from .backup import INTERVALS, Backups
 from .auth import COOKIE, SESSION_SECONDS, Auth, AuthError, AuthMiddleware
 from .config import Settings
 from .console import netns_console, serial_console
@@ -135,6 +137,23 @@ class PasswordChange(BaseModel):
     new: str = Field(max_length=256)
 
 
+class BackupSettings(BaseModel):
+    enabled: Optional[bool] = None
+    scope: Optional[Literal["all", "selected"]] = None
+    interval: Optional[int] = None  # minutes
+    username: Optional[str] = Field(default=None, min_length=1, max_length=64)
+    password: Optional[str] = Field(default=None, max_length=256)  # omit to keep the stored one
+    sensitive: Optional[bool] = None
+
+
+class BackupInclude(BaseModel):
+    included: bool
+
+
+class BackupRun(BaseModel):
+    node: Optional[int] = None  # omit for every included router
+
+
 class TemplateUse(BaseModel):
     name: Optional[str] = Field(default=None, pattern=NAME_PATTERN)
 
@@ -154,13 +173,18 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     store = Store(settings.data_dir / "state.json")
     rt = Runtime(settings, store)
 
+    backups = Backups(rt)
+
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         rt.ensure_host()
+        if not settings.dry_run:
+            threading.Thread(target=backups.loop, daemon=True).start()
         yield
 
     app = FastAPI(title="Mikrobox", version=__version__, lifespan=lifespan)
     app.state.rt = rt
+    app.state.backups = backups
     auth = Auth(settings.data_dir, enabled=settings.auth_enabled)
     app.state.auth = auth
     app.add_middleware(AuthMiddleware, auth=auth)
@@ -209,6 +233,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         view["cloud_port"] = rt.cloud_port(lab, node)
         view["ssh"] = f"ssh admin@{ip}" if ip and node.kind == NodeKind.chr else None
         view["console"] = f"/console?lab={lab.id}&node={node.id}"
+        view["backup"] = backups.node_summary(lab, node)
         return view
 
     def lab_view(lab: Lab) -> dict:
@@ -220,6 +245,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             "nodes": [node_view(lab, n) for n in lab.nodes],
             "links": [l.model_dump(mode="json") for l in lab.links],
             "annotations": [a.model_dump(mode="json") for a in lab.annotations],
+            "backup": backups.summary(lab),
         }
 
     def router_host(lab: Lab, node: Node, override: str | None = None) -> str:
@@ -450,6 +476,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             rt.stop_lab(lab)
             for node in lab.nodes:
                 rt.delete_disk(node)
+            backups.forget_lab(lab)
             store.state.labs.remove(lab)
             store.save()
             rt.sync_dhcp()
@@ -525,6 +552,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             node = get_node(lab, node_id)
             rt.stop_node(lab, node)
             rt.delete_disk(node)
+            backups.forget_node(node.id)
+            backups.set_node(lab.id, node.id, False)
             lab.links = [l for l in lab.links if not l.touches(node.id)]
             lab.nodes.remove(node)
             store.save()
@@ -603,6 +632,56 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         output = routeros.set_identity(
             router_host(lab, node, body.host), body.username, body.password, node.name)
         return {"output": output}
+
+    # -- automatic backups and revisions ---------------------------------
+
+    @app.put("/api/labs/{lab_id}/backup")
+    def set_backup(lab_id: int, body: BackupSettings):
+        lab = get_lab(lab_id)
+        if body.interval is not None and body.interval not in INTERVALS:
+            raise Invalid(f"The interval must be one of {', '.join(map(str, INTERVALS))} minutes.")
+        backups.update(lab.id, body.model_dump(exclude_unset=True))
+        return backups.summary(lab)
+
+    @app.post("/api/labs/{lab_id}/backup/run")
+    def run_backup(lab_id: int, body: BackupRun):
+        """Back up now, with the stored login: one router, or every included one."""
+        lab = get_lab(lab_id)
+        if body.node is not None:
+            node = get_node(lab, body.node)
+            if node.kind != NodeKind.chr:
+                raise Invalid(f"{node.name} is not a router.")
+        return {"results": backups.run(lab, body.node)}
+
+    @app.put("/api/labs/{lab_id}/nodes/{node_id}/backup")
+    def include_in_backup(lab_id: int, node_id: int, body: BackupInclude):
+        lab = get_lab(lab_id)
+        node = get_node(lab, node_id)
+        backups.set_node(lab.id, node.id, body.included)
+        return node_view(lab, node)
+
+    @app.get("/api/labs/{lab_id}/nodes/{node_id}/revisions")
+    def list_revisions(lab_id: int, node_id: int):
+        node = get_node(get_lab(lab_id), node_id)
+        return {"node": node.id, "name": node.name, "revisions": backups.revisions(node.id)}
+
+    @app.get("/api/labs/{lab_id}/nodes/{node_id}/revisions/diff")
+    def diff_revisions(lab_id: int, node_id: int, a: str, b: str):
+        node = get_node(get_lab(lab_id), node_id)
+        try:
+            return backups.diff(node.id, a, b)
+        except KeyError as e:
+            raise NotFound(f"No revision {e.args[0]} for {node.name}.")
+
+    @app.get("/api/labs/{lab_id}/nodes/{node_id}/revisions/{rev}")
+    def read_revision(lab_id: int, node_id: int, rev: str):
+        node = get_node(get_lab(lab_id), node_id)
+        try:
+            text = backups.read(node.id, rev)
+        except KeyError:
+            raise NotFound(f"No revision {rev} for {node.name}.")
+        return PlainTextResponse(text, headers={
+            "Content-Disposition": f'attachment; filename="{node.name}-{rev}.txt"'})
 
     # -- annotations -----------------------------------------------------
 

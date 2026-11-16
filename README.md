@@ -26,6 +26,8 @@ available through the API (interactive docs at `/docs`).
 - A live packet view in the browser (Tools menu, or Packets on any running port), with
   capture filters, alongside pcap download for Wireshark.
 - Topology export as a PNG image, device duplication, double-click to open a console.
+- Automatic config backups per lab (all routers or chosen ones, every 15 minutes to 24
+  hours), kept as revisions only when the config changed, with a side-by-side compare.
 - Settings: light or dark theme, grid, snapping, port labels, defaults for new routers.
 - Browser console for routers (serial port) and clients (shell), over a websocket.
 - Live packet capture of any port as a pcap stream you can pipe into Wireshark.
@@ -152,6 +154,8 @@ Add `?seconds=30` for a capture that ends by itself; the workspace's Capture lin
 - Config export, import and hostname push are untested against a real router. They need
   the router running, linked to the Cloud, and its RouterOS login.
 - `cloudsetup` (bridged mode) is untested on a real VM.
+- Automatic backups store the RouterOS login on the server in `backup.json` (readable by
+  root only), because they run unattended.
 - A lab file carries the topology only. Export router configs separately.
 - Clients share the VM's filesystem; they are namespaces, not full machines.
 - Stopping a router kills QEMU rather than shutting RouterOS down cleanly.

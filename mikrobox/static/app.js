@@ -639,7 +639,8 @@ function linkDialog(r1, r2) {
 
 // -------------------------------------------------------------- modal
 
-function openModal(title, fields, okLabel, onSubmit, onCancel) {
+function openModal(title, fields, okLabel, onSubmit, onCancel, wide) {
+  $("#modal-box").classList.toggle("wide", !!wide);
   $("#modal-title").textContent = title;
   $("#modal-ok").textContent = okLabel;
   $("#modal-ok").hidden = !onSubmit;
@@ -1029,6 +1030,14 @@ function nodeInspector(n) {
         h("button", { type: "button", disabled: !reachable, onclick: () => importConfig(n) }, "Import"),
         h("button", { type: "button", disabled: !reachable, onclick: () => pushIdentity(n) }, "Push hostname")),
       !reachable && h("p", {}, "These need the router running and linked to the Cloud."),
+      h("p", {}, backupLine(n)),
+      h("div", { class: "row" },
+        h("button", { type: "button", disabled: !reachable, onclick: () => backupNow(n) }, "Back up now"),
+        h("button", { type: "button", onclick: () => revisionsDialog(n.id) }, `Revisions (${n.backup.revisions})`)),
+      state.lab.backup.scope === "selected" && h("div", { class: "field check", style: "margin-top:8px" },
+        h("input", { id: "i-bk", type: "checkbox", checked: n.backup.included,
+          onchange: (e) => act(() => api("PUT", `${path}/backup`, { included: e.target.checked })) }),
+        h("label", { for: "i-bk" }, "Include in automatic backups")),
       h("div", { class: "row", style: "margin-top:8px" },
         h("button", { type: "button", disabled: n.running, onclick: () => {
           if (!confirm(`Reset ${n.name} to factory defaults? Its configuration is erased.`)) return;
@@ -1054,6 +1063,15 @@ function duplicateDialog(n) {
     const node = await api("POST", `${labPath()}/nodes/${n.id}/duplicate`, { name: v.name, copy_config: !!v.copy_config });
     state.sel = { type: "node", id: node.id };
   });
+}
+
+function backupLine(n) {
+  const b = state.lab.backup;
+  let text = !b.enabled ? "Automatic backups are off for this lab."
+    : n.backup.included ? `Backed up automatically every ${EVERY[b.interval]}.`
+    : "Not included in automatic backups.";
+  if (n.backup.last) text += ` Last attempt: ${n.backup.last.message.toLowerCase()}.`;
+  return text;
 }
 
 function deleteSelected() {
@@ -1379,6 +1397,12 @@ const ACTIONS = {
   "cfg-import": () => { const n = selectedRouter(); if (n) importConfig(n); },
   "cfg-identity": () => { const n = selectedRouter(); if (n) pushIdentity(n); },
   "tool-packets": () => packetDialog(),
+  "bak-settings": () => backupDialog(),
+  "bak-run": () => backupNow(null),
+  "bak-compare": () => {
+    const sel = state.sel && state.sel.type === "node" ? nodeById(state.sel.id) : null;
+    revisionsDialog(sel && sel.kind === "chr" ? sel.id : null);
+  },
   "acct-logout": async () => {
     try { await api("POST", "/auth/logout"); } catch (e) { /* going to the sign-in page anyway */ }
     location.replace("/login");
@@ -1400,6 +1424,116 @@ const ACTIONS = {
     } catch (e) { toast(e.message, true); }
   },
 };
+
+// ---------------------------------------------- backups and revisions
+
+const EVERY = { 15: "15 minutes", 60: "hour", 360: "6 hours", 1440: "24 hours" };
+const revTime = (id) => new Date(Date.UTC(+id.slice(0, 4), +id.slice(4, 6) - 1, +id.slice(6, 8),
+  +id.slice(9, 11), +id.slice(11, 13), +id.slice(13, 15))).toLocaleString();
+
+function backupDialog() {
+  const b = state.lab.backup;
+  const routers = state.lab.nodes.filter((n) => n.kind === "chr");
+  const last = routers.filter((n) => n.backup && n.backup.last).map((n) =>
+    h("li", {}, h("b", {}, n.name), h("span", { class: n.backup.last.ok ? "" : "bad" },
+      `${n.backup.last.message} (${new Date(n.backup.last.time * 1000).toLocaleTimeString()})`)));
+  openModal("Automatic backups", [
+    { node: h("p", {}, "Saves each router's config on a schedule. A new revision is kept only when the config has changed. Routers must be running and linked to the Cloud.") },
+    { key: "enabled", label: "Back up this lab automatically", type: "checkbox", value: b.enabled },
+    { key: "scope", label: "Which routers", type: "select", value: b.scope,
+      options: [{ value: "all", label: "All routers in this lab" }, { value: "selected", label: "Only routers I switch it on for" }] },
+    { key: "interval", label: "How often", type: "select", value: b.interval,
+      options: Object.entries(EVERY).map(([value, label]) => ({ value, label: "Every " + label })) },
+    { node: h("h2", {}, "RouterOS login used for the backup") },
+    { key: "username", label: "User", value: b.username },
+    { key: "password", label: b.has_password ? "Password (leave blank to keep the saved one)" : "Password (blank on a fresh CHR)", type: "password", value: "" },
+    { key: "sensitive", label: "Include passwords and keys in the backups", type: "checkbox", value: b.sensitive },
+    { node: h("p", {}, "The login is stored on the server so backups can run unattended.") },
+    last.length && { node: h("h2", {}, "Last attempt") },
+    last.length && { node: h("ul", { class: "bk-list" }, last) },
+  ].filter(Boolean), "Save", async (v) => {
+    const body = { enabled: v.enabled, scope: v.scope, interval: Number(v.interval), username: v.username || "admin", sensitive: v.sensitive };
+    if (v.password) body.password = v.password;
+    await api("PUT", `${labPath()}/backup`, body);
+    toast(v.enabled ? `Backing up every ${EVERY[v.interval]}.` : "Automatic backups are off.");
+  });
+  $("#m-password").autocomplete = "new-password";
+}
+
+async function backupNow(node) {
+  toast(node ? `Backing up ${node.name}` : "Backing up");
+  try {
+    const { results } = await api("POST", `${labPath()}/backup/run`, node ? { node: node.id } : {});
+    if (!results.length) { toast("No routers are included in backups.", true); return; }
+    const ok = results.filter((r) => r.ok), bad = results.filter((r) => !r.ok);
+    const changed = ok.filter((r) => r.changed).length;
+    const summary = node
+      ? `${node.name}: ${results[0].message}`
+      : `${ok.length} backed up, ${changed} with changes` + (bad.length ? `. Skipped: ${bad.map((r) => `${r.name} (${r.message})`).join(", ")}` : "");
+    toast(summary, !ok.length);
+  } catch (e) { toast(e.message, true); }
+  refresh(true).catch(() => {});
+}
+
+function revisionsDialog(nodeId) {
+  const routers = state.lab.nodes.filter((n) => n.kind === "chr");
+  if (!routers.length) { toast("This lab has no routers.", true); return; }
+  const start = routers.find((n) => n.id === nodeId) || routers.find((n) => n.backup.revisions > 1) || routers.find((n) => n.backup.revisions) || routers[0];
+  const pick = h("select", { id: "m-rnode" }, routers.map((n) => h("option", { value: n.id }, `${n.name} (${n.backup.revisions})`)));
+  pick.value = String(start.id);
+  const selA = h("select", { id: "m-ra" }), selB = h("select", { id: "m-rb" });
+  const summary = h("p", {}), view = h("div", { class: "diff", tabindex: 0 }), links = h("p", {});
+  const base = () => `${labPath()}/nodes/${pick.value}/revisions`;
+
+  const showDiff = async () => {
+    view.replaceChildren();
+    links.replaceChildren();
+    if (!selB.value) return;
+    const name = nodeById(Number(pick.value)).name;
+    links.append("Download: ",
+      selA.value && h("a", { href: `/api${base()}/${selA.value}`, download: "" }, "older"), selA.value && " · ",
+      h("a", { href: `/api${base()}/${selB.value}`, download: "" }, selA.value ? "newer" : "this revision"));
+    if (!selA.value) { summary.textContent = `${name} has one revision so far, so there is nothing to compare it with.`; return; }
+    if (selA.value === selB.value) { summary.textContent = "Pick two different revisions."; return; }
+    try {
+      const d = await api("GET", `${base()}/diff?a=${selA.value}&b=${selB.value}`);
+      summary.textContent = d.lines.length
+        ? `${d.added} line${d.added === 1 ? "" : "s"} added, ${d.removed} removed.`
+        : "These two revisions are the same.";
+      view.replaceChildren(...d.lines.map((l) => h("div", { class: { "+": "add", "-": "del", "@": "hunk" }[l.t] || "" },
+        l.t === "@" ? l.s : `${l.t} ${l.s}`)));
+    } catch (e) { summary.textContent = e.message; }
+  };
+
+  const loadNode = async () => {
+    let data;
+    try { data = await api("GET", base()); } catch (e) { summary.textContent = e.message; return; }
+    const opts = () => data.revisions.map((r) => h("option", { value: r.id }, `${revTime(r.id)} · ${r.lines} lines`));
+    selA.replaceChildren(...opts());
+    selB.replaceChildren(...opts());
+    view.replaceChildren();
+    links.replaceChildren();
+    if (!data.revisions.length) {
+      summary.textContent = `No backups of ${data.name} yet. Use Back up now, or switch on automatic backups.`;
+      return;
+    }
+    selB.value = data.revisions[0].id;           // newest
+    if (data.revisions[1]) selA.value = data.revisions[1].id; else selA.replaceChildren();
+    showDiff();
+  };
+
+  pick.addEventListener("change", loadNode);
+  selA.addEventListener("change", showDiff);
+  selB.addEventListener("change", showDiff);
+  openModal("Compare revisions", [
+    { node: h("div", { class: "cmp" },
+      h("div", { class: "field" }, h("label", { for: "m-rnode" }, "Router"), pick),
+      h("div", { class: "field" }, h("label", { for: "m-ra" }, "Older revision"), selA),
+      h("div", { class: "field" }, h("label", { for: "m-rb" }, "Newer revision"), selB)) },
+    { node: summary }, { node: view }, { node: links },
+  ], "", null, null, true);
+  loadNode();
+}
 
 async function accountsDialog() {
   let data;

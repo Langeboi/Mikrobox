@@ -216,6 +216,18 @@ pre.out { max-height: 180px; overflow: auto; background: var(--surface-2); paddi
 /* ---- modal and toast ---- */
 #modal { position: fixed; inset: 0; z-index: 20; background: rgba(10, 16, 26, .5); display: flex; align-items: center; justify-content: center; padding: 16px; }
 #modal-box { width: 420px; max-width: 100%; max-height: 100%; overflow: auto; background: var(--surface); border-radius: 14px; padding: 20px; box-shadow: var(--shadow); }
+#modal-box.wide { width: 920px; }
+.diff { font: 12px/1.5 ui-monospace, "SF Mono", Consolas, monospace; border: 1px solid var(--line); border-radius: 8px; max-height: 46vh; overflow: auto; background: var(--surface); }
+.diff div { padding: 0 10px; white-space: pre-wrap; overflow-wrap: anywhere; }
+.diff .add { background: color-mix(in srgb, #1f9d55 18%, transparent); }
+.diff .del { background: color-mix(in srgb, #d64545 18%, transparent); }
+.diff .hunk { color: var(--muted); background: var(--surface-2); }
+.cmp { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px; }
+@media (max-width: 700px) { .cmp { grid-template-columns: 1fr; } }
+.bk-list { list-style: none; padding: 0; margin: 0; font-size: 13px; }
+.bk-list li { padding: 4px 0; border-top: 1px solid var(--line); display: flex; gap: 8px; }
+.bk-list li b { font-weight: 600; min-width: 90px; }
+.bk-list .bad { color: var(--danger); }
 #modal-title { font-size: 17px; letter-spacing: 0; color: var(--text); margin-bottom: 14px; }
 #modal-fields h2 { margin-top: 14px; }
 .tpl { padding: 10px 12px; background: var(--surface-2); border-radius: 8px; margin-bottom: 10px; font-size: 13px; }
