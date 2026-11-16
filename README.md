@@ -19,6 +19,9 @@ available through the API (interactive docs at `/docs`).
 - Lab export and import as a single JSON file (topology, shapes and notes).
 - Router config export (one router, or all as a zip), config import, hostname push and
   factory reset, over SSH on the management network.
+- A live packet view in the browser (Tools menu, or Packets on any running port), with
+  capture filters, alongside pcap download for Wireshark.
+- Topology export as a PNG image, device duplication, double-click to open a console.
 - Settings: light or dark theme, grid, snapping, port labels, defaults for new routers.
 - Browser console for routers (serial port) and clients (shell), over a websocket.
 - Live packet capture of any port as a pcap stream you can pipe into Wireshark.

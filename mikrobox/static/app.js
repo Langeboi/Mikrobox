@@ -64,11 +64,10 @@ const state = {
   sel: null,        // {type: "node" | "link" | "mgmt" | "anno", id}
   tool: "select",
   linkFrom: null,
-  activeConsole: null,
+  activeDock: null,
   collapsed: false, // details panel folded down to its title
 };
 const view = { x: 90, y: 20, k: 1 };
-const consoles = new Map(); // node id -> {term, fit, ws, pane, name}
 let drag = null;
 
 // -------------------------------------------------------- preferences
@@ -864,6 +863,7 @@ function linkInspector(link) {
     h("section", {}, h("h2", {}, "Packet capture"),
       live
         ? [
+            h("button", { type: "button", onclick: () => openPackets(live[0], live[1]) }, "Open packet view"),
             h("p", {}, h("a", { href: captureUrl(live[0], live[1], 30), download: "" }, "Download a 30 second capture")),
             h("p", {}, "Or watch it live in Wireshark:"),
             copyRow(`curl -sN ${location.origin}${captureUrl(live[0], live[1])} | wireshark -k -i -`),
@@ -938,7 +938,10 @@ function nodeInspector(n) {
     rows.push(h("tr", {},
       h("td", { class: "mono" }, portName(n, p)),
       h("td", {}, peerText(n, p)),
-      h("td", {}, n.running && h("a", { href: captureUrl(n, p, 30), download: "", title: "Download a 30 second packet capture" }, "Capture"))));
+      h("td", {}, n.running && [
+        h("a", { href: "#", title: "Watch packets on this port", onclick: (e) => { e.preventDefault(); openPackets(n, p); } }, "Packets"),
+        " · ",
+        h("a", { href: captureUrl(n, p, 30), download: "", title: "Download a 30 second pcap for Wireshark" }, "pcap")])));
   }
 
   const access = [];
@@ -991,8 +994,25 @@ function nodeInspector(n) {
           act(async () => { await api("POST", path + "/reset"); toast(`${n.name} will boot with factory defaults.`); });
         } }, "Factory reset"))),
     h("section", {},
-      h("button", { type: "button", class: "danger", onclick: () => deleteSelected() }, "Delete device")),
+      h("div", { class: "row" },
+        h("button", { type: "button", onclick: () => duplicateDialog(n) }, "Duplicate"),
+        h("button", { type: "button", class: "danger", onclick: () => deleteSelected() }, "Delete device"))),
   ];
+}
+
+function duplicateDialog(n) {
+  const isChr = n.kind === "chr";
+  const stem = n.name.replace(/\d+$/, "");
+  const fields = [
+    { node: h("p", {}, `Makes a new ${isChr ? "router" : "client"} with the same settings as ${n.name}. Links are not copied.`) },
+    { key: "name", label: "Hostname for the copy", value: stem !== n.name ? nextName(stem) : nextName(n.name + "-") },
+  ];
+  if (isChr && !n.running) fields.push({ key: "copy_config", label: `Also copy ${n.name}'s saved configuration`, type: "checkbox", value: false });
+  if (isChr && n.running) fields.push({ node: h("p", {}, `The copy starts with factory defaults. To copy the configuration too, stop ${n.name} first.`) });
+  openModal(`Duplicate ${n.name}`, fields, "Duplicate", async (v) => {
+    const node = await api("POST", `${labPath()}/nodes/${n.id}/duplicate`, { name: v.name, copy_config: !!v.copy_config });
+    state.sel = { type: "node", id: node.id };
+  });
 }
 
 function deleteSelected() {
@@ -1001,7 +1021,7 @@ function deleteSelected() {
   if (sel.type === "node") {
     const n = nodeById(sel.id);
     if (!confirm(`Delete ${n.name}? Its configuration is lost.`)) return;
-    closeConsole(n.id);
+    closeNodeTabs(n.id);
     act(async () => { await api("DELETE", `${labPath()}/nodes/${n.id}`); state.sel = null; });
   } else {
     const kind = sel.type === "link" ? "links" : "annotations";
@@ -1009,10 +1029,51 @@ function deleteSelected() {
   }
 }
 
-// ------------------------------------------------------------ console
+// --------------------------------------------- dock: terminals, packets
+
+// key -> {name, pane, onShow, close}. Keys: "c:<node>" terminal, "p:<node>:<port>" packets.
+const dock = new Map();
+
+function dockShow(key) {
+  state.activeDock = key;
+  renderDock();
+}
+
+function dockClose(key) {
+  const d = dock.get(key);
+  if (!d) return;
+  d.close();
+  d.pane.remove();
+  dock.delete(key);
+  if (state.activeDock === key) state.activeDock = dock.keys().next().value ?? null;
+  renderDock();
+}
+
+function closeNodeTabs(nodeId) {
+  for (const key of [...dock.keys()]) {
+    if (key === `c:${nodeId}` || key.startsWith(`p:${nodeId}:`)) dockClose(key);
+  }
+}
+
+function renderDock() {
+  $("#dock").hidden = dock.size === 0;
+  $("#tabs").replaceChildren(...[...dock].map(([key, d]) =>
+    h("div", { class: "tab" + (key === state.activeDock ? " on" : "") },
+      h("button", { type: "button", class: "name", onclick: () => dockShow(key) }, d.name),
+      h("button", { type: "button", "aria-label": `Close ${d.name}`, onclick: () => dockClose(key) }, "×"))));
+  for (const [key, d] of dock) {
+    d.pane.hidden = key !== state.activeDock;
+    if (key === state.activeDock && d.onShow) requestAnimationFrame(d.onShow);
+  }
+}
+
+function wsUrl(path) {
+  return `${location.protocol === "https:" ? "wss" : "ws"}://${location.host}/api${path}`;
+}
 
 function openConsole(node) {
-  if (!consoles.has(node.id)) {
+  const key = `c:${node.id}`;
+  if (!dock.has(key)) {
     const pane = h("div", {});
     $("#terms").append(pane);
     $("#dock").hidden = false;
@@ -1020,48 +1081,226 @@ function openConsole(node) {
     const fit = new FitAddon.FitAddon();
     term.loadAddon(fit);
     term.open(pane);
-    const proto = location.protocol === "https:" ? "wss" : "ws";
-    const ws = new WebSocket(`${proto}://${location.host}/api${labPath()}/nodes/${node.id}/console`);
+    const ws = new WebSocket(wsUrl(`${labPath()}/nodes/${node.id}/console`));
     ws.binaryType = "arraybuffer";
     ws.onopen = () => ws.send("\r");
     ws.onmessage = (e) => term.write(typeof e.data === "string" ? e.data : new Uint8Array(e.data));
     ws.onclose = () => term.write("\r\n[disconnected]\r\n");
     term.onData((data) => { if (ws.readyState === 1) ws.send(data); });
-    consoles.set(node.id, { term, fit, ws, pane, name: node.name });
+    dock.set(key, {
+      name: node.name, pane,
+      onShow: () => { try { fit.fit(); term.focus(); } catch (e) { /* not visible yet */ } },
+      close: () => { ws.close(); term.dispose(); },
+    });
   }
-  state.activeConsole = node.id;
-  renderDock();
+  dockShow(key);
 }
 
-function closeConsole(id) {
-  const c = consoles.get(id);
-  if (!c) return;
-  c.ws.close();
-  c.term.dispose();
-  c.pane.remove();
-  consoles.delete(id);
-  if (state.activeConsole === id) state.activeConsole = consoles.keys().next().value ?? null;
-  renderDock();
+const PROTO_COLOR = {
+  ICMP: "green", ICMPv6: "green", ARP: "amber", DHCP: "amber", OSPF: "purple", BGP: "purple",
+  RIP: "purple", VRRP: "purple", BFD: "purple", LDP: "purple", PIM: "purple", IGMP: "purple",
+  STP: "red", LLDP: "red", LACP: "red", MNDP: "red",
+};
+
+function openPackets(node, port) {
+  const key = `p:${node.id}:${port}`;
+  if (!dock.has(key)) {
+    const title = `${node.name} ${portName(node, port)}`;
+    const path = `${labPath()}/nodes/${node.id}/ports/${port}`;
+    const st = { ws: null, paused: false, n: 0, picked: null };
+    const rows = h("tbody", {});
+    const status = h("span", { class: "pv-status" }, "Connecting");
+    const detail = h("div", { class: "pv-detail mono" }, "Select a packet to see tcpdump's full line for it.");
+    const filter = h("input", { type: "text", placeholder: "Filter, e.g. icmp   or   port 179   or   not arp", "aria-label": "Capture filter" });
+    const scroller = h("div", { class: "pv-scroll" },
+      h("table", { class: "pv-table" },
+        h("thead", {}, h("tr", {}, ["No.", "Time", "Source", "Destination", "Protocol", "Length", "Info"].map((t) => h("th", {}, t)))),
+        rows));
+    const pause = h("button", { type: "button", onclick: () => {
+      st.paused = !st.paused;
+      pause.textContent = st.paused ? "Resume" : "Pause";
+      status.textContent = st.paused ? "Paused" : "Listening";
+    } }, "Pause");
+
+    const add = (list) => {
+      const stick = scroller.scrollTop + scroller.clientHeight >= scroller.scrollHeight - 30;
+      for (const pk of list) {
+        st.n += 1;
+        const tr = h("tr", { tabindex: 0 },
+          h("td", {}, st.n), h("td", {}, pk.time), h("td", {}, pk.src), h("td", {}, pk.dst),
+          h("td", {}, h("span", { class: `tag c-${PROTO_COLOR[pk.proto] || "blue"}` }, pk.proto)),
+          h("td", {}, pk.length), h("td", {}, pk.info));
+        const pick = () => {
+          if (st.picked) st.picked.classList.remove("on");
+          st.picked = tr;
+          tr.classList.add("on");
+          detail.textContent = pk.raw;
+        };
+        tr.addEventListener("click", pick);
+        tr.addEventListener("keydown", (e) => { if (e.key === "Enter") pick(); });
+        rows.append(tr);
+      }
+      while (rows.children.length > 2000) rows.firstChild.remove();
+      if (stick) scroller.scrollTop = scroller.scrollHeight;
+    };
+
+    const connect = () => {
+      if (st.ws) { st.ws.onclose = null; st.ws.close(); }
+      const f = filter.value.trim();
+      status.textContent = "Connecting";
+      const ws = new WebSocket(wsUrl(`${path}/packets`) + (f ? `?filter=${encodeURIComponent(f)}` : ""));
+      st.ws = ws;
+      let failed = false;
+      ws.onopen = () => { status.textContent = st.paused ? "Paused" : "Listening"; };
+      ws.onmessage = (e) => {
+        const msg = JSON.parse(e.data);
+        if (msg.error) { failed = true; status.textContent = msg.error; return; }
+        if (!st.paused && msg.packets) add(msg.packets);
+      };
+      ws.onclose = () => { if (!failed) status.textContent = "Stopped"; };
+    };
+
+    const pane = h("div", { class: "pv" },
+      h("form", { class: "pv-bar", onsubmit: (e) => { e.preventDefault(); connect(); } },
+        h("strong", {}, title), filter,
+        h("button", { type: "submit" }, "Apply"),
+        pause,
+        h("button", { type: "button", onclick: () => { rows.replaceChildren(); st.n = 0; st.picked = null; } }, "Clear"),
+        h("a", { href: `/api${path}/capture?seconds=30`, download: "", title: "Download a 30 second pcap for Wireshark" }, "pcap"),
+        status),
+      scroller, detail);
+    $("#terms").append(pane);
+    dock.set(key, { name: `${title} packets`, pane, onShow: null, close: () => { if (st.ws) { st.ws.onclose = null; st.ws.close(); } } });
+    connect();
+  }
+  dockShow(key);
 }
 
-function renderDock() {
-  $("#dock").hidden = consoles.size === 0;
-  $("#tabs").replaceChildren(...[...consoles].map(([id, c]) =>
-    h("div", { class: "tab" + (id === state.activeConsole ? " on" : "") },
-      h("button", { type: "button", class: "name", onclick: () => { state.activeConsole = id; renderDock(); } }, c.name),
-      h("button", { type: "button", "aria-label": `Close ${c.name} console`, onclick: () => closeConsole(id) }, "×"))));
-  for (const [id, c] of consoles) {
-    c.pane.hidden = id !== state.activeConsole;
-    if (id === state.activeConsole) {
-      requestAnimationFrame(() => { try { c.fit.fit(); c.term.focus(); } catch (e) { /* not visible yet */ } });
+function packetDialog() {
+  const sel = state.sel;
+  // A selected link opens straight away, on whichever end is running.
+  if (sel && sel.type === "link") {
+    const l = state.lab.links.find((x) => x.id === sel.id);
+    const end = [l.a, l.b].find((e) => e && nodeById(e.node).running);
+    if (end) { openPackets(nodeById(end.node), end.port); return; }
+  }
+  const options = [];
+  for (const n of state.lab.nodes) {
+    if (!n.running) continue;
+    for (let p = 1; p <= n.ports; p++) {
+      const peer = peerText(n, p);
+      if (peer !== "Not connected") options.push({ value: `${n.id}:${p}`, label: `${n.name} ${portName(n, p)}  (to ${peer})`, node: n.id });
     }
   }
+  if (!options.length) { toast("Start a device that has a link first. There is nothing to listen on yet.", true); return; }
+  const mine = sel && sel.type === "node" ? options.find((o) => o.node === sel.id) : null;
+  openModal("Packet view", [
+    { key: "port", label: "Port to listen on", type: "select", options, value: (mine || options[0]).value },
+  ], "Open", async (v) => {
+    const [id, port] = v.port.split(":").map(Number);
+    openPackets(nodeById(id), port);
+  });
 }
 
 window.addEventListener("resize", () => {
-  const c = consoles.get(state.activeConsole);
-  if (c) { try { c.fit.fit(); } catch (e) { /* ignore */ } }
+  const d = dock.get(state.activeDock);
+  if (d && d.onShow) d.onShow();
 });
+
+// ------------------------------------------------------- export as PNG
+
+const STYLE_PROPS = ["fill", "stroke", "stroke-width", "stroke-dasharray", "stroke-linecap", "stroke-linejoin",
+  "font-size", "font-family", "font-weight", "text-anchor", "paint-order", "opacity"];
+
+function wrapLines(text, font, width, nowrap) {
+  const ctx = document.createElement("canvas").getContext("2d");
+  ctx.font = font;
+  const out = [];
+  for (const para of text.split("\n")) {
+    if (nowrap) { out.push(para); continue; }
+    let line = "";
+    for (const word of para.split(/\s+/)) {
+      const next = line ? line + " " + word : word;
+      if (line && ctx.measureText(next).width > width) { out.push(line); line = word; }
+      else line = next;
+    }
+    out.push(line);
+  }
+  return out;
+}
+
+// Text inside shapes is HTML on screen; an image needs it as plain SVG text.
+function foreignToText(fo) {
+  const div = fo.firstElementChild, cs = getComputedStyle(div);
+  const size = parseFloat(cs.fontSize), lh = parseFloat(cs.lineHeight) || size * 1.45;
+  const padX = parseFloat(cs.paddingLeft) || 0, padY = parseFloat(cs.paddingTop) || 0;
+  const x0 = Number(fo.getAttribute("x")), y0 = Number(fo.getAttribute("y"));
+  const w = Number(fo.getAttribute("width")), hgt = Number(fo.getAttribute("height"));
+  const center = cs.textAlign === "center";
+  const lines = wrapLines(div.textContent, `${cs.fontWeight} ${size}px ${cs.fontFamily}`, w - 2 * padX, cs.whiteSpace === "nowrap");
+  const x = center ? x0 + w / 2 : x0 + padX;
+  const max = Math.max(1, Math.floor((hgt - padY) / lh));
+  return s("text", { style: `font-size:${size}px;font-family:${cs.fontFamily};font-weight:${cs.fontWeight};fill:${cs.color}`,
+    "text-anchor": center ? "middle" : "start" },
+    lines.slice(0, max).map((line, i) => s("tspan", { x, y: y0 + padY + (lh - size) / 2 + size * 0.82 + i * lh }, line)));
+}
+
+function inlineStyles(orig, clone) {
+  if (orig.tagName !== "g") {
+    const cs = getComputedStyle(orig);
+    clone.setAttribute("style", STYLE_PROPS.map((p) => `${p}:${cs.getPropertyValue(p)}`).join(";"));
+  }
+  clone.removeAttribute("class");
+  clone.removeAttribute("tabindex");
+  const kids = [...orig.children], copies = [...clone.children];
+  kids.forEach((kid, i) => {
+    if (kid.tagName === "foreignObject") copies[i].replaceWith(foreignToText(kid));
+    else if (kid.tagName === "title" || kid.classList.contains("hit")) copies[i].remove();
+    else inlineStyles(kid, copies[i]);
+  });
+}
+
+function contentBounds() {
+  const lab = state.lab;
+  const xs = [lab.mgmt_x - 60, lab.mgmt_x + 60], ys = [lab.mgmt_y - 40, lab.mgmt_y + 55];
+  for (const n of lab.nodes) { xs.push(n.x - 60, n.x + 60); ys.push(n.y - 40, n.y + 72); }
+  for (const a of lab.annotations) { xs.push(a.x - 4, a.x + a.w + 4); ys.push(a.y - 4, a.y + a.h + 4); }
+  return { x0: Math.min(...xs), x1: Math.max(...xs), y0: Math.min(...ys), y1: Math.max(...ys) };
+}
+
+async function topologyPng(scale) {
+  const saved = { sel: state.sel, from: state.linkFrom };
+  state.sel = null;
+  state.linkFrom = null;
+  renderCanvas(); // without selection outlines
+  try {
+    const world = $("#world");
+    const clone = world.cloneNode(true);
+    inlineStyles(world, clone);
+    const b = contentBounds(), pad = 40;
+    const w = Math.ceil(b.x1 - b.x0 + 2 * pad), hgt = Math.ceil(b.y1 - b.y0 + 2 * pad);
+    clone.setAttribute("transform", `translate(${pad - b.x0},${pad - b.y0})`);
+    const svg = s("svg", { xmlns: SVGNS, width: w, height: hgt, viewBox: `0 0 ${w} ${hgt}` },
+      s("rect", { width: w, height: hgt, fill: getComputedStyle(document.body).backgroundColor }), clone);
+    const img = new Image();
+    await new Promise((ok, fail) => {
+      img.onload = ok;
+      img.onerror = () => fail(new Error("The browser could not render the topology as an image."));
+      img.src = "data:image/svg+xml;charset=utf-8," + encodeURIComponent(new XMLSerializer().serializeToString(svg));
+    });
+    // Keep very large labs inside what browsers will allocate for a canvas.
+    const k = Math.min(scale, 8000 / w, 8000 / hgt);
+    const canvas = document.createElement("canvas");
+    canvas.width = Math.round(w * k);
+    canvas.height = Math.round(hgt * k);
+    canvas.getContext("2d").drawImage(img, 0, 0, canvas.width, canvas.height);
+    return await new Promise((ok, fail) => canvas.toBlob((blob) => (blob ? ok(blob) : fail(new Error("PNG export failed."))), "image/png"));
+  } finally {
+    state.sel = saved.sel;
+    state.linkFrom = saved.from;
+    renderCanvas();
+  }
+}
 
 // ---------------------------------------------------- menus and top bar
 
@@ -1091,13 +1330,20 @@ const ACTIONS = {
   },
   "lab-delete": () => {
     if (!confirm(`Delete lab ${state.lab.name} and all its devices?`)) return;
-    for (const id of [...consoles.keys()]) closeConsole(id);
+    for (const key of [...dock.keys()]) dockClose(key);
     act(async () => { await api("DELETE", labPath()); state.lab = null; state.sel = null; });
   },
   "cfg-export": () => { const n = selectedRouter(); if (n) exportConfig(n); },
   "cfg-export-all": () => exportAllConfigs(),
   "cfg-import": () => { const n = selectedRouter(); if (n) importConfig(n); },
   "cfg-identity": () => { const n = selectedRouter(); if (n) pushIdentity(n); },
+  "tool-packets": () => packetDialog(),
+  "tool-png": async () => {
+    try {
+      saveBlob(await topologyPng(2), `${state.lab.name}.png`);
+      toast("Topology exported.");
+    } catch (e) { toast(e.message, true); }
+  },
 };
 
 function switchLab(lab) {

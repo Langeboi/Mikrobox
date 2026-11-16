@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import asyncio
 import io
 import ipaddress
+import json
+import re
 import subprocess
 import zipfile
 from contextlib import asynccontextmanager
@@ -18,6 +21,7 @@ from pydantic import BaseModel, Field, ValidationError
 from . import __version__, routeros
 from .config import Settings
 from .console import netns_console, serial_console
+from .packets import parse_line
 from .models import (
     NAME_PATTERN, Annotation, Endpoint, Lab, Link, Node, NodeKind, default_chr_ram, free_id,
 )
@@ -115,6 +119,11 @@ class ConfigExport(Creds):
 
 class ConfigImport(Creds):
     config: str = Field(min_length=1, max_length=2_000_000)
+
+
+class NodeDuplicate(BaseModel):
+    name: str = Field(pattern=NAME_PATTERN)
+    copy_config: bool = False
 
 
 class LinkCreate(BaseModel):
@@ -433,6 +442,29 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         rt.stop_node(lab, node)
         return node_view(lab, node)
 
+    @app.post("/api/labs/{lab_id}/nodes/{node_id}/duplicate", status_code=201)
+    def duplicate_node(lab_id: int, node_id: int, body: NodeDuplicate):
+        """A new device with the same settings and no links."""
+        with rt.lock:
+            lab = get_lab(lab_id)
+            src = get_node(lab, node_id)
+            check_name(lab, body.name)
+            if body.copy_config:
+                if src.kind != NodeKind.chr:
+                    raise Invalid("Only routers have a configuration to copy.")
+                if rt.node_running(src):
+                    raise Conflict(f"Stop {src.name} first to copy its configuration.")
+            node = src.model_copy(update={
+                "id": free_id({n.id for n in store.state.all_nodes()}), "name": body.name,
+                "x": src.x + 60, "y": src.y + 60,
+                "address": None,  # two clients with one address would only confuse
+            })
+            rt.delete_disk(node)  # a stale disk from an earlier node with this id
+            copied = body.copy_config and rt.copy_disk(src, node)
+            lab.nodes.append(node)
+            store.save()
+            return {**node_view(lab, node), "config_copied": bool(copied)}
+
     @app.post("/api/labs/{lab_id}/nodes/{node_id}/reset")
     def reset_node(lab_id: int, node_id: int):
         """Throw away the router's disk so it boots with factory defaults."""
@@ -567,6 +599,69 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             media_type="application/vnd.tcpdump.pcap",
             headers={"Content-Disposition": f'attachment; filename="{node.name}-p{port}.pcap"'},
         )
+
+    @app.websocket("/api/labs/{lab_id}/nodes/{node_id}/ports/{port}/packets")
+    async def packets(ws: WebSocket, lab_id: int, node_id: int, port: int,
+                      bpf: str = Query(default="", alias="filter")):
+        """Live decoded packets as JSON: {"packets": [...]} batches, or {"error": "..."}."""
+        await ws.accept()
+        lab = store.state.lab(lab_id)
+        node = lab.node(node_id) if lab else None
+        iface = iface_name(node_id, port)
+        if node is None or port < 1 or port > node.ports or not rt.net.exists(iface):
+            await ws.send_text(json.dumps({"error": "That port is not up. Start the device first."}))
+            await ws.close()
+            return
+        if len(bpf) > 200 or not re.fullmatch(r"[\w\s.:/()\[\]!=<>&|-]*", bpf):
+            await ws.send_text(json.dumps({"error": "That filter has characters that are not allowed."}))
+            await ws.close()
+            return
+        proc = await asyncio.create_subprocess_exec(
+            "tcpdump", "-l", "-n", "-e", "-i", iface, *bpf.split(),
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+
+        async def pump():
+            while True:
+                line = await proc.stdout.readline()
+                if not line:
+                    break
+                batch = [line]
+                # Group whatever else arrives within a moment into one message.
+                try:
+                    while len(batch) < 200:
+                        more = await asyncio.wait_for(proc.stdout.readline(), 0.1)
+                        if not more:
+                            break
+                        batch.append(more)
+                except asyncio.TimeoutError:
+                    pass
+                rows = [r for r in (parse_line(l.decode(errors="replace")) for l in batch) if r]
+                if rows:
+                    await ws.send_text(json.dumps({"packets": rows}))
+            err = (await proc.stderr.read()).decode(errors="replace")
+            bad = [l for l in err.splitlines() if "error" in l.lower()]
+            if bad:
+                await ws.send_text(json.dumps({"error": bad[-1].replace("tcpdump: ", "")}))
+
+        async def wait_closed():
+            while True:
+                msg = await ws.receive()
+                if msg["type"] == "websocket.disconnect":
+                    return
+
+        tasks = [asyncio.create_task(pump()), asyncio.create_task(wait_closed())]
+        try:
+            await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+        finally:
+            for t in tasks:
+                t.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            if proc.returncode is None:
+                proc.terminate()
+            try:
+                await ws.close()
+            except Exception:  # the browser already went away
+                pass
 
     # -- console ---------------------------------------------------------
 

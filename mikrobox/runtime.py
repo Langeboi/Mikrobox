@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import ipaddress
 import os
+import shutil
 import signal
 import threading
 import time
@@ -313,6 +314,13 @@ class Runtime:
         for link in lab.links:
             if any(e.node == ep.node and e.port == ep.port for e in link.endpoints()):
                 raise Conflict(f"{node.name} port {ep.port} is already connected.")
+
+    def copy_disk(self, src: Node, dst: Node) -> bool:
+        """Give dst a copy of src's disk (its saved configuration). False if src has none."""
+        if not self.disk_path(src).exists():
+            return False
+        shutil.copyfile(self.disk_path(src), self.disk_path(dst))
+        return True
 
     def delete_disk(self, node: Node) -> None:
         self.disk_path(node).unlink(missing_ok=True)

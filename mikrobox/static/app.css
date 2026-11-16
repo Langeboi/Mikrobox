@@ -191,6 +191,23 @@ pre.out { max-height: 180px; overflow: auto; background: var(--surface-2); paddi
 #terms { flex: 1; min-height: 0; padding: 6px; }
 #terms > div { height: 100%; }
 
+/* ---- packet view ---- */
+#terms > .pv { margin: -6px; height: calc(100% + 12px); display: flex; flex-direction: column; background: var(--surface); color: var(--text); }
+.pv-bar { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; padding: 6px 10px; border-bottom: 1px solid var(--line); }
+.pv-bar input { flex: 1 1 180px; width: auto !important; min-height: 30px; }
+.pv-bar button { min-height: 30px; padding: 0 10px; }
+.pv-status { color: var(--muted); font-size: 13px; }
+.pv-scroll { flex: 1; min-height: 0; overflow: auto; }
+.pv-table { font: 12px/1.35 ui-monospace, "SF Mono", Consolas, monospace; }
+.pv-table th { position: sticky; top: 0; background: var(--surface-2); text-align: left; padding: 4px 8px; font: 600 12px system-ui, sans-serif; color: var(--muted); white-space: nowrap; }
+.pv-table td { padding: 2px 8px; border-top: 1px solid var(--line); white-space: nowrap; text-align: left; }
+.pv-table td:last-child { text-align: left; white-space: nowrap; width: 100%; }
+.pv-table tbody tr { cursor: pointer; }
+.pv-table tbody tr:hover { background: var(--surface-2); }
+.pv-table tbody tr.on { background: var(--accent-soft); }
+.pv-table .tag { color: var(--c); font-weight: 700; }
+.pv-detail { padding: 6px 10px; border-top: 1px solid var(--line); background: var(--surface-2); font-size: 12px; white-space: pre-wrap; overflow-wrap: anywhere; max-height: 64px; overflow: auto; color: var(--muted); }
+
 /* ---- modal and toast ---- */
 #modal { position: fixed; inset: 0; z-index: 20; background: rgba(10, 16, 26, .5); display: flex; align-items: center; justify-content: center; padding: 16px; }
 #modal-box { width: 420px; max-width: 100%; max-height: 100%; overflow: auto; background: var(--surface); border-radius: 14px; padding: 20px; box-shadow: var(--shadow); }

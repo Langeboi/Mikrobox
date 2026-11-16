@@ -384,3 +384,82 @@ def test_area_style_defaults_and_changes(client):
                         json={"border": "wavy"}).status_code == 422
     assert client.patch(f"/api/labs/{lab}/annotations/{a['id']}",
                         json={"border_width": 50}).status_code == 400
+
+
+def test_duplicate_node(client, monkeypatch):
+    lab = make_lab(client)
+    r1 = add_node(client, lab, name="R1", ports=4, cpus=2, x=100, y=100)
+    r2 = add_node(client, lab, name="R2")
+    client.post(f"/api/labs/{lab}/links",
+                json={"a": {"node": r1["id"], "port": 1}, "b": {"node": r2["id"], "port": 1}})
+    url = f"/api/labs/{lab}/nodes/{r1['id']}/duplicate"
+    assert client.post(url, json={"name": "R2"}).status_code == 409
+    r = client.post(url, json={"name": "R3"})
+    assert r.status_code == 201
+    copy = r.json()
+    assert (copy["ports"], copy["cpus"], copy["ram_mb"]) == (4, 2, r1["ram_mb"])
+    assert (copy["x"], copy["y"]) == (160, 160) and copy["id"] not in (r1["id"], r2["id"])
+    assert copy["config_copied"] is False
+    view = client.get(f"/api/labs/{lab}").json()
+    assert len(view["links"]) == 1 and not any(
+        e and e["node"] == copy["id"] for l in view["links"] for e in (l["a"], l["b"]))
+
+    disk = client.rt.disk_path(client.rt.store.state.lab(lab).node(r1["id"]))
+    disk.parent.mkdir(parents=True, exist_ok=True)
+    disk.write_bytes(b"router-config")
+    r = client.post(url, json={"name": "R4", "copy_config": True})
+    assert r.json()["config_copied"] is True
+    new = client.rt.store.state.lab(lab).node(r.json()["id"])
+    assert client.rt.disk_path(new).read_bytes() == b"router-config"
+    monkeypatch.setattr(client.rt, "node_running", lambda node: True)
+    assert client.post(url, json={"name": "R5", "copy_config": True}).status_code == 409
+
+    pc = add_node(client, lab, kind="client", name="PC1", address="10.0.0.2/24", gateway="10.0.0.1")
+    dup = client.post(f"/api/labs/{lab}/nodes/{pc['id']}/duplicate", json={"name": "PC2"}).json()
+    assert dup["address"] is None and dup["gateway"] == "10.0.0.1"
+
+
+def test_packet_lines_are_parsed():
+    from mikrobox.packets import parse_line
+
+    icmp = parse_line("22:43:01.123456 52:54:00:00:01:02 > 52:54:00:00:02:01, ethertype IPv4 "
+                      "(0x0800), length 98: 10.0.12.1 > 10.0.12.2: ICMP echo request, id 1, seq 1, length 64")
+    assert (icmp["src"], icmp["dst"], icmp["proto"], icmp["length"]) == ("10.0.12.1", "10.0.12.2", "ICMP", 98)
+    assert icmp["info"].startswith("ICMP echo request") and icmp["time"] == "22:43:01.123456"
+
+    bgp = parse_line("22:43:02.000001 52:54:00:00:01:02 > 52:54:00:00:02:01, ethertype IPv4 (0x0800), "
+                     "length 85: 10.0.12.1.179 > 10.0.12.2.41234: Flags [P.], seq 1:20, ack 1, win 501, length 19: BGP")
+    assert (bgp["src"], bgp["dst"], bgp["proto"]) == ("10.0.12.1", "10.0.12.2", "BGP")
+    assert bgp["info"].startswith("179 → 41234")
+
+    ospf = parse_line("22:43:03.5 52:54:00:00:01:02 > 01:00:5e:00:00:05, ethertype IPv4 (0x0800), "
+                      "length 78: 10.0.12.1 > 224.0.0.5: OSPFv2, Hello, length 44")
+    assert ospf["proto"] == "OSPF" and ospf["dst"] == "224.0.0.5"
+
+    arp = parse_line("22:43:04.1 52:54:00:00:01:02 > ff:ff:ff:ff:ff:ff, ethertype ARP (0x0806), "
+                     "length 42: Request who-has 10.0.12.2 tell 10.0.12.1, length 28")
+    assert (arp["proto"], arp["src"], arp["dst"]) == ("ARP", "10.0.12.1", "10.0.12.2")
+
+    mndp = parse_line("22:43:05.1 52:54:00:00:01:02 > ff:ff:ff:ff:ff:ff, ethertype IPv4 (0x0800), "
+                      "length 150: 10.0.12.1.5678 > 255.255.255.255.5678: UDP, length 108")
+    assert mndp["proto"] == "MNDP"
+
+    tagged = parse_line("22:43:06.1 52:54:00:00:01:02 > 52:54:00:00:02:01, ethertype 802.1Q (0x8100), length 102: "
+                        "vlan 10, p 0, ethertype IPv4 (0x0800), 192.168.10.1 > 192.168.10.2: ICMP echo reply, id 1, seq 1, length 64")
+    assert tagged["vlan"] == 10 and tagged["proto"] == "ICMP" and tagged["info"].startswith("VLAN 10")
+
+    v6 = parse_line("22:43:07.1 52:54:00:00:01:02 > 33:33:00:00:00:05, ethertype IPv6 (0x86dd), "
+                    "length 90: fe80::1 > ff02::5: OSPFv3, Hello, length 36")
+    assert (v6["src"], v6["dst"], v6["proto"]) == ("fe80::1", "ff02::5", "OSPF")
+
+    stp = parse_line("22:43:08.1 52:54:00:00:01:02 > 01:80:c2:00:00:00, 802.3, length 53: LLC, dsap STP (0x42) "
+                     "Individual, ssap STP (0x42) Command, ctrl 0x03: STP 802.1w, Rapid STP, Flags [Learn]")
+    assert stp["proto"] == "STP" and stp["src"] == "52:54:00:00:01:02"
+    assert parse_line("tcpdump: listening on mb1p1") is None
+
+
+def test_packet_view_refuses_a_port_that_is_down(client):
+    lab = make_lab(client)
+    r1 = add_node(client, lab, name="R1")
+    with client.websocket_connect(f"/api/labs/{lab}/nodes/{r1['id']}/ports/1/packets") as ws:
+        assert "not up" in ws.receive_json()["error"]
