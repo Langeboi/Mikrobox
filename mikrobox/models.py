@@ -19,6 +19,8 @@ class NodeKind(str, Enum):
 class Node(BaseModel):
     id: int
     kind: NodeKind
+    # How a CHR is presented. A switch is still a full CHR, just drawn and sized as one.
+    role: Literal["router", "switch"] = "router"
     name: str = Field(pattern=NAME_PATTERN)
     ports: int = Field(ge=1)
     cpus: int = Field(default=1, ge=1, le=8)

@@ -44,6 +44,7 @@ class LabUpdate(BaseModel):
 
 class NodeCreate(BaseModel):
     kind: NodeKind = NodeKind.chr
+    role: Literal["router", "switch"] = "router"
     name: str = Field(pattern=NAME_PATTERN)
     ports: Optional[int] = Field(default=None, ge=1)
     cpus: int = Field(default=1, ge=1, le=8)
@@ -374,14 +375,16 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             lab = get_lab(lab_id)
             check_name(lab, body.name)
             is_chr = body.kind == NodeKind.chr
-            ports = body.ports or (8 if is_chr else 1)
+            if body.role == "switch" and not is_chr:
+                raise Invalid("Only a CHR can be a switch.")
+            ports = body.ports or ((24 if body.role == "switch" else 8) if is_chr else 1)
             check_ports(body.kind, ports)
             if is_chr and (body.address or body.gateway):
                 raise Invalid("address and gateway apply to client nodes only.")
             ram = body.ram_mb or (default_chr_ram(body.cpus, ports) if is_chr else 128)
             node = Node(
                 id=free_id({n.id for n in store.state.all_nodes()}),
-                kind=body.kind, name=body.name, ports=ports, cpus=body.cpus,
+                kind=body.kind, role=body.role, name=body.name, ports=ports, cpus=body.cpus,
                 ram_mb=ram, address=body.address, gateway=body.gateway,
                 x=body.x, y=body.y,
             )

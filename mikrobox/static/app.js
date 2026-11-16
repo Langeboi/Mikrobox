@@ -26,6 +26,7 @@ const ICONS = {
   link: "M9 15l6-6 M10 6l1-1a4 4 0 0 1 6 6l-1 1 M14 18l-1 1a4 4 0 0 1-6-6l1-1",
   chr: "M3 12a9 9 0 1 0 18 0a9 9 0 1 0-18 0 M7 12h10 M12 7v10 M7 12l2-2 M7 12l2 2 M17 12l-2-2 M17 12l-2 2 M12 7l-2 2 M12 7l2 2 M12 17l-2-2 M12 17l2-2",
   client: "M4 5h16v11H4z M9 20h6 M12 16v4",
+  switch: "M3 7h18v10H3z M6.5 10.5h7 M11.5 8.5l2 2-2 2 M17.5 13.5h-7 M12.5 11.5l-2 2 2 2",
   rect: "M4 6h16v12H4z",
   ellipse: "M3 12a9 6.5 0 1 0 18 0a9 6.5 0 1 0-18 0",
   text: "M5 6h14 M12 6v13 M9 19h6",
@@ -43,6 +44,7 @@ const TOOLS = [
   { id: "link", label: "Link", tip: "Connect two ports" },
   null,
   { id: "chr", label: "Router", tip: "Add a MikroTik CHR router", add: true },
+  { id: "switch", label: "Switch", tip: "Add a CHR with 24 ports to use as a switch", add: true },
   { id: "client", label: "Client", tip: "Add a Linux client", add: true },
   null,
   { id: "rect", label: "Area", tip: "Draw a rectangular area", draw: true },
@@ -147,6 +149,11 @@ async function refresh(force) {
   const wanted = before ?? readStore("lab", null);
   state.lab = labs.find((l) => l.id === wanted) || labs[0] || null;
   if (state.lab && state.lab.id !== before) loadView();
+  if (textEdit && state.lab) {
+    // Keep what is being typed; the server copy is a moment behind.
+    const typing = state.lab.annotations.find((x) => x.id === textEdit.id);
+    if (typing) typing.text = textEdit.text;
+  }
   if (state.sel && state.lab) {
     const { type, id } = state.sel;
     if (type === "node" && !nodeById(id)) state.sel = null;
@@ -455,7 +462,7 @@ function renderCanvas() {
       s("g", { class: cls(ref, n.running ? " running" : ""), transform: `translate(${n.x},${n.y})`, ...handlers(ref) },
         s("title", {}, `${n.name} (${n.running ? "running" : "stopped"})`),
         s("rect", { class: "box", x: -30, y: -30, width: 60, height: 60, rx: 14 }),
-        s("path", { class: "glyph", d: ICONS[n.kind], transform: "translate(-15.6,-15.6) scale(1.3)" }),
+        s("path", { class: "glyph", d: ICONS[n.role === "switch" ? "switch" : n.kind], transform: "translate(-15.6,-15.6) scale(1.3)" }),
         s("circle", { class: "dot", cx: 26, cy: -26, r: 6.5 }),
         s("text", { y: 48 }, n.name),
         s("text", { class: "sub", y: 62 }, n.mgmt_ip || (n.kind === "client" && n.address) || ""),
@@ -694,10 +701,12 @@ function addNodeDialog(kind) {
     if (!state.lab.nodes.some((n) => Math.hypot(n.x - p.x, n.y - p.y) < 110)) at = p;
   }
   const maxPorts = (state.sys && state.sys.max_chr_ports) || 24;
-  const fields = kind === "chr"
+  const isSwitch = kind === "switch";
+  const fields = kind !== "client"
     ? [
-        { key: "name", label: "Hostname", value: nextName("R") },
-        { key: "ports", label: `Ethernet ports (1-${maxPorts})`, type: "number", value: prefs.defPorts, min: 1, max: maxPorts },
+        isSwitch && { node: h("p", {}, "A switch is a normal CHR with more ports. It boots unconfigured: add its ports to a bridge in RouterOS to make it switch.") },
+        { key: "name", label: "Hostname", value: nextName(isSwitch ? "SW" : "R") },
+        { key: "ports", label: `Ethernet ports (1-${maxPorts})`, type: "number", value: isSwitch ? maxPorts : prefs.defPorts, min: 1, max: maxPorts },
         { key: "cpus", label: "vCPUs", type: "number", value: prefs.defCpus, min: 1, max: 8 },
         { key: "ram_mb", label: "RAM in MB (blank = sized from ports)", type: "number", placeholder: "auto", min: 128 },
       ]
@@ -706,8 +715,9 @@ function addNodeDialog(kind) {
         { key: "address", label: "IP address (optional)", placeholder: "192.168.10.2/24" },
         { key: "gateway", label: "Gateway (optional)", placeholder: "192.168.10.1" },
       ];
-  openModal(kind === "chr" ? "Add router" : "Add client", fields, "Add", async (v) => {
-    const body = { kind, name: v.name, ...at };
+  openModal(isSwitch ? "Add switch" : kind === "chr" ? "Add router" : "Add client", fields.filter(Boolean), "Add", async (v) => {
+    const body = { kind: isSwitch ? "chr" : kind, name: v.name, ...at };
+    if (isSwitch) body.role = "switch";
     for (const k of ["ports", "cpus", "ram_mb"]) if (v[k]) body[k] = Number(v[k]);
     for (const k of ["address", "gateway"]) if (v[k]) body[k] = v[k];
     const node = await api("POST", `${labPath()}/nodes`, body);
@@ -886,11 +896,29 @@ function styleSelect(a, key, label, options) {
   return h("div", { class: "field" }, h("label", { for: id }, label), sel);
 }
 
+let textEdit = null; // typing not saved yet: {id, path, text, timer}
+
+function flushText() {
+  if (!textEdit) return;
+  const edit = textEdit;
+  textEdit = null;
+  clearTimeout(edit.timer);
+  api("PATCH", edit.path, { text: edit.text }).catch((err) => toast(err.message, true));
+}
+
 function annoInspector(a) {
   const path = `${labPath()}/annotations/${a.id}`;
   const area = a.kind === "rect" || a.kind === "ellipse";
-  const text = h("textarea", { id: "i-text", rows: area || a.kind === "text" ? 2 : 6,
-    onchange: (e) => act(() => api("PATCH", path, { text: e.target.value })) }, a.text);
+  // The canvas follows every keystroke; saving waits for a short pause in typing.
+  const text = h("textarea", { id: "i-text", rows: area || a.kind === "text" ? 2 : 6, maxlength: 2000,
+    oninput: (e) => {
+      const live = annoById(a.id);
+      if (live) live.text = e.target.value;
+      if (textEdit) clearTimeout(textEdit.timer);
+      textEdit = { id: a.id, path, text: e.target.value, timer: setTimeout(flushText, 500) };
+      renderCanvas();
+    },
+    onblur: () => flushText() }, a.text);
   return [
     head(KIND_NAME[a.kind]),
     h("div", { class: "status" }, area ? "Marks a group of devices, such as a site or an OSPF area." : "Shown on the canvas for everyone using this lab."),
@@ -961,7 +989,7 @@ function nodeInspector(n) {
   return [
     head(n.name),
     h("div", { class: "status" + (n.running ? " running" : "") }, h("i", {}),
-      (n.running ? "Running" : "Stopped") + " · " + (isChr ? "CHR router" : "Linux client")),
+      (n.running ? "Running" : "Stopped") + " · " + (isChr ? (n.role === "switch" ? "CHR switch" : "CHR router") : "Linux client")),
     h("div", { class: "row" },
       n.running
         ? h("button", { type: "button", onclick: () => act(() => api("POST", path + "/stop")) }, "Stop")
@@ -1004,7 +1032,7 @@ function duplicateDialog(n) {
   const isChr = n.kind === "chr";
   const stem = n.name.replace(/\d+$/, "");
   const fields = [
-    { node: h("p", {}, `Makes a new ${isChr ? "router" : "client"} with the same settings as ${n.name}. Links are not copied.`) },
+    { node: h("p", {}, `Makes a new ${isChr ? (n.role === "switch" ? "switch" : "router") : "client"} with the same settings as ${n.name}. Links are not copied.`) },
     { key: "name", label: "Hostname for the copy", value: stem !== n.name ? nextName(stem) : nextName(n.name + "-") },
   ];
   if (isChr && !n.running) fields.push({ key: "copy_config", label: `Also copy ${n.name}'s saved configuration`, type: "checkbox", value: false });

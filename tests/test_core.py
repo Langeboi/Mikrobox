@@ -463,3 +463,18 @@ def test_packet_view_refuses_a_port_that_is_down(client):
     r1 = add_node(client, lab, name="R1")
     with client.websocket_connect(f"/api/labs/{lab}/nodes/{r1['id']}/ports/1/packets") as ws:
         assert "not up" in ws.receive_json()["error"]
+
+
+def test_switch_is_a_chr_with_24_ports(client):
+    lab = make_lab(client)
+    sw = add_node(client, lab, name="SW1", role="switch")
+    assert (sw["kind"], sw["role"], sw["ports"], sw["ram_mb"]) == ("chr", "switch", 24, 256 + 8 * 23)
+    assert add_node(client, lab, name="R1")["role"] == "router"
+    assert client.post(f"/api/labs/{lab}/nodes",
+                       json={"kind": "client", "role": "switch", "name": "PC1"}).status_code == 400
+    client.rt.sh.history.clear()
+    assert client.post(f"/api/labs/{lab}/nodes/{sw['id']}/start").status_code == 200
+    qemu = next(c for c in client.rt.sh.history if c[0] == "qemu-system-x86_64")
+    assert sum(1 for arg in qemu if arg.startswith("virtio-net-pci")) == 24
+    dup = client.post(f"/api/labs/{lab}/nodes/{sw['id']}/duplicate", json={"name": "SW2"}).json()
+    assert dup["role"] == "switch" and dup["ports"] == 24
