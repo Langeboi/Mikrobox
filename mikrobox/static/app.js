@@ -166,6 +166,7 @@ async function refresh(force) {
   const before = state.lab ? state.lab.id : null;
   const wanted = before ?? readStore("lab", null);
   state.lab = labs.find((l) => l.id === wanted) || labs[0] || null;
+  if (state.lab) noteChanges(state.lab);
   if (state.lab && state.lab.id !== before) loadView();
   if (textEdit && state.lab) {
     // Keep what is being typed; the server copy is a moment behind.
@@ -402,6 +403,49 @@ function annoElement(a, selected) {
   return g;
 }
 
+// ---------------------------------------------------------------- motion
+//
+// Short animations for what just changed: a device starting or stopping, a new device,
+// a new link, a link coming up. The canvas is rebuilt on every update, so each change is
+// noted with its time and the rebuilt element starts its animation that far in (a negative
+// delay): it plays once, smoothly, however often the canvas redraws. Only changes seen
+// while a lab is open animate, never what was already there when it loaded. Turned off
+// for people who ask their system for reduced motion (see app.css).
+const MOTION_MS = { start: 1400, stop: 800, add: 420, link: 520, up: 1000 };
+const motion = { lab: null, seen: null, nodes: new Map(), links: new Map() };
+const linkUp = (lab, l) => {
+  const a = lab.nodes.find((n) => n.id === l.a.node), b = l.b && lab.nodes.find((n) => n.id === l.b.node);
+  return !!(a && a.running && (l.b ? b && b.running : true));
+};
+function noteChanges(lab) {
+  const now = performance.now();
+  const cur = { nodes: new Map(lab.nodes.map((n) => [n.id, n.running])), links: new Map(lab.links.map((l) => [l.id, linkUp(lab, l)])) };
+  const prev = motion.lab === lab.id ? motion.seen : null;
+  if (prev) {
+    for (const [id, running] of cur.nodes) {
+      if (!prev.nodes.has(id)) motion.nodes.set(id, { kind: "add", at: now });
+      else if (running !== prev.nodes.get(id)) motion.nodes.set(id, { kind: running ? "start" : "stop", at: now });
+    }
+    for (const [id, up] of cur.links) {
+      if (!prev.links.has(id)) motion.links.set(id, { kind: "link", at: now });
+      else if (up && !prev.links.get(id)) motion.links.set(id, { kind: "up", at: now });
+    }
+  } else {
+    motion.nodes.clear();
+    motion.links.clear();
+  }
+  motion.lab = lab.id;
+  motion.seen = cur;
+}
+// " m-<kind>" and the delay to put on the element, or null when nothing is playing.
+function motionOf(map, id) {
+  const m = map.get(id);
+  if (!m) return null;
+  const t = performance.now() - m.at;
+  if (t >= MOTION_MS[m.kind]) { map.delete(id); return null; }
+  return { cls: " m-" + m.kind, kind: m.kind, style: `--md:${-Math.round(t)}ms` };
+}
+
 function renderCanvas() {
   const world = $("#world");
   world.replaceChildren();
@@ -451,13 +495,15 @@ function renderCanvas() {
       const da = Math.min(60 + 14 * Math.max(0, uy), len * 0.45);
       const db = Math.min(60 + 14 * Math.max(0, -uy), len * 0.45);
       const up = na.running && (nb ? nb.running : true);
+      const mo = motionOf(motion.links, l.id);
       const down = (e) => {
         if (state.tool !== "select") return; // drawing or linking passes through
         e.stopPropagation();
         select({ type: "link", id: l.id });
       };
       world.append(
-        s("g", { class: "link" + (isSel("link", l.id) ? " sel" : "") + (up ? " up" : "") },
+        s("g", { class: "link" + (isSel("link", l.id) ? " sel" : "") + (up ? " up" : "") + (mo ? mo.cls : ""),
+          style: mo ? `${mo.style};--len:${Math.hypot(B.x - A.x, B.y - A.y).toFixed(1)}` : null },
           s("line", { class: "vis", x1: A.x, y1: A.y, x2: B.x, y2: B.y }),
           prefs.labels && s("text", { x: A.x + ux * da, y: A.y + uy * da + 4 }, portName(na, l.a.port)),
           prefs.labels && nb && s("text", { x: B.x - ux * db, y: B.y - uy * db + 4 }, portName(nb, l.b.port)),
@@ -489,15 +535,21 @@ function renderCanvas() {
   );
   for (const n of lab.nodes) {
     const ref = { type: "node", id: n.id };
+    const mo = motionOf(motion.nodes, n.id);
     world.append(
-      s("g", { class: cls(ref, n.running ? " running" : ""), transform: `translate(${n.x},${n.y})`, ...handlers(ref) },
+      s("g", { class: cls(ref, (n.running ? " running" : "") + (mo ? mo.cls : "")), transform: `translate(${n.x},${n.y})`,
+        style: mo ? mo.style : null, ...handlers(ref) },
         s("title", {}, `${n.name} (${n.running ? "running" : "stopped"})` +
           (n.services && n.services.length ? `\nRuns: ${n.services.map((x) => SERVICES.find((d) => d[0] === x)[1]).join(", ")}` : "")),
-        s("rect", { class: "box", x: -30, y: -30, width: 60, height: 60, rx: 14 }),
-        s("path", { class: "glyph", d: ICONS[n.role === "switch" ? "switch" : n.kind], transform: "translate(-19.2,-19.2) scale(1.6)", "vector-effect": "non-scaling-stroke" }),
-        s("circle", { class: "dot", cx: 26, cy: -26, r: 6.5 }),
-        s("text", { y: 48 }, n.name),
-        s("text", { class: "sub", y: 62 }, n.mgmt_ip || (n.kind === "client" && clientAddress(n)) || ""),
+        // Its own group, so an animation can scale the tile without touching where it sits.
+        s("g", { class: "tile" },
+          s("rect", { class: "box", x: -30, y: -30, width: 60, height: 60, rx: 14 }),
+          s("path", { class: "glyph", d: ICONS[n.role === "switch" ? "switch" : n.kind], transform: "translate(-19.2,-19.2) scale(1.6)", "vector-effect": "non-scaling-stroke" }),
+          mo && mo.kind === "start" && [s("circle", { class: "ripple", cx: 26, cy: -26, r: 6.5 }),
+                                        s("circle", { class: "ripple r2", cx: 26, cy: -26, r: 6.5 })],
+          s("circle", { class: "dot", cx: 26, cy: -26, r: 6.5 }),
+          s("text", { y: 48 }, n.name),
+          s("text", { class: "sub", y: 62 }, n.mgmt_ip || (n.kind === "client" && clientAddress(n)) || "")),
       ),
     );
   }
