@@ -181,6 +181,10 @@ class PresenceLeave(BaseModel):
     client: str = Field(min_length=4, max_length=40)
 
 
+class LabClear(BaseModel):
+    confirm: str = Field(max_length=100)  # the lab's name, typed by the person
+
+
 class TemplateUse(BaseModel):
     name: Optional[str] = Field(default=None, pattern=NAME_PATTERN)
 
@@ -537,6 +541,32 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         lab = get_lab(lab_id)
         rt.stop_lab(lab)
         return lab_view(lab)
+
+    @app.post("/api/labs/{lab_id}/clear")
+    def clear_lab(lab_id: int, body: LabClear):
+        """Delete everything in a lab and keep the empty lab: devices with their disks
+        and saved revisions, links, shapes and notes. Needs the lab's name as confirmation."""
+        with rt.lock:
+            lab = get_lab(lab_id)
+            if body.confirm.strip() != lab.name:
+                raise Invalid(f"Type the lab's name, {lab.name}, to confirm.")
+            removed = {
+                "devices": len(lab.nodes),
+                "links": len(lab.links),
+                "annotations": len(lab.annotations),
+                "revisions": sum(len(backups.revisions(n.id)) for n in lab.nodes),
+            }
+            rt.stop_lab(lab)
+            for node in lab.nodes:
+                rt.delete_disk(node)
+                backups.forget_node(node.id)
+                backups.set_node(lab.id, node.id, False)
+            defaults = Lab(id=lab.id, name=lab.name)
+            lab.nodes, lab.links, lab.annotations = [], [], []
+            lab.mgmt_x, lab.mgmt_y = defaults.mgmt_x, defaults.mgmt_y
+            store.save()
+            rt.sync_dhcp()
+            return {"removed": removed, "lab": lab_view(lab)}
 
     # -- nodes -----------------------------------------------------------
 

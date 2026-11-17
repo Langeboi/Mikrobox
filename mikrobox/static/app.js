@@ -672,6 +672,8 @@ function linkDialog(r1, r2) {
 
 function openModal(title, fields, okLabel, onSubmit, onCancel, wide) {
   $("#modal-box").classList.toggle("wide", !!wide);
+  $("#modal-ok").classList.remove("danger-fill");
+  $("#modal-ok").disabled = false;
   $("#modal-title").textContent = title;
   $("#modal-ok").textContent = okLabel;
   $("#modal-ok").hidden = !onSubmit;
@@ -1506,6 +1508,7 @@ const ACTIONS = {
   "cfg-import": () => { const n = selectedRouter(); if (n) importConfig(n); },
   "cfg-identity": () => { const n = selectedRouter(); if (n) pushIdentity(n); },
   "tool-packets": () => packetDialog(),
+  "tool-nuke": () => nukeDialog(),
   "tool-test": () => reachDialog(),
   "tool-docs": async () => {
     toast("Building the documentation");
@@ -1681,6 +1684,62 @@ function revisionsDialog(nodeId) {
     { node: summary }, { node: view }, { node: links }, { node: restoreRow },
   ], "", null, null, true);
   loadNode();
+}
+
+function nukeDialog() {
+  const lab = state.lab;
+  const plural = (n, one, many) => `${n} ${n === 1 ? one : many}`;
+  const devices = lab.nodes.length, links = lab.links.length, shapes = lab.annotations.length;
+  const running = lab.nodes.filter((n) => n.running).length;
+  const revisions = lab.nodes.reduce((sum, n) => sum + ((n.backup && n.backup.revisions) || 0), 0);
+  if (!devices && !links && !shapes) { toast(`${lab.name} is already empty.`); return; }
+  const others = [...new Set((state.others || []).filter((o) => o.lab === lab.id).map((o) => o.user))];
+
+  const gone = [
+    devices && `${plural(devices, "device", "devices")}${running ? `, ${running} of them running,` : ""} with their disks and configurations`,
+    links && plural(links, "link", "links"),
+    shapes && `${plural(shapes, "area, label or note", "areas, labels and notes")}`,
+    revisions && `${plural(revisions, "saved config revision", "saved config revisions")}`,
+  ].filter(Boolean);
+  const typed = h("input", { id: "m-confirm", type: "text", autocomplete: "off", spellcheck: "false",
+    placeholder: lab.name, oninput: () => { $("#modal-ok").disabled = typed.value.trim() !== lab.name; } });
+  const exportLab = async (e) => {
+    e.preventDefault();
+    try {
+      const res = await apiRaw("GET", `${labPath()}/export`);
+      saveBlob(await res.blob(), `${lab.name}.mikrobox.json`);
+      toast("Lab file downloaded.");
+    } catch (err) { toast(err.message, true); }
+  };
+
+  openModal(`Nuke ${lab.name}?`, [
+    { node: h("div", { class: "nuke" },
+      h("p", {}, h("strong", {}, "This deletes everything in this lab and cannot be undone.")),
+      h("ul", {}, gone.map((line) => h("li", {}, line))),
+      h("p", {}, "Kept: the lab itself, its name and its backup settings. You get an empty canvas to start over."),
+      others.length > 0 && h("p", {}, h("strong", {}, `${others.join(", ")} ${others.length === 1 ? "is" : "are"} in this lab right now.`),
+        " It empties for them too, and their consoles close.")) },
+    { node: h("p", {}, "Want a way back? ", h("a", { href: "#", onclick: exportLab }, "Download the lab file first"),
+      revisions ? ". Saved config revisions are not in it; use Configs, Compare revisions to download any you need." : ".") },
+    { node: h("div", { class: "field" }, h("label", { for: "m-confirm" }, ["Type ", h("strong", {}, lab.name), " to confirm"]), typed) },
+  ], "Nuke lab", async () => {
+    const r = await api("POST", `${labPath()}/clear`, { confirm: typed.value.trim() });
+    for (const key of [...dock.keys()]) dockClose(key);
+    state.sel = null;
+    state.linkFrom = null;
+    state.tool = "select";
+    Object.assign(view, { x: 90, y: 20, k: 1 });
+    saveView();
+    const parts = [
+      r.removed.devices && plural(r.removed.devices, "device", "devices"),
+      r.removed.links && plural(r.removed.links, "link", "links"),
+      r.removed.annotations && plural(r.removed.annotations, "shape or note", "shapes and notes"),
+    ].filter(Boolean);
+    toast(`${lab.name} is empty. Removed ${parts.join(", ")}.`);
+  });
+  $("#modal-ok").classList.add("danger-fill");
+  $("#modal-ok").disabled = true;
+  typed.focus();
 }
 
 async function accountsDialog() {
