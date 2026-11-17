@@ -29,9 +29,9 @@ from .shell import Shell
 OLD_BRIDGE = "mbmgmt"
 
 NFT_RULES = """\
-table ip mikrobox
-delete table ip mikrobox
-table ip mikrobox {{
+table ip {table}
+delete table ip {table}
+table ip {table} {{
     chain post {{
         type nat hook postrouting priority 100;
         oifname "{bridge}" masquerade
@@ -39,7 +39,7 @@ table ip mikrobox {{
     }}
 }}
 """
-NFT_CLEAR = "table ip mikrobox\ndelete table ip mikrobox\n"
+NFT_CLEAR = "table ip {table}\ndelete table ip {table}\n"
 
 
 def pid_alive(pidfile: Path, must_contain: str) -> int | None:
@@ -209,6 +209,8 @@ class Net:
 
     def _adopt_old_bridge(self) -> None:
         """Earlier versions called the bridge mbmgmt; move its ports across."""
+        if self.s.tag != "mb":
+            return  # that bridge belongs to the main install
         if not self.exists(OLD_BRIDGE) or OLD_BRIDGE == self.s.mgmt_bridge:
             return
         for port in self._ports(OLD_BRIDGE):
@@ -220,7 +222,7 @@ class Net:
         self._stop_dhcp()  # restarted with current options by reload_dhcp
         if self.bridged():
             # Your own network provides addresses and routing; stay out of the way.
-            self.sh.run(["nft", "-f", "-"], input=NFT_CLEAR, check=False)
+            self.sh.run(["nft", "-f", "-"], input=NFT_CLEAR.format(table=self.s.nft_table), check=False)
             self._adopt_old_bridge()
             return
         prefix = self.s.mgmt_net.split("/")[1]
@@ -235,7 +237,7 @@ class Net:
         # Lab devices reach the internet through the VM, and your PC reaches them
         # through it, both source-NATed so no return routes are needed.
         self.sh.run(["nft", "-f", "-"],
-                    input=NFT_RULES.format(bridge=br, net=self.s.mgmt_net), check=False)
+                    input=NFT_RULES.format(table=self.s.nft_table, bridge=br, net=self.s.mgmt_net), check=False)
 
     def _stop_dhcp(self) -> None:
         if self.s.dry_run:

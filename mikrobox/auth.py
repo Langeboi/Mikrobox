@@ -43,8 +43,9 @@ def _digest(token: str) -> str:
 
 
 class Auth:
-    def __init__(self, data_dir: Path, enabled: bool = True) -> None:
+    def __init__(self, data_dir: Path, enabled: bool = True, cookie: str = COOKIE) -> None:
         self.enabled = enabled
+        self.cookie = cookie
         self.users_file = data_dir / "users.json"
         self.sessions_file = data_dir / "sessions.json"
         self.lock = threading.RLock()
@@ -157,8 +158,7 @@ class Auth:
 
     # -- requests --------------------------------------------------------
 
-    @staticmethod
-    def cookie_token(headers: dict[bytes, bytes]) -> str | None:
+    def cookie_token(self, headers: dict[bytes, bytes]) -> str | None:
         raw = headers.get(b"cookie")
         if not raw:
             return None
@@ -166,7 +166,7 @@ class Auth:
             jar = SimpleCookie(raw.decode("latin-1"))
         except Exception:
             return None
-        return jar[COOKIE].value if COOKIE in jar else None
+        return jar[self.cookie].value if self.cookie in jar else None
 
     def user_from_headers(self, headers: dict[bytes, bytes]) -> str | None:
         user = self.session_user(self.cookie_token(headers))

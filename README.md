@@ -9,8 +9,44 @@ available through the API (interactive docs at `/docs`).
 
 
 > **This is the `experimental/aruba-cx` branch.** It adds Aruba AOS-CX switches next to
-> MikroTik. The MikroTik build lives on `ui-workspace`; this branch keeps up with it but
-> may break. To go back: `git checkout ui-workspace && sudo ./scripts/install.sh`.
+> MikroTik. The MikroTik build lives on `ui-workspace`. Install this branch **side by side**
+> (below) so it never touches your main install or its labs.
+
+## Installing the test build side by side
+
+A second install gets its own folders, service, port, accounts, labs, images and host
+network names, so both run at the same time without seeing each other.
+
+```bash
+git clone -b experimental/aruba-cx https://github.com/Langeboi/Mikrobox Mikrobox-test
+cd Mikrobox-test
+sudo ./scripts/install.sh --name test --port 8081
+```
+
+Then open `http://<vm-ip>:8081/` and create an account (it has its own). A purple
+**Test build** label in the top bar shows which install you are in.
+
+| | Main install | Test install |
+|---|---|---|
+| Web | port 8080 | port 8081 |
+| Service | `mikrobox` | `mikrobox-test` |
+| Program, data | `/opt/mikrobox`, `/var/lib/mikrobox` | `/opt/mikrobox-test`, `/var/lib/mikrobox-test` |
+| Host names | `mb...`, bridge `mbcloud`, table `mikrobox` | `mx...`, bridge `mxcloud`, table `mikrobox_mx` |
+| Cloud | NAT `10.99.0.0/16`, or bridged to your LAN | NAT `10.98.0.0/16` only |
+
+- **Updating:** `cd Mikrobox-test && git pull && sudo ./scripts/install.sh`. The folder
+  remembers that it belongs to the test install, so this never touches the main one.
+- **Removing:** `sudo ./scripts/uninstall.sh --name test` stops its devices and deletes
+  everything it created. It refuses to remove the main install.
+- **Safety net:** running a plain `sudo ./scripts/install.sh` from a folder on an
+  experimental branch that is not a named install stops and asks before replacing the
+  main install.
+- **Lab files:** you can export a lab from the main install and import it into the test
+  one. The other way round only works for labs without Aruba switches.
+- **Memory sharing (KSM)** is a kernel-wide setting, so the test install switching it on
+  helps the main install's devices too.
+- Both installs share the VM's CPU and memory, and each counts only its own devices
+  towards its 128-device limit.
 
 ## Experimental: Aruba AOS-CX switches
 

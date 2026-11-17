@@ -288,6 +288,10 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--foreground", action="store_true", help=argparse.SUPPRESS)
     a = p.parse_args(argv)
 
+    if os.environ.get("MIKROBOX_TAG", "mb") != "mb":
+        print("Putting the Cloud on your own network is only for the main install. "
+              "A side-by-side install keeps its Cloud behind the VM (NAT).", file=sys.stderr)
+        return 1
     up = uplink()
     if a.command == "status":
         dev, gw = default_route()

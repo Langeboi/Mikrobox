@@ -16,6 +16,13 @@
     status = { enabled: true, setup_needed: false, user: null };
   }
   if (!status.enabled || status.user) { location.replace("/"); return; }
+  if (status.label) {
+    document.title = `Sign in to Mikrobox (${status.label})`;
+    const tag = document.createElement("span");
+    tag.className = "install-label";
+    tag.textContent = status.label;
+    document.querySelector("#card .brand").append(tag);
+  }
 
   const setup = status.setup_needed;
   if (setup) {

@@ -329,6 +329,11 @@ function renderTop() {
     h("span", { class: `who c-${whoColor(name)}`, title: `${name} is in this lab`, role: "img", "aria-label": `${name} is in this lab` }, name.slice(0, 2))));
 
   const sys = state.sys;
+  // A side-by-side install (e.g. a test build) names itself so the two never get mixed up.
+  const label = sys && sys.label;
+  $("#install-label").hidden = !label;
+  $("#install-label").textContent = label || "";
+  document.title = label ? `Mikrobox (${label})` : "Mikrobox";
   $("#sys").textContent = sys
     ? `${sys.running_devices} / ${sys.max_devices} running` +
       (sys.mem_available_mb !== null ? ` · ${(sys.mem_available_mb / 1024).toFixed(1)} GB free` : "") +

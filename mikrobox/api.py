@@ -23,7 +23,7 @@ from pydantic import BaseModel, Field, ValidationError
 
 from . import __version__, routeros, templates
 from .backup import INTERVALS, Backups
-from .auth import COOKIE, SESSION_SECONDS, Auth, AuthError, AuthMiddleware
+from .auth import SESSION_SECONDS, Auth, AuthError, AuthMiddleware
 from .config import Settings
 from . import console as consoles
 from . import docs
@@ -33,7 +33,7 @@ from .platforms import PLATFORMS, is_vm, platform
 from .models import (
     NAME_PATTERN, Annotation, Endpoint, Lab, Link, Node, NodeKind, default_chr_ram, free_id,
 )
-from .runtime import Conflict, Invalid, NotFound, Runtime, iface_name, netns_name
+from .runtime import Conflict, Invalid, NotFound, Runtime
 from .shell import CommandError
 from .store import Store
 
@@ -224,7 +224,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.state.backups = backups
     hubs: dict[str, consoles.Hub] = {}  # shared consoles, by "lab/node"
     presence: dict[str, dict] = {}  # browser tab -> who, where, when
-    auth = Auth(settings.data_dir, enabled=settings.auth_enabled)
+    auth = Auth(settings.data_dir, enabled=settings.auth_enabled, cookie=settings.cookie)
     app.state.auth = auth
     app.add_middleware(AuthMiddleware, auth=auth)
 
@@ -317,7 +317,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     # -- accounts --------------------------------------------------------
 
     def signed_in(response: JSONResponse, name: str) -> JSONResponse:
-        response.set_cookie(COOKIE, auth.new_session(name), max_age=SESSION_SECONDS,
+        response.set_cookie(auth.cookie, auth.new_session(name), max_age=SESSION_SECONDS,
                             httponly=True, samesite="lax", path="/")
         return response
 
@@ -331,7 +331,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     @app.get("/api/auth/status")
     def auth_status(request: Request):
         user = auth.user_from_headers(dict(request.scope["headers"])) if auth.enabled else None
-        return {"enabled": auth.enabled, "setup_needed": auth.enabled and not auth.users, "user": user}
+        return {"enabled": auth.enabled, "setup_needed": auth.enabled and not auth.users, "user": user,
+                "label": settings.label}
 
     @app.post("/api/auth/setup")
     def auth_setup(body: Login):
@@ -353,7 +354,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     def auth_logout(request: Request):
         auth.end_session(auth.cookie_token(dict(request.scope["headers"])))
         response = JSONResponse({"user": None})
-        response.delete_cookie(COOKIE, path="/")
+        response.delete_cookie(auth.cookie, path="/")
         return response
 
     @app.get("/api/users")
@@ -877,7 +878,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         if settings.dry_run:
             return {"ok": False, "command": " ".join(tool), "output": "Dry-run mode: nothing is running."}
         try:
-            proc = subprocess.run(["ip", "netns", "exec", netns_name(node.id), *tool],
+            proc = subprocess.run(["ip", "netns", "exec", rt.netns(node.id), *tool],
                                   capture_output=True, text=True, timeout=70)
             return {"ok": proc.returncode == 0, "command": " ".join(tool),
                     "output": (proc.stdout + proc.stderr).strip()}
@@ -968,7 +969,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     ):
         """Pcap stream. Live: curl -sN URL | wireshark -k -i -   Timed file: add ?seconds=30"""
         node = get_node(get_lab(lab_id), node_id)
-        iface = iface_name(node.id, port)
+        iface = rt.iface(node.id, port)
         if port < 1 or port > node.ports or not rt.net.exists(iface):
             raise Conflict(f"{node.name} port {port} is not up. Start the node first.")
 
@@ -999,7 +1000,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         await ws.accept()
         lab = store.state.lab(lab_id)
         node = lab.node(node_id) if lab else None
-        iface = iface_name(node_id, port)
+        iface = rt.iface(node_id, port)
         if node is None or port < 1 or port > node.ports or not rt.net.exists(iface):
             await ws.send_text(json.dumps({"error": "That port is not up. Start the device first."}))
             await ws.close()
@@ -1072,7 +1073,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             if node.kind == NodeKind.chr:
                 await consoles.join(hubs, key, lambda: consoles.SerialHub(key, hubs, rt.serial_socket(node)), ws, user)
             else:
-                await consoles.join(hubs, key, lambda: consoles.ShellHub(key, hubs, netns_name(node.id), node.name), ws, user)
+                await consoles.join(hubs, key, lambda: consoles.ShellHub(key, hubs, rt.netns(node.id), node.name), ws, user)
         except OSError as e:
             await ws.send_text(f"\r\nConsole unavailable: {e}\r\n")
         try:

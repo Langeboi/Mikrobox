@@ -90,6 +90,7 @@ input:disabled { background: var(--surface-2); color: var(--muted); }
 .menu-list button:hover:not(:disabled) { background: var(--surface-2); }
 .chip { padding: 6px 12px; border-radius: 999px; background: var(--surface-2); color: var(--muted); font-size: 13px; font-variant-numeric: tabular-nums; }
 .icon-btn { padding: 0; width: 36px; display: inline-flex; align-items: center; justify-content: center; }
+.install-label { padding: 4px 10px; border-radius: 999px; background: #7c3aed; color: #fff; font-size: 12px; font-weight: 700; letter-spacing: .02em; }
 #banner { padding: 8px 14px; background: #fff4d6; border-bottom: 1px solid #e6c766; color: #5c4400; }
 :root[data-theme="dark"] #banner { background: #3a2f12; border-bottom-color: #6b5720; color: #f3dfa0; }
 

@@ -548,7 +548,8 @@ def test_everything_needs_an_account(client):
     with pytest.raises(WebSocketDisconnect):
         with anon.websocket_connect("/api/labs/1/nodes/1/console"):
             pass
-    assert anon.get("/api/auth/status").json() == {"enabled": True, "setup_needed": False, "user": None}
+    assert anon.get("/api/auth/status").json() == {"enabled": True, "setup_needed": False, "user": None,
+                                                   "label": ""}
 
 
 def test_login_logout_and_accounts(client):
@@ -1209,3 +1210,76 @@ def test_nuke_empties_the_lab_and_keeps_it(client, monkeypatch):
     assert client.rt.disk_path(client.rt.store.state.lab(other).node(keep["id"])).exists()
     # A fresh device can be added straight away.
     assert add_node(client, lab, name="R1")["name"] == "R1"
+
+
+
+# -- a second install side by side -------------------------------------------
+
+def test_second_install_uses_its_own_host_names(tmp_path):
+    def start_one(tag, label=""):
+        root = tmp_path / tag
+        (root / "sys").mkdir(parents=True)
+        settings = Settings(data_dir=root / "data", run_dir=root / "run", dry_run=True,
+                            sys_net=root / "sys", netns_dir=root / "ns", netns_etc=root / "etc",
+                            kvm_device=root / "kvm", ksm_dir=root / "ksm", tag=tag, label=label,
+                            auth_enabled=False)
+        app = create_app(settings)
+        with TestClient(app) as c:
+            lab = c.post("/api/labs", json={"name": "same"}).json()["id"]
+            r1 = c.post(f"/api/labs/{lab}/nodes", json={"name": "R1", "ports": 2}).json()
+            pc = c.post(f"/api/labs/{lab}/nodes", json={"kind": "client", "name": "PC1"}).json()
+            c.post(f"/api/labs/{lab}/links", json={"a": {"node": r1["id"], "port": 1}})
+            c.post(f"/api/labs/{lab}/nodes/{r1['id']}/start")
+            c.post(f"/api/labs/{lab}/nodes/{pc['id']}/start")
+            system = c.get("/api/system").json()
+            hosts = (root / "run" / "dhcp-hosts").read_text()
+        history = app.state.rt.sh.history
+        flat = [" ".join(cmd) for cmd in history]
+        nft = [cmd for cmd in history if cmd[0] == "nft"]
+        return {"flat": flat, "system": system, "hosts": hosts, "app": app, "settings": settings,
+                "nft_input": app.state.rt.net}
+
+    main, test = start_one("mb"), start_one("mx", "Test build")
+    # Main install: exactly the names it always had.
+    assert "ip link add mbcloud type bridge" in main["flat"]
+    assert "ip tuntap add dev mb1p1 mode tap" in main["flat"] and "ip netns add mbc2" in main["flat"]
+    assert any("mac=52:54:00:00:01:01" in line for line in main["flat"])
+    # Test install: none of them.
+    assert "ip link add mxcloud type bridge" in test["flat"]
+    assert "ip tuntap add dev mx1p1 mode tap" in test["flat"] and "ip netns add mxc2" in test["flat"]
+    assert not any(" mb" in line or "mbcloud" in line or "mbc2" in line for line in test["flat"])
+    mx_mac = test["settings"].mac_prefix
+    assert mx_mac != "52:54:00" and any(f"mac={mx_mac}:00:01:01" in line for line in test["flat"])
+    assert test["hosts"].startswith(f"{mx_mac}:00:01:01,")
+    assert (main["settings"].nft_table, test["settings"].nft_table) == ("mikrobox", "mikrobox_mx")
+    assert (main["settings"].cookie, test["settings"].cookie) == ("mikrobox_session", "mikrobox_session_mx")
+    assert test["system"]["label"] == "Test build" and test["system"]["tag"] == "mx"
+
+
+def test_second_install_firewall_table_and_cloud_range(monkeypatch, tmp_path):
+    from mikrobox.network import NFT_CLEAR, NFT_RULES
+
+    monkeypatch.setenv("MIKROBOX_TAG", "mx")
+    monkeypatch.setenv("MIKROBOX_CLOUD_NET", "10.98.0.0/16")
+    monkeypatch.setenv("MIKROBOX_LABEL", "Test build")
+    s = Settings.from_env()
+    assert (s.tag, s.label, s.mgmt_bridge) == ("mx", "Test build", "mxcloud")
+    assert (s.mgmt_net, s.mgmt_host_ip, s.mgmt_first_ip) == ("10.98.0.0/16", "10.98.0.1", "10.98.1.0")
+    rules = NFT_RULES.format(table=s.nft_table, bridge=s.mgmt_bridge, net=s.mgmt_net)
+    assert "table ip mikrobox_mx {" in rules and "delete table ip mikrobox_mx" in rules
+    assert "table ip mikrobox\n" not in rules
+    assert NFT_CLEAR.format(table=s.nft_table) == "table ip mikrobox_mx\ndelete table ip mikrobox_mx\n"
+    with pytest.raises(ValueError):
+        Settings(tag="MX1")
+
+
+def test_installs_do_not_share_sign_in(tmp_path):
+    from mikrobox.auth import Auth
+
+    main = Auth(tmp_path / "a")
+    test = Auth(tmp_path / "b", cookie="mikrobox_session_mx")
+    main.create_user("anna", "long-enough")
+    token = main.new_session("anna")
+    headers = {b"cookie": f"mikrobox_session={token}".encode()}
+    assert main.user_from_headers(headers) == "anna"
+    assert test.user_from_headers(headers) is None  # the main install's cookie means nothing here

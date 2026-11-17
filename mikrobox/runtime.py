@@ -32,16 +32,16 @@ class Invalid(Exception):
     pass
 
 
-def iface_name(node_id: int, port: int) -> str:
-    return f"mb{node_id}p{port}"
+def iface_name(node_id: int, port: int, tag: str = "mb") -> str:
+    return f"{tag}{node_id}p{port}"
 
 
-def netns_name(node_id: int) -> str:
-    return f"mbc{node_id}"
+def netns_name(node_id: int, tag: str = "mb") -> str:
+    return f"{tag}c{node_id}"
 
 
-def mac_for(node_id: int, port: int) -> str:
-    return f"52:54:00:{(node_id >> 8) & 0xFF:02x}:{node_id & 0xFF:02x}:{port & 0xFF:02x}"
+def mac_for(node_id: int, port: int, prefix: str = "52:54:00") -> str:
+    return f"{prefix}:{(node_id >> 8) & 0xFF:02x}:{node_id & 0xFF:02x}:{port & 0xFF:02x}"
 
 
 class Runtime:
@@ -54,6 +54,17 @@ class Runtime:
         self.lock = threading.RLock()
         self.cloud_ips: dict[str, str] = {}  # MAC -> address, discovered in bridged mode
         self._scanner: threading.Thread | None = None
+
+    # -- host names, unique to this install ------------------------------
+
+    def iface(self, node_id: int, port: int) -> str:
+        return iface_name(node_id, port, self.s.tag)
+
+    def netns(self, node_id: int) -> str:
+        return netns_name(node_id, self.s.tag)
+
+    def mac(self, node_id: int, port: int) -> str:
+        return mac_for(node_id, port, self.s.mac_prefix)
 
     # -- paths -----------------------------------------------------------
 
@@ -87,7 +98,7 @@ class Runtime:
     def node_running(self, node: Node) -> bool:
         if is_vm(node):
             return pid_alive(self._run(node, "pid"), "qemu") is not None
-        return (self.s.netns_dir / netns_name(node.id)).exists()
+        return (self.s.netns_dir / self.netns(node.id)).exists()
 
     def running_count(self) -> int:
         return sum(1 for n in self.store.state.all_nodes() if self.node_running(n))
@@ -99,7 +110,7 @@ class Runtime:
             return None
         if self.net.bridged():
             # Your own network hands out the address; we only know it once it is seen.
-            return self.cloud_ips.get(mac_for(node.id, port))
+            return self.cloud_ips.get(self.mac(node.id, port))
         return str(ipaddress.ip_address(self.s.mgmt_first_ip) + node.id)
 
     def cloud_port(self, lab: Lab, node: Node) -> int | None:
@@ -118,6 +129,8 @@ class Runtime:
             "mgmt_network": cloud["network"],
             "mgmt_host_ip": cloud["gateway"],
             "dry_run": self.s.dry_run,
+            "label": self.s.label,
+            "tag": self.s.tag,
             "chr_version": self._chr_version(),
             "max_chr_ports": self.s.max_chr_ports,
             "platforms": [self.platform_info(p) for p in PLATFORMS.values()],
@@ -181,7 +194,7 @@ class Runtime:
                 if node is None or not is_vm(node):
                     continue
                 hosts.append(
-                    f"{mac_for(node.id, link.a.port)},{self.mgmt_ip(lab, node)},{node.name}"
+                    f"{self.mac(node.id, link.a.port)},{self.mgmt_ip(lab, node)},{node.name}"
                 )
         self.net.reload_dhcp(hosts)
 
@@ -214,9 +227,9 @@ class Runtime:
         for port in range(1, node.ports + 1):
             cmd += [
                 "-netdev",
-                f"tap,id=p{port},ifname={iface_name(node.id, port)},script=no,downscript=no",
+                f"tap,id=p{port},ifname={self.iface(node.id, port)},script=no,downscript=no",
                 "-device",
-                f"{p.nic},netdev=p{port},mac={mac_for(node.id, port)}",
+                f"{p.nic},netdev=p{port},mac={self.mac(node.id, port)}",
             ]
         return cmd
 
@@ -242,10 +255,10 @@ class Runtime:
             if is_vm(node):
                 self._start_vm(node)
             else:
-                self.net.delete_client(netns_name(node.id))
+                self.net.delete_client(self.netns(node.id))
                 self.net.create_client(
-                    netns_name(node.id),
-                    [iface_name(node.id, p) for p in range(1, node.ports + 1)],
+                    self.netns(node.id),
+                    [self.iface(node.id, p) for p in range(1, node.ports + 1)],
                     node.address,
                     node.gateway,
                     node.dns,
@@ -270,7 +283,7 @@ class Runtime:
                 f"{avail} MB available and {self.s.mem_reserve_mb} MB is kept in reserve."
             )
         self._ensure_disk(node)
-        ifaces = [iface_name(node.id, p) for p in range(1, node.ports + 1)]
+        ifaces = [self.iface(node.id, p) for p in range(1, node.ports + 1)]
         for iface in ifaces:
             self.net.delete(iface)  # leftovers from a crash
             self.net.create_tap(iface)
@@ -288,15 +301,15 @@ class Runtime:
             for link in lab.links:
                 if link.touches(node.id) and link.b is not None:
                     other = link.b if link.a.node == node.id else link.a
-                    self.net.disconnect(iface_name(other.node, other.port))
+                    self.net.disconnect(self.iface(other.node, other.port))
             if is_vm(node):
                 self._kill(self._run(node, "pid"))
                 for suffix in ("pid", "serial", "monitor", "qga"):
                     self._run(node, suffix).unlink(missing_ok=True)
                 for port in range(1, node.ports + 1):
-                    self.net.delete(iface_name(node.id, port))
+                    self.net.delete(self.iface(node.id, port))
             else:
-                self.net.delete_client(netns_name(node.id))
+                self.net.delete_client(self.netns(node.id))
 
     def _kill(self, pidfile: Path) -> None:
         pid = pid_alive(pidfile, "qemu")
@@ -323,7 +336,7 @@ class Runtime:
     # -- links -----------------------------------------------------------
 
     def apply_link(self, lab: Lab, link: Link) -> None:
-        a = iface_name(link.a.node, link.a.port)
+        a = self.iface(link.a.node, link.a.port)
         if link.b is None:
             if not self.net.exists(a):
                 return
@@ -332,20 +345,20 @@ class Runtime:
             if node is not None and node.kind == NodeKind.client and not self.net.bridged():
                 prefix = self.s.mgmt_net.split("/")[1]
                 self.net.client_addr(
-                    netns_name(node.id), link.a.port, f"{self.mgmt_ip(lab, node)}/{prefix}"
+                    self.netns(node.id), link.a.port, f"{self.mgmt_ip(lab, node)}/{prefix}"
                 )
             return
-        b = iface_name(link.b.node, link.b.port)
+        b = self.iface(link.b.node, link.b.port)
         if self.net.exists(a) and self.net.exists(b):
             self.net.connect(a, b)
 
     def remove_link(self, link: Link) -> None:
-        a = iface_name(link.a.node, link.a.port)
+        a = self.iface(link.a.node, link.a.port)
         if link.b is None:
             self.net.detach_mgmt(a)
             return
         self.net.disconnect(a)
-        self.net.disconnect(iface_name(link.b.node, link.b.port))
+        self.net.disconnect(self.iface(link.b.node, link.b.port))
 
     def check_endpoint(self, lab: Lab, ep: Endpoint) -> None:
         node = lab.node(ep.node)
