@@ -177,6 +177,10 @@ class PresenceBeat(BaseModel):
     node: Optional[int] = None
 
 
+class PresenceLeave(BaseModel):
+    client: str = Field(min_length=4, max_length=40)
+
+
 class TemplateUse(BaseModel):
     name: Optional[str] = Field(default=None, pattern=NAME_PATTERN)
 
@@ -369,6 +373,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             del presence[key]
         return {"others": [{"user": v["user"], "lab": v["lab"], "node": v["node"]}
                            for k, v in presence.items() if k != body.client]}
+
+    @app.post("/api/presence/leave", status_code=204)
+    def presence_leave(body: PresenceLeave):
+        """Sent when a tab closes or reloads, so it does not linger as a ghost."""
+        presence.pop(body.client, None)
 
     # -- system ----------------------------------------------------------
 

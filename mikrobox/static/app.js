@@ -146,6 +146,10 @@ async function act(fn) {
 }
 
 const CLIENT = Math.random().toString(36).slice(2, 12) + Date.now().toString(36);
+window.addEventListener("pagehide", () => {
+  const body = new Blob([JSON.stringify({ client: CLIENT })], { type: "application/json" });
+  if (navigator.sendBeacon) navigator.sendBeacon("/api/presence/leave", body);
+});
 const WHO_COLORS = ["purple", "green", "amber", "red", "blue"];
 const whoColor = (name) => WHO_COLORS[[...name].reduce((sum, ch) => sum + ch.charCodeAt(0), 0) % WHO_COLORS.length];
 
