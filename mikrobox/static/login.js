@@ -1,7 +1,6 @@
 "use strict";
 /* Sign-in page. Becomes "create the first account" on a server with no accounts.
-   The left half is decoration: a small lab that starts, runs and stops on a loop,
-   drawn in the same style as the workspace. */
+   The left half is decoration, drawn by login-art.js. */
 
 (async () => {
   const $ = (q) => document.querySelector(q);
@@ -13,7 +12,6 @@
     for (const kid of kids.flat()) if (kid !== null && kid !== undefined && kid !== false) el.append(kid instanceof Node ? kid : String(kid));
     return el;
   }
-  const h = (tag, attrs, ...kids) => make(null, tag, attrs, kids);
   const s = (tag, attrs, ...kids) => make(SVGNS, tag, attrs, kids);
   const icon = (d) => s("svg", { viewBox: "0 0 24 24", "aria-hidden": "true" }, s("path", { d }));
   const SUN = "M12 8a4 4 0 1 0 0 8a4 4 0 1 0 0-8 M12 2v2 M12 20v2 M4.9 4.9l1.4 1.4 M17.7 17.7l1.4 1.4 M2 12h2 M20 12h2 M4.9 19.1l1.4-1.4 M17.7 6.3l1.4-1.4";
@@ -45,80 +43,11 @@
     applyTheme();
   });
 
-  // ------------------------------------------------------------ the lab
-  const ICONS = {
-    chr: "M2 12a10 10 0 1 0 20 0a10 10 0 1 0-20 0 M6 12h12 M12 6v12 M6 12l2.6-2.6 M6 12l2.6 2.6 M18 12l-2.6-2.6 M18 12l-2.6 2.6 M12 6l-2.6 2.6 M12 6l2.6 2.6 M12 18l-2.6-2.6 M12 18l2.6-2.6",
-    client: "M4 5h16v11H4z M9 20h6 M12 16v4",
-    switch: "M3 8.5h18 M17 5l4 3.5-4 3.5 M21 15.5H3 M7 12l-4 3.5 4 3.5",
-  };
-  const CLOUD = "M-34 26a20 20 0 0 1-5-39a27 27 0 0 1 51-9a23 23 0 0 1 27 48z";
-  const CYCLE = 14;  // seconds, as --cycle in login.html
-  const at = (sec) => `${(sec - 0.08 * CYCLE).toFixed(2)}s`;  // the keyframes switch on at 8%
-  const NODES = {
-    Cloud: { x: 300, y: 84, on: 0 },
-    R1: { x: 160, y: 208, kind: "chr", sub: "10.99.1.12", on: 0.8 },
-    R2: { x: 440, y: 208, kind: "chr", sub: "10.99.1.13", on: 1.4 },
-    SW1: { x: 300, y: 310, kind: "switch", sub: "", on: 2.2 },
-    PC1: { x: 160, y: 408, kind: "client", sub: "192.168.10.142/24", on: 3.0 },
-    PC2: { x: 440, y: 408, kind: "client", sub: "192.168.10.143/24", on: 3.5 },
-  };
-  // [a, b, a's port, b's port, traffic: 0 none, 1 from a to b, -1 from b to a]
-  const LINKS = [
-    ["Cloud", "R1", "", "ether1", -1], ["Cloud", "R2", "", "ether1", 0], ["R1", "R2", "ether2", "ether2", 1],
-    ["R1", "SW1", "ether3", "ether1", 1], ["R2", "SW1", "ether3", "ether2", -1],
-    ["SW1", "PC1", "ether3", "eth0", 1], ["SW1", "PC2", "ether4", "eth0", -1],
-  ];
-  const LOG = [
-    ["R1 ", "interface  ether1 link up (1Gbps/full)", 1.3],
-    ["R1 ", "dhcp       dhcp-client on ether1 got IP address 10.99.1.12", 2.0],
-    ["R2 ", "ospf       neighbor 1.1.1.1 on ether2: Full", 4.7],
-    ["PC1", "dhcp       leased 192.168.10.142/24, gateway 192.168.10.1", 5.6],
-  ];
-
-  function drawLab() {
-    const links = [], labels = [], flows = [], tiles = [];
-    LINKS.forEach(([a, b, pa, pb, dir], i) => {
-      const A = NODES[a], B = NODES[b];
-      const len = Math.hypot(B.x - A.x, B.y - A.y);
-      const ux = (B.x - A.x) / len, uy = (B.y - A.y) / len;
-      const up = Math.max(A.on, B.on) + 0.3;
-      links.push(s("line", { class: "a-link", x1: A.x, y1: A.y, x2: B.x, y2: B.y, style: `--d:${at(up)}` }));
-      // Port names sit clear of the tile, and further out below it, as on the canvas.
-      const da = Math.min(60 + 14 * Math.max(0, uy), len * 0.45), db = Math.min(60 + 14 * Math.max(0, -uy), len * 0.45);
-      if (pa) labels.push(s("text", { class: "a-port", x: (A.x + ux * da).toFixed(1), y: (A.y + uy * da + 4).toFixed(1) }, pa));
-      if (pb) labels.push(s("text", { class: "a-port", x: (B.x - ux * db).toFixed(1), y: (B.y - uy * db + 4).toFixed(1) }, pb));
-      if (dir) {
-        const [S, E] = dir > 0 ? [A, B] : [B, A];
-        flows.push(s("g", { class: "a-flow", style: `--d:${at(up + 0.5)}` },
-          s("circle", { class: "a-pkt", r: 3 },
-            s("animateMotion", { dur: `${(1.9 + (i % 3) * 0.45).toFixed(2)}s`, begin: `${(-i * 0.41).toFixed(2)}s`,
-              repeatCount: "indefinite", path: `M${S.x} ${S.y}L${E.x} ${E.y}` }))));
-      }
-    });
-    for (const [name, n] of Object.entries(NODES)) {
-      if (!n.kind) {
-        tiles.push(s("g", { transform: `translate(${n.x},${n.y})` },
-          s("path", { class: "a-cloud", d: CLOUD }),
-          s("text", { y: 9 }, name),
-          s("text", { class: "a-sub", y: -46 }, "10.99.0.0/16 (NAT)")));  // above: its links leave from below
-        continue;
-      }
-      tiles.push(s("g", { transform: `translate(${n.x},${n.y})` },
-        s("g", { class: "a-tile", style: `--d:${at(n.on)}` },
-          s("rect", { class: "a-box", x: -30, y: -30, width: 60, height: 60, rx: 14 }),
-          s("path", { class: "a-glyph", d: ICONS[n.kind], transform: "translate(-19.2,-19.2) scale(1.6)" }),
-          s("circle", { class: "a-rip", cx: 26, cy: -26, r: 6.5 }),
-          s("circle", { class: "a-dot", cx: 26, cy: -26, r: 6.5 })),
-        s("text", { y: 48 }, name),
-        n.sub && s("text", { class: "a-sub", y: 62 }, n.sub)));
-    }
-    $("#lab").replaceChildren(...links, ...flows, ...labels, ...tiles);
-    $("#log").replaceChildren(
-      ...LOG.map(([who, what, sec]) => h("div", { class: "a-line", style: `--n:${who.length + 2 + what.length};--d:${at(sec)}` },
-        h("b", {}, who), "  " + what)),
-      h("div", {}, h("b", {}, "[admin@R1] >"), " ", h("span", { class: "a-caret" })));
-  }
-  drawLab();
+  // ------------------------------------------------------------ the labs on the left
+  try {
+    window.MikroboxArt.start({ svg: $("#lab"), log: $("#log"), name: $("#scene-name"), blurb: $("#scene-blurb"),
+      bar: $("#scene-bar"), head: $("#scene-head") });
+  } catch (e) { /* decoration only: the form works without it */ }
 
   // ------------------------------------------------------------ server
   $("#host").textContent = location.host;
