@@ -864,10 +864,12 @@ function renderInspector(force) {
   box.hidden = !(lab && sel);
   box.classList.toggle("collapsed", state.collapsed);
   if (box.hidden) { box.replaceChildren(); return; }
-  if (sel.type === "mgmt") box.replaceChildren(...mgmtInspector());
-  else if (sel.type === "link") box.replaceChildren(...linkInspector(lab.links.find((l) => l.id === sel.id)));
-  else if (sel.type === "anno") box.replaceChildren(...annoInspector(annoById(sel.id)));
-  else box.replaceChildren(...nodeInspector(nodeById(sel.id)));
+  // Sections that do not apply come back as false; leave them out rather than print them.
+  const fill = (items) => box.replaceChildren(...items.filter((item) => item !== false && item != null));
+  if (sel.type === "mgmt") fill(mgmtInspector());
+  else if (sel.type === "link") fill(linkInspector(lab.links.find((l) => l.id === sel.id)));
+  else if (sel.type === "anno") fill(annoInspector(annoById(sel.id)));
+  else fill(nodeInspector(nodeById(sel.id)));
 }
 
 function mgmtInspector() {
