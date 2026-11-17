@@ -19,6 +19,7 @@ def client(tmp_path: Path):
         netns_dir=tmp_path / "netns",
         netns_etc=tmp_path / "etcns",
         kvm_device=tmp_path / "kvm",
+        ksm_dir=tmp_path / "ksm",  # never touch the real host's KSM from tests
     )
     (tmp_path / "sysnet").mkdir()
     (tmp_path / "netns").mkdir()
@@ -969,11 +970,12 @@ def test_connectivity_test_rules(client, monkeypatch):
 def test_aoscx_node_defaults_and_qemu(client):
     lab = make_lab(client)
     cx = add_node(client, lab, kind="aoscx", name="CX1")
-    assert (cx["kind"], cx["ports"], cx["cpus"], cx["ram_mb"]) == ("aoscx", 9, 2, 4096)
+    assert (cx["kind"], cx["role"], cx["ports"], cx["cpus"], cx["ram_mb"]) == ("aoscx", "switch", 9, 1, 2048)
     assert client.post(f"/api/labs/{lab}/nodes", json={"kind": "aoscx", "name": "CX2", "ports": 18}).status_code == 400
     assert client.post(f"/api/labs/{lab}/nodes", json={"kind": "aoscx", "name": "CX2", "ram_mb": 1024}).status_code == 400
     assert client.post(f"/api/labs/{lab}/nodes", json={"kind": "aoscx", "name": "CX2", "address": "1.2.3.4/24"}).status_code == 400
-    assert client.patch(f"/api/labs/{lab}/nodes/{cx['id']}", json={"ram_mb": 2048}).json()["ram_mb"] == 2048
+    assert client.post(f"/api/labs/{lab}/nodes", json={"kind": "aoscx", "role": "router", "name": "CX2"}).status_code == 400
+    assert client.patch(f"/api/labs/{lab}/nodes/{cx['id']}", json={"cpus": 2, "ram_mb": 4096}).json()["ram_mb"] == 4096
 
     node = client.rt.store.state.lab(lab).node(cx["id"])
     cmd = client.rt.qemu_command(node)
@@ -1028,7 +1030,7 @@ def test_aoscx_ports_in_documentation(client):
     client.post(f"/api/labs/{lab}/links", json={"a": {"node": cx["id"], "port": 3}, "b": {"node": r1["id"], "port": 2}})
     client.post(f"/api/labs/{lab}/links", json={"a": {"node": cx["id"], "port": 1}})
     md = zipfile.ZipFile(io.BytesIO(client.post(f"/api/labs/{lab}/documentation", json={}).content)).read("first.md").decode()
-    assert "| CX1 | Switch (Aruba AOS-CX) | 9 | 2 | 4096 |" in md
+    assert "| CX1 | Switch (Aruba AOS-CX) | 9 | 1 | 2048 |" in md
     assert "| CX1 | 1/1/2 | R1 | ether2 |" in md and "| CX1 | mgmt | Cloud | |" in md
 
 
@@ -1113,3 +1115,45 @@ def test_image_upload_endpoint(client, monkeypatch):
             break
         _time.sleep(0.1)
     assert info["import"]["state"] == "error" and "not a .zip" in info["import"]["message"]
+
+
+def test_operating_system_and_role(client):
+    lab = make_lab(client)
+    assert add_node(client, lab, name="R1")["role"] == "router"
+    sw = add_node(client, lab, kind="chr", role="switch", name="SW1")  # CHR still works as a switch
+    assert (sw["kind"], sw["role"], sw["ports"]) == ("chr", "switch", 24)
+    cx = add_node(client, lab, kind="aoscx", name="CX1")  # role defaults to what the OS can be
+    assert cx["role"] == "switch"
+    platforms = {p["kind"]: p for p in client.get("/api/system").json()["platforms"]}
+    assert platforms["chr"]["roles"] == ["router", "switch"] and platforms["aoscx"]["roles"] == ["switch"]
+    assert platforms["aoscx"]["short"] == "CX" and platforms["chr"]["short"] == ""
+    # A CX saved before roles existed is still a switch when loaded.
+    from mikrobox.models import Node
+    assert Node(id=9, kind="aoscx", name="OLD", ports=9).role == "switch"
+
+
+def test_ksm_setting(tmp_path):
+    from mikrobox.ksm import Ksm
+    import os as _os
+
+    ksm_dir = tmp_path / "ksm"
+    ksm_dir.mkdir()
+    (ksm_dir / "run").write_text("0\n")
+    (ksm_dir / "pages_sharing").write_text("262144\n")
+    settings = Settings(data_dir=tmp_path / "data", ksm_dir=ksm_dir)
+    k = Ksm(settings)
+    assert k.status()["enabled"] is True and k.status()["running"] is False
+    k.apply()
+    assert (ksm_dir / "run").read_text() == "1"
+    st = k.status()
+    assert st["running"] and st["saved_mb"] == 262144 * _os.sysconf("SC_PAGE_SIZE") // 2**20
+    assert k.set(False)["enabled"] is False and (ksm_dir / "run").read_text() == "0"
+    assert Ksm(settings).wanted() is False  # remembered
+    assert Ksm(Settings(data_dir=tmp_path / "d2", ksm_dir=tmp_path / "none")).status()["available"] is False
+
+
+def test_ksm_endpoint(client):
+    st = client.get("/api/system").json()["ksm"]
+    assert st["enabled"] is True and st["available"] is False
+    assert client.put("/api/host/ksm", json={"enabled": False}).json()["enabled"] is False
+    assert client.get("/api/system").json()["ksm"]["enabled"] is False

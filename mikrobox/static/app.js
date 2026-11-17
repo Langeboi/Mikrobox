@@ -27,7 +27,6 @@ const ICONS = {
   chr: "M2 12a10 10 0 1 0 20 0a10 10 0 1 0-20 0 M6 12h12 M12 6v12 M6 12l2.6-2.6 M6 12l2.6 2.6 M18 12l-2.6-2.6 M18 12l-2.6 2.6 M12 6l-2.6 2.6 M12 6l2.6 2.6 M12 18l-2.6-2.6 M12 18l2.6-2.6",
   client: "M4 5h16v11H4z M9 20h6 M12 16v4",
   switch: "M3 8.5h18 M17 5l4 3.5-4 3.5 M21 15.5H3 M7 12l-4 3.5 4 3.5",
-  aoscx: "M2 7h20v10H2z M5 10.5h2.5 M9 10.5h2.5 M13 10.5h2.5 M5 13.5h2.5 M9 13.5h2.5 M13 13.5h2.5 M18.5 10v4",
   rect: "M4 6h16v12H4z",
   ellipse: "M3 12a9 6.5 0 1 0 18 0a9 6.5 0 1 0-18 0",
   text: "M5 6h14 M12 6v13 M9 19h6",
@@ -44,11 +43,9 @@ const TOOLS = [
   { id: "select", label: "Select", tip: "Select, move and pan" },
   { id: "link", label: "Link", tip: "Connect two ports" },
   null,
-  { id: "chr", label: "Router", tip: "Add a MikroTik CHR router", add: true },
-  { id: "switch", label: "Switch", tip: "Add a CHR with 24 ports to use as a switch", add: true },
+  { id: "chr", label: "Router", tip: "Add a router (MikroTik CHR)", add: true },
+  { id: "switch", label: "Switch", tip: "Add a switch (MikroTik CHR or Aruba AOS-CX)", add: true },
   { id: "client", label: "Client", tip: "Add a Linux client", add: true },
-  null,
-  { id: "aoscx", label: "Aruba CX", tip: "Add an Aruba AOS-CX switch (experimental; needs the simulator image)", add: true },
   null,
   { id: "rect", label: "Area", tip: "Draw a rectangular area", draw: true },
   { id: "ellipse", label: "Ellipse", tip: "Draw an elliptical area", draw: true },
@@ -186,6 +183,17 @@ const portName = (node, port) => (node.kind === "chr" ? `ether${port}`
   : node.kind === "aoscx" ? (port === 1 ? "mgmt" : `1/1/${port - 1}`)
   : `eth${port - 1}`);
 const isVm = (node) => node.kind === "chr" || node.kind === "aoscx";
+const roleName = (node) => (node.kind === "client" ? "Client" : node.role === "switch" ? "Switch" : "Router");
+
+// The glyph shows the role; a small badge names the OS when it is not MikroTik.
+function osBadge(n) {
+  const p = platformInfo(n.kind);
+  if (!p || !p.short) return null;
+  const w = 10 + p.short.length * 7;
+  return s("g", { class: `os-badge k-${n.kind}`, "aria-hidden": "true" },
+    s("rect", { x: 30 - w + 4, y: 17, width: w, height: 15, rx: 7.5 }),
+    s("text", { x: 30 - w / 2 + 4, y: 28 }, p.short));
+}
 const platformInfo = (kind) => ((state.sys && state.sys.platforms) || []).find((p) => p.kind === kind) || null;
 const labPath = () => `/labs/${state.lab.id}`;
 const snap = (v) => (prefs.snap ? Math.round(v / 20) * 20 : Math.round(v));
@@ -319,7 +327,8 @@ function renderTop() {
   const sys = state.sys;
   $("#sys").textContent = sys
     ? `${sys.running_devices} / ${sys.max_devices} running` +
-      (sys.mem_available_mb !== null ? ` · ${(sys.mem_available_mb / 1024).toFixed(1)} GB free` : "")
+      (sys.mem_available_mb !== null ? ` · ${(sys.mem_available_mb / 1024).toFixed(1)} GB free` : "") +
+      (sys.ksm && sys.ksm.running && sys.ksm.saved_mb >= 100 ? ` · ${(sys.ksm.saved_mb / 1024).toFixed(1)} GB shared` : "")
     : "";
   const warn = [];
   if (sys && sys.dry_run) warn.push("Dry-run mode: nothing is actually started.");
@@ -493,7 +502,8 @@ function renderCanvas() {
       s("g", { class: cls(ref, (n.running ? " running" : "") + ` k-${n.kind}`), transform: `translate(${n.x},${n.y})`, ...handlers(ref) },
         s("title", {}, `${n.name} (${n.running ? "running" : "stopped"})`),
         s("rect", { class: "box", x: -30, y: -30, width: 60, height: 60, rx: 14 }),
-        s("path", { class: "glyph", d: ICONS[n.role === "switch" ? "switch" : n.kind], transform: "translate(-19.2,-19.2) scale(1.6)", "vector-effect": "non-scaling-stroke" }),
+        s("path", { class: "glyph", d: ICONS[n.kind === "client" ? "client" : n.role === "switch" ? "switch" : "chr"], transform: "translate(-19.2,-19.2) scale(1.6)", "vector-effect": "non-scaling-stroke" }),
+        osBadge(n),
         s("circle", { class: "dot", cx: 26, cy: -26, r: 6.5 }),
         s("text", { y: 48 }, n.name),
         s("text", { class: "sub", y: 62 }, n.mgmt_ip || (n.kind === "client" && n.address) || ""),
@@ -737,62 +747,108 @@ function nextName(prefix) {
   return prefix + i;
 }
 
-function addNodeDialog(kind) {
+function freeSpot() {
   // First free slot on a grid, starting near the middle of what is on screen.
   const r = $("#canvas").getBoundingClientRect();
   const cx = snap(((r.width || 900) / 2 - view.x) / view.k), cy = snap(((r.height || 600) / 2 - view.y) / view.k);
-  let at = null;
-  for (let i = 0; !at; i++) {
+  for (let i = 0; ; i++) {
     const p = { x: cx - 160 + (i % 4) * 160, y: cy - 80 + Math.floor(i / 4) * 140 };
-    if (!state.lab.nodes.some((n) => Math.hypot(n.x - p.x, n.y - p.y) < 110)) at = p;
+    if (!state.lab.nodes.some((n) => Math.hypot(n.x - p.x, n.y - p.y) < 110)) return p;
   }
-  const maxPorts = (state.sys && state.sys.max_chr_ports) || 24;
-  const isSwitch = kind === "switch";
-  if (kind === "aoscx") { addArubaDialog(at); return; }
-  const fields = kind !== "client"
-    ? [
-        isSwitch && { node: h("p", {}, "A switch is a normal CHR with more ports. It boots unconfigured: add its ports to a bridge in RouterOS to make it switch.") },
-        { key: "name", label: "Hostname", value: nextName(isSwitch ? "SW" : "R") },
-        { key: "ports", label: `Ethernet ports (1-${maxPorts})`, type: "number", value: isSwitch ? maxPorts : prefs.defPorts, min: 1, max: maxPorts },
-        { key: "cpus", label: "vCPUs", type: "number", value: prefs.defCpus, min: 1, max: 8 },
-        { key: "ram_mb", label: "RAM in MB (blank = sized from ports)", type: "number", placeholder: "auto", min: 128 },
-      ]
-    : [
-        { key: "name", label: "Hostname", value: nextName("PC") },
-        { key: "address", label: "IP address (optional)", placeholder: "192.168.10.2/24" },
-        { key: "gateway", label: "Gateway (optional)", placeholder: "192.168.10.1" },
-        { key: "dns", label: "DNS servers (optional)", placeholder: "1.1.1.1, 9.9.9.9" },
-      ];
-  openModal(isSwitch ? "Add switch" : kind === "chr" ? "Add router" : "Add client", fields.filter(Boolean), "Add", async (v) => {
-    const body = { kind: isSwitch ? "chr" : kind, name: v.name, ...at };
-    if (isSwitch) body.role = "switch";
-    for (const k of ["ports", "cpus", "ram_mb"]) if (v[k]) body[k] = Number(v[k]);
-    for (const k of ["address", "gateway", "dns"]) if (v[k]) body[k] = v[k];
-    const node = await api("POST", `${labPath()}/nodes`, body);
-    state.sel = { type: "node", id: node.id };
-  });
 }
 
-function addArubaDialog(at) {
-  const p = platformInfo("aoscx");
-  if (!p || !p.image) {
-    imagesDialog("aoscx", "Aruba CX switches need the AOS-CX Switch Simulator image first.");
+function addNodeDialog(tool) {
+  const at = freeSpot();
+  if (tool === "client") {
+    openModal("Add client", [
+      { key: "name", label: "Hostname", value: nextName("PC") },
+      { key: "address", label: "IP address (optional)", placeholder: "192.168.10.2/24" },
+      { key: "gateway", label: "Gateway (optional)", placeholder: "192.168.10.1" },
+      { key: "dns", label: "DNS servers (optional)", placeholder: "1.1.1.1, 9.9.9.9" },
+    ], "Add", async (v) => {
+      const body = { kind: "client", name: v.name, ...at };
+      for (const k of ["address", "gateway", "dns"]) if (v[k]) body[k] = v[k];
+      const node = await api("POST", `${labPath()}/nodes`, body);
+      state.sel = { type: "node", id: node.id };
+    });
     return;
   }
-  const maxData = p.max_ports - 1;
-  openModal("Add Aruba CX switch", [
-    { node: h("p", {}, `Experimental. Runs the AOS-CX Switch Simulator${p.version ? ` ${p.version}` : ""}. It takes a few minutes to boot. Log in as ${p.login}.`) },
-    { key: "name", label: "Hostname", value: nextName("CX") },
-    { key: "data", label: `Data ports, 1/1/1 onwards (1-${maxData}). The mgmt port comes on top.`, type: "number", value: p.default_ports - 1, min: 1, max: maxData },
-    { key: "cpus", label: "vCPUs", type: "number", value: p.default_cpus, min: 1, max: 8 },
-    { key: "ram_mb", label: `RAM in MB (at least ${p.min_ram_mb})`, type: "number", value: p.default_ram_mb, min: p.min_ram_mb },
-  ], "Add", async (v) => {
-    const body = { kind: "aoscx", name: v.name, ...at, ports: Number(v.data || p.default_ports - 1) + 1 };
-    if (v.cpus) body.cpus = Number(v.cpus);
-    if (v.ram_mb) body.ram_mb = Number(v.ram_mb);
+  addDeviceDialog(tool === "switch" ? "switch" : "router", at);
+}
+
+// A router or switch: pick the role from the toolbar, then the operating system here.
+function addDeviceDialog(role, at) {
+  const sys = state.sys || {};
+  const choices = (sys.platforms || []).filter((p) => p.roles.includes(role));
+  if (!choices.length) { toast("This server has no operating system for that.", true); return; }
+  const remembered = prefs[`os_${role}`];
+  const os = h("select", { id: "m-os" }, choices.map((p) =>
+    h("option", { value: p.kind }, p.label + (p.version ? ` ${p.version}` : "")
+      + (p.experimental ? " (experimental)" : "") + (p.image ? "" : " (image not installed)"))));
+  os.value = choices.some((p) => p.kind === remembered) ? remembered : choices[0].kind;
+  const note = h("div", {});
+  const name = h("input", { id: "m-name", type: "text", autocomplete: "off" });
+  const portsLabel = h("label", { for: "m-ports" });
+  const ports = h("input", { id: "m-ports", type: "number", min: 1 });
+  const cpus = h("input", { id: "m-cpus", type: "number", min: 1, max: 8 });
+  const ramLabel = h("label", { for: "m-ram" });
+  const ram = h("input", { id: "m-ram", type: "number" });
+  let named = false;
+  name.addEventListener("input", () => { named = true; });
+  const field = (label, input) => h("div", { class: "field" }, label, input);
+  const chosen = () => choices.find((p) => p.kind === os.value);
+
+  const fill = () => {
+    const p = chosen();
+    if (!named) name.value = nextName(p.kind === "aoscx" ? "CX" : role === "switch" ? "SW" : "R");
+    if (p.kind === "chr") {
+      const max = sys.max_chr_ports || p.max_ports;
+      portsLabel.textContent = `Ethernet ports (1-${max})`;
+      ports.max = max;
+      ports.value = role === "switch" ? max : prefs.defPorts;
+      cpus.value = prefs.defCpus;
+      ramLabel.textContent = "RAM in MB (blank = sized from ports)";
+      ram.min = p.min_ram_mb; ram.value = ""; ram.placeholder = "auto";
+    } else {
+      portsLabel.textContent = `Data ports, 1/1/1 onwards (1-${p.max_ports - 1}). The mgmt port comes on top.`;
+      ports.max = p.max_ports - 1;
+      ports.value = p.default_ports - 1;
+      cpus.value = p.default_cpus;
+      ramLabel.textContent = `RAM in MB (at least ${p.min_ram_mb})`;
+      ram.min = p.min_ram_mb; ram.value = p.default_ram_mb; ram.placeholder = "";
+    }
+    const lines = [];
+    if (p.kind === "chr" && role === "switch") lines.push(h("p", {}, "Boots unconfigured: add its ports to a bridge in RouterOS to make it switch."));
+    if (p.experimental) lines.push(h("p", {}, `Experimental. Takes a few minutes to boot. Log in as ${p.login}.`));
+    if (!p.image) lines.push(h("p", { class: "warn-text" }, `The ${p.label} image is not installed yet. `,
+      p.experimental
+        ? [h("a", { href: "#", onclick: (e) => { e.preventDefault(); imagesDialog(p.kind); } }, "Add it now"), "."]
+        : p.image_help));
+    note.replaceChildren(...lines);
+  };
+  os.addEventListener("change", fill);
+  fill();
+
+  openModal(role === "switch" ? "Add switch" : "Add router", [
+    { node: field(h("label", { for: "m-os" }, "Operating system"), os) },
+    { node: note },
+    { node: field(h("label", { for: "m-name" }, "Hostname"), name) },
+    { node: field(portsLabel, ports) },
+    { node: field(h("label", { for: "m-cpus" }, "vCPUs"), cpus) },
+    { node: field(ramLabel, ram) },
+  ], "Add", async () => {
+    const p = chosen();
+    if (!p.image && p.experimental) throw new Error(`Add the ${p.label} image first, with the link above.`);
+    prefs[`os_${role}`] = p.kind;
+    writeStore("prefs", prefs);
+    const n = Number(ports.value) || (p.kind === "chr" ? prefs.defPorts : p.default_ports - 1);
+    const body = { kind: p.kind, role, name: name.value.trim(), ...at, ports: p.kind === "chr" ? n : n + 1 };
+    if (cpus.value) body.cpus = Number(cpus.value);
+    if (ram.value) body.ram_mb = Number(ram.value);
     const node = await api("POST", `${labPath()}/nodes`, body);
     state.sel = { type: "node", id: node.id };
   });
+  name.focus();
 }
 
 // ------------------------------------------------- images (experimental platforms)
@@ -1130,8 +1186,9 @@ function nodeInspector(n) {
   return [
     head(n.name),
     h("div", { class: "status" + (n.running ? " running" : "") }, h("i", {}),
-      (n.running ? "Running" : "Stopped") + " · " + (isChr ? (n.role === "switch" ? "CHR switch" : "CHR router")
-        : isCx ? "Aruba AOS-CX switch (experimental)" : "Linux client")),
+      (n.running ? "Running" : "Stopped") + " · " + (isVm(n)
+        ? `${roleName(n)} · ${(platformInfo(n.kind) || {}).label || n.kind}${isCx ? " (experimental)" : ""}`
+        : "Linux client")),
     isCx && n.running && h("p", {}, `It takes a few minutes to boot. Log in as ${cxInfo ? cxInfo.login : "admin"}.`),
     h("div", { class: "row" },
       n.running
@@ -1921,6 +1978,11 @@ $("#settings").addEventListener("click", () => {
       row("Free memory", sys.mem_available_mb != null ? `${sys.mem_available_mb} MB` : "?"),
       row("Cloud", sys.cloud ? (sys.cloud.mode === "bridged" ? `your network ${sys.cloud.network || ""}` : `NAT, ${sys.cloud.network}`) : "?"),
       row("API reference", h("a", { href: "/docs", target: "_blank", rel: "noopener" }, "/docs"))) },
+    { node: h("h2", {}, "Memory") },
+    { key: "ksm", label: "Share identical memory between devices (KSM)", type: "checkbox", value: !!(sys.ksm && sys.ksm.enabled) },
+    { node: h("p", {}, !sys.ksm || !sys.ksm.available
+      ? "Not available on this server's kernel."
+      : `Devices booted from the same image share the memory they have in common. It uses some CPU while scanning, and savings build up over a few minutes. ${sys.ksm.running ? `Saving ${(sys.ksm.saved_mb / 1024).toFixed(1)} GB right now.` : "Off right now."}`) },
     { node: h("h2", {}, "Images") },
     { node: h("dl", { class: "info" }, (sys.platforms || []).map((p) => row(p.label + (p.experimental ? " (experimental)" : ""),
       h("span", {}, p.image ? `installed${p.version ? ` ${p.version}` : ""}` : "not installed",
@@ -1933,6 +1995,10 @@ $("#settings").addEventListener("click", () => {
     });
     writeStore("prefs", prefs);
     applyPrefs();
+    if (sys.ksm && v.ksm !== sys.ksm.enabled) {
+      const st = await api("PUT", "/host/ksm", { enabled: v.ksm });
+      toast(st.enabled ? "Memory sharing is on." : "Memory sharing is off. Pages already shared stay shared.");
+    }
   });
 });
 

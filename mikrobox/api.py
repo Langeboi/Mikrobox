@@ -51,8 +51,8 @@ class LabUpdate(BaseModel):
 
 
 class NodeCreate(BaseModel):
-    kind: NodeKind = NodeKind.chr
-    role: Literal["router", "switch"] = "router"
+    kind: NodeKind = NodeKind.chr  # the operating system
+    role: Optional[Literal["router", "switch"]] = None  # default: the first the OS supports
     name: str = Field(pattern=NAME_PATTERN)
     ports: Optional[int] = Field(default=None, ge=1)
     cpus: Optional[int] = Field(default=None, ge=1, le=8)
@@ -177,6 +177,10 @@ class PresenceBeat(BaseModel):
     client: str = Field(min_length=4, max_length=40)
     lab: Optional[int] = None
     node: Optional[int] = None
+
+
+class KsmSetting(BaseModel):
+    enabled: bool
 
 
 class TemplateUse(BaseModel):
@@ -439,6 +443,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     def system():
         return rt.system_info()
 
+    @app.put("/api/host/ksm")
+    def set_ksm(body: KsmSetting):
+        """Switch memory sharing between devices on or off."""
+        return rt.ksm.set(body.enabled)
+
     @app.get("/", include_in_schema=False)
     def index_page():
         return FileResponse(STATIC / "index.html")
@@ -601,12 +610,15 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             check_name(lab, body.name)
             is_chr = body.kind == NodeKind.chr
             p = platform(body.kind)
-            if body.role == "switch" and not is_chr:
-                raise Invalid("Only a CHR can be a switch.")
-            if is_chr:
-                ports = body.ports or (24 if body.role == "switch" else 8)
+            if p is None:
+                if body.role == "switch":
+                    raise Invalid("A client cannot be a switch.")
+                role = "router"
             else:
-                ports = body.ports or (p.default_ports if p else 1)
+                role = body.role or p.roles[0]
+                if role not in p.roles:
+                    raise Invalid(f"{p.label} can only be added as a {' or '.join(p.roles)}.")
+            ports = body.ports or (p.ports_for(role) if p else 1)
             check_ports(body.kind, ports)
             if p and (body.address or body.gateway or body.dns):
                 raise Invalid("address, gateway and dns apply to client nodes only.")
@@ -620,7 +632,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             check_ram(body.kind, ram)
             node = Node(
                 id=free_id({n.id for n in store.state.all_nodes()}),
-                kind=body.kind, role=body.role, name=body.name, ports=ports, cpus=cpus,
+                kind=body.kind, role=role, name=body.name, ports=ports, cpus=cpus,
                 ram_mb=ram, address=body.address, gateway=body.gateway, dns=body.dns,
                 x=body.x, y=body.y,
             )

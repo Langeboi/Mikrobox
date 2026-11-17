@@ -201,7 +201,9 @@ pre.out { max-height: 180px; overflow: auto; background: var(--surface-2); paddi
 /* ---- experimental platforms ---- */
 :root { --cx: #b45c00; }
 :root[data-theme="dark"] { --cx: #f2a65a; }
-.node.k-aoscx .glyph, .node.k-aoscx.running .glyph { stroke: var(--cx); }
+.os-badge rect { fill: var(--cx); stroke: var(--surface); stroke-width: 2; }
+.os-badge text { fill: #fff; font-size: 10px; font-weight: 700; text-anchor: middle; stroke: none; letter-spacing: .03em; }
+:root[data-theme="dark"] .os-badge text { fill: #0e1319; }
 .warn-text { color: var(--danger); font-size: 13px; }
 progress { height: 8px; accent-color: var(--accent); }
 

@@ -13,6 +13,7 @@ from pathlib import Path
 from . import __version__
 from .config import Settings
 from .models import Endpoint, Lab, Link, Node, NodeKind
+from .ksm import Ksm
 from .network import Net, pid_alive
 from .platforms import PLATFORMS, is_vm, platform
 from .shell import CommandError, Shell
@@ -49,6 +50,7 @@ class Runtime:
         self.store = store
         self.sh = sh or Shell(dry_run=settings.dry_run)
         self.net = Net(settings, self.sh)
+        self.ksm = Ksm(settings)
         self.lock = threading.RLock()
         self.cloud_ips: dict[str, str] = {}  # MAC -> address, discovered in bridged mode
         self._scanner: threading.Thread | None = None
@@ -119,11 +121,13 @@ class Runtime:
             "chr_version": self._chr_version(),
             "max_chr_ports": self.s.max_chr_ports,
             "platforms": [self.platform_info(p) for p in PLATFORMS.values()],
+            "ksm": self.ksm.status(),
         }
 
     def platform_info(self, p) -> dict:
         image = p.image_path(self.s)
-        info = {"kind": p.kind.value, "label": p.label, "experimental": p.experimental,
+        info = {"kind": p.kind.value, "label": p.label, "short": p.short, "roles": list(p.roles),
+                "experimental": p.experimental,
                 "image": image.exists(), "image_size": image.stat().st_size if image.exists() else None,
                 "default_ports": p.default_ports, "max_ports": p.max_ports,
                 "default_cpus": p.default_cpus, "default_ram_mb": p.default_ram_mb,
@@ -148,6 +152,7 @@ class Runtime:
         (self.s.data_dir / "disks").mkdir(parents=True, exist_ok=True)
         self.net.ensure_mgmt()
         self.sync_dhcp()
+        self.ksm.apply()
         if self.net.bridged() and not self.s.dry_run and self._scanner is None:
             self._scanner = threading.Thread(target=self._scan_loop, daemon=True)
             self._scanner.start()

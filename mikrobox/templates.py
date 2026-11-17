@@ -30,8 +30,8 @@ class Build:
     def aoscx(self, name: str, x: float, y: float, data_ports: int = 4) -> int:
         """An Aruba AOS-CX switch. Port 1 is its mgmt port, kept free for the Cloud."""
         nid = len(self.nodes) + 1
-        self.nodes.append({"id": nid, "kind": "aoscx", "name": name, "ports": data_ports + 1,
-                           "cpus": 2, "ram_mb": 4096, "x": x, "y": y})
+        self.nodes.append({"id": nid, "kind": "aoscx", "role": "switch", "name": name,
+                           "ports": data_ports + 1, "cpus": 1, "ram_mb": 2048, "x": x, "y": y})
         self.used[nid] = 1
         return nid
 
@@ -250,7 +250,7 @@ def aruba_mikrotik() -> Build:
     b.link(cx2, b.pc("PC2", 830, 590, "10.10.20.10/24", "10.10.20.1"))
     b.note(900, 50, 300, 440,
            "Aruba CX and MikroTik (experimental)\n\n"
-           "Needs the AOS-CX Switch Simulator image (Settings, Images) and about 9 GB of memory.\n\n"
+           "Needs the AOS-CX Switch Simulator image (Settings, Images) and about 5 GB of memory.\n\n"
            "Suggested plan\n"
            "Loopbacks 10.255.0.x/32\n"
            "EDGE1-EDGE2 10.0.0.0/30, EDGE-CX links 10.0.1.0/30 and 10.0.2.0/30\n"

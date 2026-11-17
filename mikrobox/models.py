@@ -7,7 +7,7 @@ import re
 from enum import Enum
 from typing import Literal, Optional
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 NAME_PATTERN = r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,62}$"
 
@@ -21,7 +21,8 @@ class NodeKind(str, Enum):
 class Node(BaseModel):
     id: int
     kind: NodeKind
-    # How a CHR is presented. A switch is still a full CHR, just drawn and sized as one.
+    # What the device is used as. kind says which operating system runs it; role says
+    # whether it is drawn and sized as a router or a switch. A CHR can be either.
     role: Literal["router", "switch"] = "router"
     name: str = Field(pattern=NAME_PATTERN)
     ports: int = Field(ge=1)
@@ -34,6 +35,12 @@ class Node(BaseModel):
     # Position on the topology canvas.
     x: float = 0
     y: float = 0
+
+    @model_validator(mode="after")
+    def _fixed_roles(self) -> "Node":
+        if self.kind == NodeKind.aoscx:
+            self.role = "switch"  # AOS-CX only comes as a switch
+        return self
 
     @field_validator("address")
     @classmethod

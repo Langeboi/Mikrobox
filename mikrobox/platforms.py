@@ -17,6 +17,8 @@ from .models import Node, NodeKind
 class Platform:
     kind: NodeKind
     label: str
+    short: str  # badge on the canvas; empty for the default OS
+    roles: tuple[str, ...]  # what it can be added as: router, switch
     image_name: str  # file under <data>/images/
     image_format: str  # backing format of that file
     nic: str  # QEMU NIC model
@@ -32,6 +34,11 @@ class Platform:
     login: str
     image_help: str
 
+    def ports_for(self, role: str) -> int:
+        if self.kind == NodeKind.chr and role == "switch":
+            return 24
+        return self.default_ports
+
     def port_name(self, port: int) -> str:
         if self.kind == NodeKind.aoscx:
             return "mgmt" if port == 1 else f"1/1/{port - 1}"
@@ -44,7 +51,8 @@ class Platform:
 
 
 CHR = Platform(
-    kind=NodeKind.chr, label="MikroTik CHR", image_name="chr.img", image_format="raw",
+    kind=NodeKind.chr, label="MikroTik CHR", short="", roles=("router", "switch"),
+    image_name="chr.img", image_format="raw",
     nic="virtio-net-pci", disk_bus="virtio", default_ports=8, max_ports=24,
     default_cpus=1, default_ram_mb=256, min_ram_mb=128, needs_kvm=False, guest_agent=True,
     experimental=False, login="admin, no password",
@@ -53,10 +61,13 @@ CHR = Platform(
 
 # The AOS-CX Switch Simulator. Its first network card is the out-of-band mgmt port;
 # the rest are 1/1/1 onwards. e1000 avoids TCP problems seen with virtio in other labs.
+# HPE gives 2 vCPU / 4 GB as the default (sized for vSphere) and 1 vCPU / 2 GB as the
+# minimum for lab platforms such as EVE-NG and GNS3. A lab wants density, so the minimum.
 AOSCX = Platform(
-    kind=NodeKind.aoscx, label="Aruba AOS-CX", image_name="aoscx.qcow2", image_format="qcow2",
+    kind=NodeKind.aoscx, label="Aruba AOS-CX", short="CX", roles=("switch",),
+    image_name="aoscx.qcow2", image_format="qcow2",
     nic="e1000", disk_bus="ide", default_ports=9, max_ports=17,
-    default_cpus=2, default_ram_mb=4096, min_ram_mb=2048, needs_kvm=True, guest_agent=False,
+    default_cpus=1, default_ram_mb=2048, min_ram_mb=2048, needs_kvm=True, guest_agent=False,
     experimental=True, login="admin, no password (it asks you to set one)",
     image_help=("Download the AOS-CX Switch Simulator (an .ova inside a .zip) from the HPE "
                 "Networking Support Portal, free with an HPE account, and upload the .zip, "
