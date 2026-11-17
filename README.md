@@ -35,7 +35,7 @@ available through the API (interactive docs at `/docs`).
 - Automatic config backups per lab (all routers or chosen ones, every 15 minutes to 24
   hours), kept as revisions only when the config changed, with a side-by-side compare.
 - Shared consoles: everyone who opens a device's console sees the same session and can
-  type. Badges show who else is in the lab and which device they have selected.
+  type. Badges show who else is in the lab; hover one to see which device they are on.
 - Restore a saved revision to a router, replacing its config or applying it on top.
 - Documentation export: a zip with a Markdown write-up (devices, cabling, areas, notes),
   the topology image and each router's latest config.
