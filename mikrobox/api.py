@@ -25,7 +25,7 @@ from pydantic import BaseModel, Field, ValidationError
 from . import __version__, routeros, templates
 from . import clients as clients_mod
 from .backup import INTERVALS, Backups
-from .auth import COOKIE, SESSION_SECONDS, Auth, AuthError, AuthMiddleware
+from .auth import COOKIE, MIN_PASSWORD, SESSION_SECONDS, Auth, AuthError, AuthMiddleware
 from .config import Settings
 from . import console as consoles
 from .activity import Activity
@@ -366,7 +366,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     @app.get("/api/auth/status")
     def auth_status(request: Request):
         user = auth.user_from_headers(dict(request.scope["headers"])) if auth.enabled else None
-        return {"enabled": auth.enabled, "setup_needed": auth.enabled and not auth.users, "user": user}
+        return {"enabled": auth.enabled, "setup_needed": auth.enabled and not auth.users, "user": user,
+                "version": __version__, "min_password": MIN_PASSWORD}
 
     @app.post("/api/auth/setup")
     def auth_setup(body: Login):

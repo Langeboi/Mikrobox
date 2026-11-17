@@ -5,6 +5,7 @@ from pathlib import Path
 import pytest
 from fastapi.testclient import TestClient
 
+from mikrobox import __version__
 from mikrobox.api import create_app
 from mikrobox.config import Settings
 
@@ -547,7 +548,8 @@ def test_everything_needs_an_account(client):
     with pytest.raises(WebSocketDisconnect):
         with anon.websocket_connect("/api/labs/1/nodes/1/console"):
             pass
-    assert anon.get("/api/auth/status").json() == {"enabled": True, "setup_needed": False, "user": None}
+    assert anon.get("/api/auth/status").json() == {"enabled": True, "setup_needed": False, "user": None,
+                                                   "version": __version__, "min_password": 8}
 
 
 def test_login_logout_and_accounts(client):
