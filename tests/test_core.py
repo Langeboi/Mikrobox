@@ -503,7 +503,7 @@ def test_client_dns(client):
 def test_templates_build_valid_labs(client):
     listed = client.get("/api/templates").json()
     assert [t["id"] for t in listed] == ["ospf-multi-area", "collapsed-core", "spine-leaf",
-                                          "isp-mpls", "bgp-multihoming"]
+                                          "isp-mpls", "bgp-multihoming", "aruba-mikrotik"]
     for t in listed:
         r = client.post(f"/api/templates/{t['id']}", json={})
         assert r.status_code == 201, r.text
@@ -961,3 +961,155 @@ def test_connectivity_test_rules(client, monkeypatch):
     assert client.post(url, json={"target": "--help"}).status_code == 422
     r = client.post(url, json={"target": "192.168.20.2", "tool": "traceroute"}).json()
     assert r["ok"] is False and r["command"].startswith("traceroute -n") and "Dry-run" in r["output"]
+
+
+
+# -- experimental: Aruba AOS-CX ---------------------------------------------
+
+def test_aoscx_node_defaults_and_qemu(client):
+    lab = make_lab(client)
+    cx = add_node(client, lab, kind="aoscx", name="CX1")
+    assert (cx["kind"], cx["ports"], cx["cpus"], cx["ram_mb"]) == ("aoscx", 9, 2, 4096)
+    assert client.post(f"/api/labs/{lab}/nodes", json={"kind": "aoscx", "name": "CX2", "ports": 18}).status_code == 400
+    assert client.post(f"/api/labs/{lab}/nodes", json={"kind": "aoscx", "name": "CX2", "ram_mb": 1024}).status_code == 400
+    assert client.post(f"/api/labs/{lab}/nodes", json={"kind": "aoscx", "name": "CX2", "address": "1.2.3.4/24"}).status_code == 400
+    assert client.patch(f"/api/labs/{lab}/nodes/{cx['id']}", json={"ram_mb": 2048}).json()["ram_mb"] == 2048
+
+    node = client.rt.store.state.lab(lab).node(cx["id"])
+    cmd = client.rt.qemu_command(node)
+    joined = " ".join(cmd)
+    assert f"if=ide,format=qcow2" in joined and "guest_agent" not in joined
+    assert sum(1 for a in cmd if a.startswith("e1000,netdev=")) == 9
+    assert cmd[cmd.index("-smp") + 1] == "2"
+
+    # MikroTik is unchanged.
+    r1 = add_node(client, lab, name="R1")
+    cmd = " ".join(client.rt.qemu_command(client.rt.store.state.lab(lab).node(r1["id"])))
+    assert "if=virtio,format=qcow2" in cmd and "virtio-net-pci,netdev=p1" in cmd and "guest_agent" in cmd
+
+
+def test_aoscx_needs_its_image_and_kvm(client):
+    lab = make_lab(client)
+    cx = add_node(client, lab, kind="aoscx", name="CX1")
+    client.rt.s.dry_run = False  # the checks below happen before anything runs
+    try:
+        r = client.post(f"/api/labs/{lab}/nodes/{cx['id']}/start")
+        assert r.status_code == 409 and "No Aruba AOS-CX image yet" in r.json()["detail"]
+        image = client.tmp / "data" / "images" / "aoscx.qcow2"
+        image.parent.mkdir(parents=True, exist_ok=True)
+        image.write_bytes(b"QFI\xfb")
+        r = client.post(f"/api/labs/{lab}/nodes/{cx['id']}/start")
+        assert r.status_code == 409 and "needs KVM" in r.json()["detail"]
+    finally:
+        client.rt.s.dry_run = True
+    client.rt.sh.history.clear()
+    assert client.post(f"/api/labs/{lab}/nodes/{cx['id']}/start").status_code == 200
+    overlay = next(c for c in client.rt.sh.history if c[:2] == ["qemu-img", "create"])
+    assert overlay[overlay.index("-F") + 1] == "qcow2" and overlay[overlay.index("-b") + 1].endswith("aoscx.qcow2")
+
+
+def test_aoscx_mgmt_port_gets_a_cloud_address(client):
+    lab = make_lab(client)
+    cx = add_node(client, lab, kind="aoscx", name="CX1")
+    client.post(f"/api/labs/{lab}/links", json={"a": {"node": cx["id"], "port": 1}})
+    view = client.get(f"/api/labs/{lab}").json()["nodes"][0]
+    assert view["mgmt_ip"] == f"10.99.1.{cx['id']}" and view["ssh"] == f"ssh admin@10.99.1.{cx['id']}"
+    assert view["backup"] is None  # config tools stay MikroTik-only for now
+    hosts = (client.tmp / "run" / "dhcp-hosts").read_text()
+    assert f"52:54:00:00:{cx['id']:02x}:01,10.99.1.{cx['id']},CX1" in hosts
+
+
+def test_aoscx_ports_in_documentation(client):
+    import io, zipfile
+
+    lab = make_lab(client)
+    cx = add_node(client, lab, kind="aoscx", name="CX1")
+    r1 = add_node(client, lab, name="R1")
+    client.post(f"/api/labs/{lab}/links", json={"a": {"node": cx["id"], "port": 3}, "b": {"node": r1["id"], "port": 2}})
+    client.post(f"/api/labs/{lab}/links", json={"a": {"node": cx["id"], "port": 1}})
+    md = zipfile.ZipFile(io.BytesIO(client.post(f"/api/labs/{lab}/documentation", json={}).content)).read("first.md").decode()
+    assert "| CX1 | Switch (Aruba AOS-CX) | 9 | 2 | 4096 |" in md
+    assert "| CX1 | 1/1/2 | R1 | ether2 |" in md and "| CX1 | mgmt | Cloud | |" in md
+
+
+def _make_ova_zip(folder):
+    """A stand-in for HPE's download: a .zip holding an .ova (tar) holding a .vmdk."""
+    import io, tarfile, zipfile
+
+    vmdk = b"KDMV" + b"\0" * 4096
+    ova = io.BytesIO()
+    with tarfile.open(fileobj=ova, mode="w") as t:
+        for name, data in (("ArubaOS-CX.ovf", b"<Envelope/>"), ("../../evil.vmdk", b"KDMV"),
+                           ("arubaoscx-disk-image-genericx86-p4.vmdk", vmdk)):
+            info = tarfile.TarInfo(name)
+            info.size = len(data)
+            t.addfile(info, io.BytesIO(data))
+    path = folder / "ArubaOS-CX_10_15_1020_ova.zip"
+    with zipfile.ZipFile(path, "w") as z:
+        z.writestr("README.txt", "hello")
+        z.writestr("ArubaOS-CX_10_15_1020.ova", ova.getvalue())
+    return path, vmdk
+
+
+def test_image_install_unpacks_zip_and_ova(tmp_path, monkeypatch):
+    from mikrobox import images
+    from mikrobox.platforms import AOSCX
+
+    src, vmdk = _make_ova_zip(tmp_path)
+    seen = []
+
+    def fake_convert(disk, dest):
+        seen.append((images.sniff(disk), disk.read_bytes()))
+        dest.write_bytes(b"QFI\xfb converted")
+
+    monkeypatch.setattr(images, "_convert", fake_convert)
+    settings = Settings(data_dir=tmp_path / "data", run_dir=tmp_path / "run", dry_run=True)
+    result = images.install(settings, AOSCX, src, src.name)
+    assert seen == [("vmdk", vmdk)]  # the real disk, not the tiny one with the hostile name
+    assert result["version"] == "10.15.1020"
+    assert (tmp_path / "data" / "images" / "aoscx.qcow2").read_bytes() == b"QFI\xfb converted"
+    assert (tmp_path / "data" / "images" / "aoscx.version").read_text() == "10.15.1020\n"
+    assert not (tmp_path / "evil.vmdk").exists() and not (tmp_path / "data" / "evil.vmdk").exists()
+    assert not list((tmp_path / "data" / "images").glob(".import-*"))
+
+    junk = tmp_path / "notes.txt"
+    junk.write_text("not an image")
+    with pytest.raises(images.ImageError):
+        images.install(settings, AOSCX, junk)
+
+
+def test_image_upload_endpoint(client, monkeypatch):
+    import time as _time
+    from mikrobox import images
+
+    src, _ = _make_ova_zip(client.tmp)
+    monkeypatch.setattr(images, "_convert", lambda disk, dest: dest.write_bytes(b"QFI\xfb ok"))
+    lab = make_lab(client)
+    cx = add_node(client, lab, kind="aoscx", name="CX1")
+    disk = client.rt.disk_path(client.rt.store.state.lab(lab).node(cx["id"]))
+    disk.parent.mkdir(parents=True, exist_ok=True)
+    disk.write_bytes(b"old overlay")
+
+    assert client.put("/api/images/chr", content=b"x").status_code == 400
+    r = client.put("/api/images/aoscx", params={"filename": src.name}, content=src.read_bytes())
+    assert r.status_code == 202, r.text
+    for _ in range(50):
+        info = next(i for i in client.get("/api/images").json() if i["kind"] == "aoscx")
+        if info["import"]["state"] != "converting":
+            break
+        _time.sleep(0.1)
+    assert info["import"] == {"state": "done", "message": "Aruba AOS-CX 10.15.1020 is ready."}
+    assert info["image"] and info["version"] == "10.15.1020"
+    assert not disk.exists()  # existing switches start fresh on the new image
+    assert not (client.tmp / "data" / "images" / ".upload-aoscx").exists()
+    platforms = {p["kind"]: p for p in client.get("/api/system").json()["platforms"]}
+    assert platforms["aoscx"]["image"] and platforms["aoscx"]["experimental"]
+    assert platforms["chr"]["experimental"] is False
+
+    r = client.put("/api/images/aoscx", content=b"just text")
+    for _ in range(50):
+        info = next(i for i in client.get("/api/images").json() if i["kind"] == "aoscx")
+        if info["import"]["state"] != "converting":
+            break
+        _time.sleep(0.1)
+    assert info["import"]["state"] == "error" and "not a .zip" in info["import"]["message"]

@@ -27,6 +27,7 @@ const ICONS = {
   chr: "M2 12a10 10 0 1 0 20 0a10 10 0 1 0-20 0 M6 12h12 M12 6v12 M6 12l2.6-2.6 M6 12l2.6 2.6 M18 12l-2.6-2.6 M18 12l-2.6 2.6 M12 6l-2.6 2.6 M12 6l2.6 2.6 M12 18l-2.6-2.6 M12 18l2.6-2.6",
   client: "M4 5h16v11H4z M9 20h6 M12 16v4",
   switch: "M3 8.5h18 M17 5l4 3.5-4 3.5 M21 15.5H3 M7 12l-4 3.5 4 3.5",
+  aoscx: "M2 7h20v10H2z M5 10.5h2.5 M9 10.5h2.5 M13 10.5h2.5 M5 13.5h2.5 M9 13.5h2.5 M13 13.5h2.5 M18.5 10v4",
   rect: "M4 6h16v12H4z",
   ellipse: "M3 12a9 6.5 0 1 0 18 0a9 6.5 0 1 0-18 0",
   text: "M5 6h14 M12 6v13 M9 19h6",
@@ -46,6 +47,8 @@ const TOOLS = [
   { id: "chr", label: "Router", tip: "Add a MikroTik CHR router", add: true },
   { id: "switch", label: "Switch", tip: "Add a CHR with 24 ports to use as a switch", add: true },
   { id: "client", label: "Client", tip: "Add a Linux client", add: true },
+  null,
+  { id: "aoscx", label: "Aruba CX", tip: "Add an Aruba AOS-CX switch (experimental; needs the simulator image)", add: true },
   null,
   { id: "rect", label: "Area", tip: "Draw a rectangular area", draw: true },
   { id: "ellipse", label: "Ellipse", tip: "Draw an elliptical area", draw: true },
@@ -179,7 +182,11 @@ async function refresh(force) {
 
 const nodeById = (id) => state.lab.nodes.find((n) => n.id === id);
 const annoById = (id) => state.lab.annotations.find((a) => a.id === id);
-const portName = (node, port) => (node.kind === "chr" ? `ether${port}` : `eth${port - 1}`);
+const portName = (node, port) => (node.kind === "chr" ? `ether${port}`
+  : node.kind === "aoscx" ? (port === 1 ? "mgmt" : `1/1/${port - 1}`)
+  : `eth${port - 1}`);
+const isVm = (node) => node.kind === "chr" || node.kind === "aoscx";
+const platformInfo = (kind) => ((state.sys && state.sys.platforms) || []).find((p) => p.kind === kind) || null;
 const labPath = () => `/labs/${state.lab.id}`;
 const snap = (v) => (prefs.snap ? Math.round(v / 20) * 20 : Math.round(v));
 const sameRef = (a, b) => !!a && !!b && a.type === b.type && a.id === b.id;
@@ -483,7 +490,7 @@ function renderCanvas() {
   for (const n of lab.nodes) {
     const ref = { type: "node", id: n.id };
     world.append(
-      s("g", { class: cls(ref, n.running ? " running" : ""), transform: `translate(${n.x},${n.y})`, ...handlers(ref) },
+      s("g", { class: cls(ref, (n.running ? " running" : "") + ` k-${n.kind}`), transform: `translate(${n.x},${n.y})`, ...handlers(ref) },
         s("title", {}, `${n.name} (${n.running ? "running" : "stopped"})`),
         s("rect", { class: "box", x: -30, y: -30, width: 60, height: 60, rx: 14 }),
         s("path", { class: "glyph", d: ICONS[n.role === "switch" ? "switch" : n.kind], transform: "translate(-19.2,-19.2) scale(1.6)", "vector-effect": "non-scaling-stroke" }),
@@ -741,6 +748,7 @@ function addNodeDialog(kind) {
   }
   const maxPorts = (state.sys && state.sys.max_chr_ports) || 24;
   const isSwitch = kind === "switch";
+  if (kind === "aoscx") { addArubaDialog(at); return; }
   const fields = kind !== "client"
     ? [
         isSwitch && { node: h("p", {}, "A switch is a normal CHR with more ports. It boots unconfigured: add its ports to a bridge in RouterOS to make it switch.") },
@@ -762,6 +770,94 @@ function addNodeDialog(kind) {
     for (const k of ["address", "gateway", "dns"]) if (v[k]) body[k] = v[k];
     const node = await api("POST", `${labPath()}/nodes`, body);
     state.sel = { type: "node", id: node.id };
+  });
+}
+
+function addArubaDialog(at) {
+  const p = platformInfo("aoscx");
+  if (!p || !p.image) {
+    imagesDialog("aoscx", "Aruba CX switches need the AOS-CX Switch Simulator image first.");
+    return;
+  }
+  const maxData = p.max_ports - 1;
+  openModal("Add Aruba CX switch", [
+    { node: h("p", {}, `Experimental. Runs the AOS-CX Switch Simulator${p.version ? ` ${p.version}` : ""}. It takes a few minutes to boot. Log in as ${p.login}.`) },
+    { key: "name", label: "Hostname", value: nextName("CX") },
+    { key: "data", label: `Data ports, 1/1/1 onwards (1-${maxData}). The mgmt port comes on top.`, type: "number", value: p.default_ports - 1, min: 1, max: maxData },
+    { key: "cpus", label: "vCPUs", type: "number", value: p.default_cpus, min: 1, max: 8 },
+    { key: "ram_mb", label: `RAM in MB (at least ${p.min_ram_mb})`, type: "number", value: p.default_ram_mb, min: p.min_ram_mb },
+  ], "Add", async (v) => {
+    const body = { kind: "aoscx", name: v.name, ...at, ports: Number(v.data || p.default_ports - 1) + 1 };
+    if (v.cpus) body.cpus = Number(v.cpus);
+    if (v.ram_mb) body.ram_mb = Number(v.ram_mb);
+    const node = await api("POST", `${labPath()}/nodes`, body);
+    state.sel = { type: "node", id: node.id };
+  });
+}
+
+// ------------------------------------------------- images (experimental platforms)
+
+function sizeText(bytes) {
+  return bytes >= 1024 ** 3 ? `${(bytes / 1024 ** 3).toFixed(1)} GB` : `${Math.round(bytes / 1024 ** 2)} MB`;
+}
+
+function imagesDialog(kind, reason) {
+  const p = platformInfo(kind);
+  if (!p) { toast("This server does not know that platform.", true); return; }
+  const status = h("p", {});
+  const progress = h("progress", { max: 100, value: 0, hidden: true, style: "width:100%" });
+  const file = h("input", { id: "m-image", type: "file", accept: ".zip,.ova,.vmdk,.qcow2" });
+  const showStatus = (info) => {
+    status.textContent = info.image
+      ? `Installed${info.version ? `: version ${info.version}` : ""}, ${sizeText(info.image_size)}.`
+      : "Not installed yet.";
+  };
+  showStatus(p);
+  openModal(`${p.label} image`, [
+    reason && { node: h("p", {}, reason) },
+    { node: status },
+    { node: h("p", {}, p.image_help) },
+    { node: h("div", { class: "field" }, h("label", { for: "m-image" }, p.image ? "Replace it with" : "Image file"), file) },
+    p.image && { node: h("p", { class: "warn-text" }, `Replacing the image resets every ${p.label} device to factory defaults. Stop them first.`) },
+    { node: progress },
+  ].filter(Boolean), "Upload", async () => {
+    const f = file.files && file.files[0];
+    if (!f) throw new Error("Choose the file you downloaded first.");
+    progress.hidden = false;
+    status.textContent = "Uploading";
+    await new Promise((ok, fail) => {
+      const xhr = new XMLHttpRequest();
+      xhr.open("PUT", `/api/images/${kind}?filename=${encodeURIComponent(f.name)}`);
+      xhr.upload.onprogress = (e) => {
+        if (!e.lengthComputable) return;
+        progress.value = Math.round((e.loaded / e.total) * 100);
+        status.textContent = `Uploading: ${sizeText(e.loaded)} of ${sizeText(e.total)}`;
+      };
+      xhr.onload = () => {
+        if (xhr.status === 401) { location.replace("/login"); return; }
+        if (xhr.status >= 200 && xhr.status < 300) { ok(); return; }
+        let msg = `Upload failed (${xhr.status})`;
+        try { msg = JSON.parse(xhr.responseText).detail || msg; } catch (e) { /* keep the status */ }
+        fail(new Error(msg));
+      };
+      xhr.onerror = () => fail(new Error("The upload was interrupted."));
+      xhr.send(f);
+    });
+    progress.removeAttribute("value"); // indeterminate while the server converts
+    status.textContent = "Unpacking and converting the disk. This takes a minute or two.";
+    for (;;) {
+      await new Promise((r) => setTimeout(r, 1500));
+      const info = (await api("GET", "/images")).find((x) => x.kind === kind);
+      const st = info.import || {};
+      if (st.state === "done") {
+        progress.hidden = true;
+        showStatus(info);
+        toast(st.message);
+        state.sys = await api("GET", "/system");
+        return false; // close
+      }
+      if (st.state === "error") { progress.hidden = true; showStatus(info); throw new Error(st.message); }
+    }
   });
 }
 
@@ -983,6 +1079,8 @@ function annoInspector(a) {
 
 function nodeInspector(n) {
   const isChr = n.kind === "chr";
+  const isCx = n.kind === "aoscx";
+  const cxInfo = isCx ? platformInfo("aoscx") : null;
   const inputs = {};
   const field = (key, label, type, extra) => {
     const id = "i-" + key;
@@ -1013,14 +1111,14 @@ function nodeInspector(n) {
   }
 
   const access = [];
-  if (n.mgmt_ip && isChr) {
+  if (n.mgmt_ip && (isChr || isCx)) {
     access.push(copyRow(n.ssh), h("p", {}, h("a", { href: `ssh://admin@${n.mgmt_ip}` }, "Open in your SSH client"),
       ". WinBox and MobaXterm can connect to the same address."));
   } else if (n.mgmt_ip) {
     access.push(copyRow(n.mgmt_ip));
   } else if (n.cloud_port) {
     access.push(h("p", {}, n.running
-      ? `Waiting to see which address ${portName(n, n.cloud_port)} was given. You can also check on the console${isChr ? " with /ip address print" : ""}.`
+      ? `Waiting to see which address ${portName(n, n.cloud_port)} was given. You can also check on the console${isChr ? " with /ip address print" : isCx ? " with show interface mgmt" : ""}.`
       : "Start the device to get an address."));
   } else {
     access.push(h("p", {}, "Link a port to the Cloud to give this device internet and reach it from your PC."));
@@ -1029,7 +1127,9 @@ function nodeInspector(n) {
   return [
     head(n.name),
     h("div", { class: "status" + (n.running ? " running" : "") }, h("i", {}),
-      (n.running ? "Running" : "Stopped") + " · " + (isChr ? (n.role === "switch" ? "CHR switch" : "CHR router") : "Linux client")),
+      (n.running ? "Running" : "Stopped") + " · " + (isChr ? (n.role === "switch" ? "CHR switch" : "CHR router")
+        : isCx ? "Aruba AOS-CX switch (experimental)" : "Linux client")),
+    isCx && n.running && h("p", {}, `It takes a few minutes to boot. Log in as ${cxInfo ? cxInfo.login : "admin"}.`),
     h("div", { class: "row" },
       n.running
         ? h("button", { type: "button", onclick: () => act(() => api("POST", path + "/stop")) }, "Stop")
@@ -1043,6 +1143,11 @@ function nodeInspector(n) {
             field("ports", "Ports", "number", { min: 1, max: 24 }),
             field("cpus", "vCPUs", "number", { min: 1, max: 8 }),
             field("ram_mb", "RAM (MB)", "number", { min: 128 }))
+        : isCx
+        ? h("div", { class: "grid3" },
+            field("ports", "Ports + mgmt", "number", { min: 2, max: cxInfo ? cxInfo.max_ports : 17 }),
+            field("cpus", "vCPUs", "number", { min: 1, max: 8 }),
+            field("ram_mb", "RAM (MB)", "number", { min: cxInfo ? cxInfo.min_ram_mb : 2048 }))
         : [field("address", "IP address", "text", { placeholder: "192.168.10.2/24" }),
            field("gateway", "Gateway", "text", { placeholder: "192.168.10.1" }),
            field("dns", "DNS servers", "text", { placeholder: "1.1.1.1, 9.9.9.9" })],
@@ -1070,6 +1175,13 @@ function nodeInspector(n) {
           if (!confirm(`Reset ${n.name} to factory defaults? Its configuration is erased.`)) return;
           act(async () => { await api("POST", path + "/reset"); toast(`${n.name} will boot with factory defaults.`); });
         } }, "Factory reset"))),
+    isCx && h("section", {}, h("h2", {}, "Configuration"),
+      h("p", {}, "Config export, backups and restore are MikroTik-only for now. Use checkpoints or copy running-config on the console."),
+      h("div", { class: "row" },
+        h("button", { type: "button", disabled: n.running, onclick: () => {
+          if (!confirm(`Reset ${n.name} to factory defaults? Its configuration is erased.`)) return;
+          act(async () => { await api("POST", path + "/reset"); toast(`${n.name} will boot with factory defaults.`); });
+        } }, "Factory reset"))),
     h("section", {},
       h("div", { class: "row" },
         h("button", { type: "button", onclick: () => duplicateDialog(n) }, "Duplicate"),
@@ -1078,10 +1190,11 @@ function nodeInspector(n) {
 }
 
 function duplicateDialog(n) {
-  const isChr = n.kind === "chr";
+  const isChr = isVm(n);
   const stem = n.name.replace(/\d+$/, "");
+  const what = n.kind === "aoscx" || n.role === "switch" ? "switch" : n.kind === "chr" ? "router" : "client";
   const fields = [
-    { node: h("p", {}, `Makes a new ${isChr ? (n.role === "switch" ? "switch" : "router") : "client"} with the same settings as ${n.name}. Links are not copied.`) },
+    { node: h("p", {}, `Makes a new ${what} with the same settings as ${n.name}. Links are not copied.`) },
     { key: "name", label: "Hostname for the copy", value: stem !== n.name ? nextName(stem) : nextName(n.name + "-") },
   ];
   if (isChr && !n.running) fields.push({ key: "copy_config", label: `Also copy ${n.name}'s saved configuration`, type: "checkbox", value: false });
@@ -1746,10 +1859,14 @@ $("#templates").addEventListener("click", async () => {
   const show = () => {
     const t = list.find((x) => x.id === pick.value);
     name.value = t.id;
-    info.replaceChildren(
+    info.replaceChildren(...[
       h("p", {}, t.summary),
       h("p", {}, `${t.routers} routers and switches, ${t.devices - t.routers} clients. Needs about ${(t.ram_mb / 1024).toFixed(1)} GB of memory when everything is running.`),
-      free !== null && t.ram_mb > free && h("p", { class: "warn" }, `This server has ${(free / 1024).toFixed(1)} GB free, so not all of it can run at once.`));
+      free !== null && t.ram_mb > free && h("p", { class: "warn" }, `This server has ${(free / 1024).toFixed(1)} GB free, so not all of it can run at once.`),
+      ...(t.needs || []).map((kind) => {
+        const p = platformInfo(kind);
+        return p && !p.image && h("p", { class: "warn" }, `Needs the ${p.label} image, which is not installed yet. Add it under Settings, Images.`);
+      })].filter(Boolean));
   };
   pick.addEventListener("change", show);
   show();
@@ -1801,6 +1918,10 @@ $("#settings").addEventListener("click", () => {
       row("Free memory", sys.mem_available_mb != null ? `${sys.mem_available_mb} MB` : "?"),
       row("Cloud", sys.cloud ? (sys.cloud.mode === "bridged" ? `your network ${sys.cloud.network || ""}` : `NAT, ${sys.cloud.network}`) : "?"),
       row("API reference", h("a", { href: "/docs", target: "_blank", rel: "noopener" }, "/docs"))) },
+    { node: h("h2", {}, "Images") },
+    { node: h("dl", { class: "info" }, (sys.platforms || []).map((p) => row(p.label + (p.experimental ? " (experimental)" : ""),
+      h("span", {}, p.image ? `installed${p.version ? ` ${p.version}` : ""}` : "not installed",
+        p.experimental && [" · ", h("a", { href: "#", onclick: (e) => { e.preventDefault(); imagesDialog(p.kind); } }, p.image ? "replace" : "add")])))) },
   ], "Save", async (v) => {
     Object.assign(prefs, {
       theme: v.theme, grid: v.grid, snap: v.snap, labels: v.labels,

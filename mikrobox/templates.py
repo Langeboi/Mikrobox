@@ -27,6 +27,14 @@ class Build:
         self.used[nid] = 1  # ether1 stays free for the Cloud
         return nid
 
+    def aoscx(self, name: str, x: float, y: float, data_ports: int = 4) -> int:
+        """An Aruba AOS-CX switch. Port 1 is its mgmt port, kept free for the Cloud."""
+        nid = len(self.nodes) + 1
+        self.nodes.append({"id": nid, "kind": "aoscx", "name": name, "ports": data_ports + 1,
+                           "cpus": 2, "ram_mb": 4096, "x": x, "y": y})
+        self.used[nid] = 1
+        return nid
+
     def switch(self, name: str, x: float, y: float) -> int:
         return self.router(name, x, y, role="switch", ports=8)
 
@@ -224,6 +232,39 @@ def bgp_multihoming() -> Build:
     return b
 
 
+def aruba_mikrotik() -> Build:
+    b = Build(cloud=(150, 90))
+    b.area(320, 50, 520, 170, "WAN edge: MikroTik, OSPF area 0 and eBGP", "amber")
+    b.area(320, 270, 520, 170, "Distribution: Aruba CX, VRRP gateways", "blue")
+    b.area(220, 490, 720, 220, "Users", "green", label_pos="bottom-left")
+    r1 = b.router("EDGE1", 430, 130)
+    r2 = b.router("EDGE2", 730, 130)
+    cx1 = b.aoscx("CX1", 430, 350)
+    cx2 = b.aoscx("CX2", 730, 350)
+    b.link(r1, r2)
+    b.link(r1, cx1)
+    b.link(r2, cx2)
+    b.link(cx1, cx2)
+    b.link(cx1, cx2)
+    b.link(cx1, b.pc("PC1", 330, 590, "10.10.10.10/24", "10.10.10.1"))
+    b.link(cx2, b.pc("PC2", 830, 590, "10.10.20.10/24", "10.10.20.1"))
+    b.note(900, 50, 300, 440,
+           "Aruba CX and MikroTik (experimental)\n\n"
+           "Needs the AOS-CX Switch Simulator image (Settings, Images) and about 9 GB of memory.\n\n"
+           "Suggested plan\n"
+           "Loopbacks 10.255.0.x/32\n"
+           "EDGE1-EDGE2 10.0.0.0/30, EDGE-CX links 10.0.1.0/30 and 10.0.2.0/30\n"
+           "VLAN 10 10.10.10.0/24, VLAN 20 10.10.20.0/24\n"
+           "Gateways .1 shared by CX1 and CX2 with VRRP\n\n"
+           "Build\n"
+           "1. Trunk the two links between CX1 and CX2\n"
+           "2. VLAN interfaces and VRRP on both CX switches\n"
+           "3. OSPF between all four, CX in area 0\n"
+           "4. Stop CX1 and watch PC1 keep its gateway\n"
+           "5. Stretch: eBGP between the EDGE routers")
+    return b
+
+
 TEMPLATES: dict[str, tuple[str, str, Callable[[], Build]]] = {
     "ospf-multi-area": ("Multi-area OSPF", "A backbone with two border routers, each feeding its own area.",
                         ospf_multi_area),
@@ -233,6 +274,8 @@ TEMPLATES: dict[str, tuple[str, str, Callable[[], Build]]] = {
     "isp-mpls": ("ISP with MPLS", "A provider core with two PE routers and two customers with two sites each.",
                  isp_mpls),
     "bgp-multihoming": ("BGP multihoming", "One network connected to two internet providers.", bgp_multihoming),
+    "aruba-mikrotik": ("Aruba CX and MikroTik (experimental)", "Two Aruba CX switches sharing gateways with "
+                       "VRRP, routed with OSPF to two MikroTik edge routers.", aruba_mikrotik),
 }
 
 
@@ -240,7 +283,8 @@ def describe() -> list[dict]:
     out = []
     for tid, (title, summary, build) in TEMPLATES.items():
         data = build().data(tid)
-        routers = [n for n in data["nodes"] if n["kind"] == "chr"]
+        routers = [n for n in data["nodes"] if n["kind"] != "client"]
         out.append({"id": tid, "title": title, "summary": summary, "devices": len(data["nodes"]),
-                    "routers": len(routers), "ram_mb": sum(n["ram_mb"] for n in data["nodes"])})
+                    "routers": len(routers), "ram_mb": sum(n["ram_mb"] for n in data["nodes"]),
+                    "needs": sorted({n["kind"] for n in data["nodes"]} - {"chr", "client"})})
     return out

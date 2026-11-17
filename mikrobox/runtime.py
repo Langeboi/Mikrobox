@@ -14,6 +14,7 @@ from . import __version__
 from .config import Settings
 from .models import Endpoint, Lab, Link, Node, NodeKind
 from .network import Net, pid_alive
+from .platforms import PLATFORMS, is_vm, platform
 from .shell import CommandError, Shell
 from .store import Store
 
@@ -82,7 +83,7 @@ class Runtime:
         return None
 
     def node_running(self, node: Node) -> bool:
-        if node.kind == NodeKind.chr:
+        if is_vm(node):
             return pid_alive(self._run(node, "pid"), "qemu") is not None
         return (self.s.netns_dir / netns_name(node.id)).exists()
 
@@ -117,7 +118,22 @@ class Runtime:
             "dry_run": self.s.dry_run,
             "chr_version": self._chr_version(),
             "max_chr_ports": self.s.max_chr_ports,
+            "platforms": [self.platform_info(p) for p in PLATFORMS.values()],
         }
+
+    def platform_info(self, p) -> dict:
+        image = p.image_path(self.s)
+        info = {"kind": p.kind.value, "label": p.label, "experimental": p.experimental,
+                "image": image.exists(), "image_size": image.stat().st_size if image.exists() else None,
+                "default_ports": p.default_ports, "max_ports": p.max_ports,
+                "default_cpus": p.default_cpus, "default_ram_mb": p.default_ram_mb,
+                "min_ram_mb": p.min_ram_mb, "needs_kvm": p.needs_kvm, "login": p.login,
+                "image_help": p.image_help, "version": None}
+        try:
+            info["version"] = image.with_suffix(".version").read_text().strip() or None
+        except OSError:
+            pass
+        return info
 
     def _chr_version(self) -> str | None:
         try:
@@ -157,7 +173,7 @@ class Runtime:
                 if link.b is not None:
                     continue
                 node = lab.node(link.a.node)
-                if node is None or node.kind != NodeKind.chr:
+                if node is None or not is_vm(node):
                     continue
                 hosts.append(
                     f"{mac_for(node.id, link.a.port)},{self.mgmt_ip(lab, node)},{node.name}"
@@ -167,6 +183,7 @@ class Runtime:
     # -- qemu ------------------------------------------------------------
 
     def qemu_command(self, node: Node) -> list[str]:
+        p = platform(node)
         kvm = self.kvm_available()
         cmd = [
             self.s.qemu_binary,
@@ -178,20 +195,23 @@ class Runtime:
             "-display", "none",
             "-daemonize",
             "-pidfile", str(self._run(node, "pid")),
-            "-drive", f"file={self.disk_path(node)},if=virtio,format=qcow2",
+            "-drive", f"file={self.disk_path(node)},if={p.disk_bus},format=qcow2",
             "-serial", f"unix:{self.serial_socket(node)},server=on,wait=off",
             "-monitor", f"unix:{self._run(node, 'monitor')},server=on,wait=off",
-            # Guest agent: lets Mikrobox read the config without any network path.
-            "-device", "virtio-serial-pci",
-            "-chardev", f"socket,id=qga0,path={self.agent_socket(node)},server=on,wait=off",
-            "-device", "virtserialport,chardev=qga0,name=org.qemu.guest_agent.0",
         ]
+        if p.guest_agent:
+            # Guest agent: lets Mikrobox read the config without any network path.
+            cmd += [
+                "-device", "virtio-serial-pci",
+                "-chardev", f"socket,id=qga0,path={self.agent_socket(node)},server=on,wait=off",
+                "-device", "virtserialport,chardev=qga0,name=org.qemu.guest_agent.0",
+            ]
         for port in range(1, node.ports + 1):
             cmd += [
                 "-netdev",
                 f"tap,id=p{port},ifname={iface_name(node.id, port)},script=no,downscript=no",
                 "-device",
-                f"virtio-net-pci,netdev=p{port},mac={mac_for(node.id, port)}",
+                f"{p.nic},netdev=p{port},mac={mac_for(node.id, port)}",
             ]
         return cmd
 
@@ -199,10 +219,11 @@ class Runtime:
         disk = self.disk_path(node)
         if disk.exists():
             return
+        p = platform(node)
         disk.parent.mkdir(parents=True, exist_ok=True)
         self.sh.run(
-            ["qemu-img", "create", "-f", "qcow2", "-F", "raw",
-             "-b", str(self.s.base_image), str(disk)]
+            ["qemu-img", "create", "-f", "qcow2", "-F", p.image_format,
+             "-b", str(p.image_path(self.s)), str(disk)]
         )
 
     # -- start / stop ----------------------------------------------------
@@ -213,8 +234,8 @@ class Runtime:
                 return
             if self.running_count() >= self.s.max_devices:
                 raise Conflict(f"Device limit reached ({self.s.max_devices} running).")
-            if node.kind == NodeKind.chr:
-                self._start_chr(node)
+            if is_vm(node):
+                self._start_vm(node)
             else:
                 self.net.delete_client(netns_name(node.id))
                 self.net.create_client(
@@ -228,9 +249,15 @@ class Runtime:
                 if link.touches(node.id):
                     self.apply_link(lab, link)
 
-    def _start_chr(self, node: Node) -> None:
-        if not self.s.dry_run and not self.s.base_image.exists():
-            raise Conflict(f"CHR image not found at {self.s.base_image}. Run scripts/install.sh.")
+    def _start_vm(self, node: Node) -> None:
+        p = platform(node)
+        if not self.s.dry_run and not p.image_path(self.s).exists():
+            if p.kind == NodeKind.chr:
+                raise Conflict(f"CHR image not found at {self.s.base_image}. Run scripts/install.sh.")
+            raise Conflict(f"No {p.label} image yet. Add it under Settings, Images. {p.image_help}")
+        if p.needs_kvm and not self.s.dry_run and not self.kvm_available():
+            raise Conflict(f"{p.label} needs KVM, which this server does not have. "
+                           "On Proxmox, set the VM's CPU type to host.")
         avail = self.mem_available_mb()
         if avail is not None and avail < node.ram_mb + self.s.mem_reserve_mb:
             raise Conflict(
@@ -257,7 +284,7 @@ class Runtime:
                 if link.touches(node.id) and link.b is not None:
                     other = link.b if link.a.node == node.id else link.a
                     self.net.disconnect(iface_name(other.node, other.port))
-            if node.kind == NodeKind.chr:
+            if is_vm(node):
                 self._kill(self._run(node, "pid"))
                 for suffix in ("pid", "serial", "monitor", "qga"):
                     self._run(node, suffix).unlink(missing_ok=True)

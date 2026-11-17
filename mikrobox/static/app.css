@@ -198,6 +198,13 @@ pre.out { max-height: 180px; overflow: auto; background: var(--surface-2); paddi
 #terms { flex: 1; min-height: 0; padding: 6px; }
 #terms > div { height: 100%; }
 
+/* ---- experimental platforms ---- */
+:root { --cx: #b45c00; }
+:root[data-theme="dark"] { --cx: #f2a65a; }
+.node.k-aoscx .glyph, .node.k-aoscx.running .glyph { stroke: var(--cx); }
+.warn-text { color: var(--danger); font-size: 13px; }
+progress { height: 8px; accent-color: var(--accent); }
+
 /* ---- who is here ---- */
 #who { display: inline-flex; gap: 4px; align-items: center; }
 #who:empty { display: none; }

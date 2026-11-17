@@ -28,6 +28,8 @@ from .config import Settings
 from . import console as consoles
 from . import docs
 from .packets import parse_line
+from .images import MAX_UPLOAD, ImageError, Importer
+from .platforms import PLATFORMS, is_vm, platform
 from .models import (
     NAME_PATTERN, Annotation, Endpoint, Lab, Link, Node, NodeKind, default_chr_ram, free_id,
 )
@@ -53,7 +55,7 @@ class NodeCreate(BaseModel):
     role: Literal["router", "switch"] = "router"
     name: str = Field(pattern=NAME_PATTERN)
     ports: Optional[int] = Field(default=None, ge=1)
-    cpus: int = Field(default=1, ge=1, le=8)
+    cpus: Optional[int] = Field(default=None, ge=1, le=8)
     ram_mb: Optional[int] = Field(default=None, ge=128, le=16384)
     address: Optional[str] = None
     gateway: Optional[str] = None
@@ -240,7 +242,15 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         return node
 
     def port_limit(kind: NodeKind) -> int:
-        return settings.max_chr_ports if kind == NodeKind.chr else settings.max_client_ports
+        if kind == NodeKind.chr:
+            return settings.max_chr_ports
+        p = platform(kind)
+        return p.max_ports if p else settings.max_client_ports
+
+    def check_ram(kind: NodeKind, ram: int) -> None:
+        p = platform(kind)
+        if p and ram < p.min_ram_mb:
+            raise Invalid(f"{p.label} needs at least {p.min_ram_mb} MB of RAM.")
 
     def check_ports(kind: NodeKind, ports: int) -> None:
         if ports > port_limit(kind):
@@ -256,7 +266,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         view["running"] = rt.node_running(node)
         view["mgmt_ip"] = ip
         view["cloud_port"] = rt.cloud_port(lab, node)
-        view["ssh"] = f"ssh admin@{ip}" if ip and node.kind == NodeKind.chr else None
+        view["ssh"] = f"ssh admin@{ip}" if ip and is_vm(node) else None
         view["console"] = f"/console?lab={lab.id}&node={node.id}"
         view["backup"] = backups.node_summary(lab, node)
         return view
@@ -369,6 +379,59 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             del presence[key]
         return {"others": [{"user": v["user"], "lab": v["lab"], "node": v["node"]}
                            for k, v in presence.items() if k != body.client]}
+
+    # -- images for experimental platforms -------------------------------
+
+    importer = Importer(settings)
+    app.state.importer = importer
+
+    def image_list() -> list[dict]:
+        out = []
+        for p in PLATFORMS.values():
+            info = rt.platform_info(p)
+            info["import"] = importer.status.get(p.kind.value)
+            out.append(info)
+        return out
+
+    @app.get("/api/images")
+    def list_images():
+        return image_list()
+
+    @app.put("/api/images/{kind}", status_code=202)
+    async def upload_image(kind: NodeKind, request: Request, filename: str = Query(default="", max_length=255)):
+        """Send the file as the raw request body. It is converted in the background;
+        poll GET /api/images for progress."""
+        p = platform(kind)
+        if p is None or not p.experimental:
+            raise Invalid("Images can only be uploaded for experimental platforms.")
+        size = int(request.headers.get("content-length") or 0)
+        if size > MAX_UPLOAD:
+            raise Invalid("That file is too large.")
+        try:
+            importer.begin(kind)
+        except ImageError as e:
+            raise Conflict(str(e))
+        target = importer.upload_path(kind)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        got = 0
+        try:
+            with target.open("wb") as f:
+                async for chunk in request.stream():
+                    got += len(chunk)
+                    if got > MAX_UPLOAD:
+                        raise Invalid("That file is too large.")
+                    f.write(chunk)
+        except Invalid as e:
+            importer.fail(kind, str(e))
+            raise
+        except Exception:
+            importer.fail(kind, "The upload was interrupted.")
+            raise Invalid("The upload was interrupted.")
+        if got == 0:
+            importer.fail(kind, "The file was empty.")
+            raise Invalid("The file was empty.")
+        importer.start(kind, filename)
+        return importer.status[kind.value]
 
     # -- system ----------------------------------------------------------
 
@@ -537,16 +600,27 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             lab = get_lab(lab_id)
             check_name(lab, body.name)
             is_chr = body.kind == NodeKind.chr
+            p = platform(body.kind)
             if body.role == "switch" and not is_chr:
                 raise Invalid("Only a CHR can be a switch.")
-            ports = body.ports or ((24 if body.role == "switch" else 8) if is_chr else 1)
+            if is_chr:
+                ports = body.ports or (24 if body.role == "switch" else 8)
+            else:
+                ports = body.ports or (p.default_ports if p else 1)
             check_ports(body.kind, ports)
-            if is_chr and (body.address or body.gateway or body.dns):
+            if p and (body.address or body.gateway or body.dns):
                 raise Invalid("address, gateway and dns apply to client nodes only.")
-            ram = body.ram_mb or (default_chr_ram(body.cpus, ports) if is_chr else 128)
+            cpus = body.cpus or (p.default_cpus if p else 1)
+            if body.ram_mb:
+                ram = body.ram_mb
+            elif is_chr:
+                ram = default_chr_ram(cpus, ports)
+            else:
+                ram = p.default_ram_mb if p else 128
+            check_ram(body.kind, ram)
             node = Node(
                 id=free_id({n.id for n in store.state.all_nodes()}),
-                kind=body.kind, role=body.role, name=body.name, ports=ports, cpus=body.cpus,
+                kind=body.kind, role=body.role, name=body.name, ports=ports, cpus=cpus,
                 ram_mb=ram, address=body.address, gateway=body.gateway, dns=body.dns,
                 x=body.x, y=body.y,
             )
@@ -567,6 +641,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 raise Conflict(f"Stop {node.name} before changing it.")
             if "name" in changes:
                 check_name(lab, changes["name"], skip=node.id)
+            if "ram_mb" in changes:
+                check_ram(node.kind, changes["ram_mb"])
             if "ports" in changes:
                 check_ports(node.kind, changes["ports"])
                 used = max(
@@ -617,8 +693,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             src = get_node(lab, node_id)
             check_name(lab, body.name)
             if body.copy_config:
-                if src.kind != NodeKind.chr:
-                    raise Invalid("Only routers have a configuration to copy.")
+                if not is_vm(src):
+                    raise Invalid("Only routers and switches have a configuration to copy.")
                 if rt.node_running(src):
                     raise Conflict(f"Stop {src.name} first to copy its configuration.")
             node = src.model_copy(update={

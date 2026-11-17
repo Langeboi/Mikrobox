@@ -7,12 +7,21 @@ import time
 import zipfile
 
 from .models import Lab, Node, NodeKind
+from .platforms import port_name as _platform_port_name
 
 AREA_KINDS = {"rect": "Area", "ellipse": "Area"}
 
 
 def port_name(node: Node, port: int) -> str:
-    return f"ether{port}" if node.kind == NodeKind.chr else f"eth{port - 1}"
+    return _platform_port_name(node, port)
+
+
+def kind_label(node: Node) -> str:
+    if node.kind == NodeKind.client:
+        return "Client"
+    if node.kind == NodeKind.aoscx:
+        return "Switch (Aruba AOS-CX)"
+    return "Switch (CHR)" if node.role == "switch" else "Router (CHR)"
 
 
 def _cell(text: object) -> str:
@@ -33,7 +42,7 @@ def markdown(lab: Lab, rt, backups, has_image: bool) -> str:
             "| Name | Type | Ports | vCPUs | RAM (MB) | Address | State |",
             "|---|---|---|---|---|---|---|"]
     for n in lab.nodes:
-        kind = "Client" if n.kind == NodeKind.client else ("Switch (CHR)" if n.role == "switch" else "Router (CHR)")
+        kind = kind_label(n)
         address = rt.mgmt_ip(lab, n) or (n.address if n.kind == NodeKind.client else None) or ""
         state = "Running" if rt.node_running(n) else "Stopped"
         out.append(f"| {_cell(n.name)} | {kind} | {n.ports} | {n.cpus} | {n.ram_mb} | {_cell(address)} | {state} |")

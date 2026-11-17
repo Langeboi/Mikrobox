@@ -15,6 +15,7 @@ NAME_PATTERN = r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,62}$"
 class NodeKind(str, Enum):
     chr = "chr"
     client = "client"
+    aoscx = "aoscx"  # experimental: Aruba AOS-CX Switch Simulator, image supplied by the user
 
 
 class Node(BaseModel):
