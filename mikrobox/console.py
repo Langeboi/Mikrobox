@@ -98,13 +98,15 @@ class Hub:
                     await self.write(data)
         except (WebSocketDisconnect, RuntimeError, OSError):
             pass
-        finally:
-            self.clients.pop(ws, None)
-            if not self.closed:
-                if not self.clients and not self.keep_when_empty and self.task:
-                    self.task.cancel()
-                else:
-                    await self.announce()
+        except BaseException:
+            self.clients.pop(ws, None)  # cancelled or failed: no goodbyes to send
+            raise
+        self.clients.pop(ws, None)
+        if not self.closed:
+            if not self.clients and not self.keep_when_empty and self.task:
+                self.task.cancel()
+            else:
+                await self.announce()
 
 
 class SerialHub(Hub):
