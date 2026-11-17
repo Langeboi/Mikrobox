@@ -30,15 +30,33 @@ from the HPE Networking Support Portal (it comes as an `.ova` inside a `.zip`). 
 stored as `/var/lib/mikrobox/images/aoscx.qcow2`. Replacing it later resets every CX switch
 to factory defaults.
 
-How it runs:
+## Choosing an operating system
+
+**Router** and **Switch** in the toolbar pick the role; the dialog then asks for the
+operating system. MikroTik CHR can be a router or a switch; Aruba AOS-CX is a switch only.
+The dialog remembers your last choice for each role. Through the API, `kind` is the OS
+(`chr`, `aoscx`, `client`) and `role` is `router` or `switch`.
+
+## Sharing memory between devices (KSM)
+
+Mikrobox switches on the kernel's same-page merging when it starts, so devices booted from
+the same image share the memory they have in common. The savings show in the top bar
+("GB shared") and in Settings, Memory, where it can be switched off. It costs some CPU
+while scanning, and savings build up over a few minutes after devices boot. How much it
+saves depends on the devices and what they are doing.
+
+How Aruba CX runs:
 
 | | |
 |---|---|
 | Ports | The first is `mgmt` (out of band); the rest are `1/1/1`, `1/1/2`, ... (up to 16) |
-| Resources | 2 vCPUs and 4 GB RAM by default; 2 GB is the minimum HPE gives for labs |
+| Resources | 1 vCPU and 2 GB RAM by default, HPE's minimum for labs (HPE's own default, 2 vCPUs and 4 GB, is sized for vSphere). Raise it per switch if a feature needs more |
 | Hardware | Needs KVM. Boots in a few minutes |
 | Login | `admin` with no password; it asks you to set one |
 | QEMU | e1000 NICs (virtio has caused TCP problems with the simulator in other labs), IDE disk |
+
+Add one with **Switch** in the toolbar and choose **Aruba AOS-CX** as the operating system.
+A small `CX` badge on the tile marks it on the canvas.
 
 Link `mgmt` to the Cloud to SSH to the switch from your PC; the console works either way.
 Config export, automatic backups and restore are MikroTik-only for now.
