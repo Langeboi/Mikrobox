@@ -154,9 +154,11 @@ pre.out { max-height: 180px; overflow: auto; background: var(--surface-2); paddi
 /* ---- canvas content ---- */
 .c-gray { --c: #5d6b7c; } .c-blue { --c: #1668e3; } .c-green { --c: #14853f; }
 .c-amber { --c: #b26a00; } .c-red { --c: #c93426; } .c-purple { --c: #7c4ddb; }
+.c-teal { --c: #0b7a75; } .c-pink { --c: #b8327a; }
 :root[data-theme="dark"] .c-gray { --c: #9dabba; } :root[data-theme="dark"] .c-blue { --c: #6eaaff; }
 :root[data-theme="dark"] .c-green { --c: #4cc27f; } :root[data-theme="dark"] .c-amber { --c: #f0b24a; }
 :root[data-theme="dark"] .c-red { --c: #ff8a7a; } :root[data-theme="dark"] .c-purple { --c: #b79cff; }
+:root[data-theme="dark"] .c-teal { --c: #4fd1c5; } :root[data-theme="dark"] .c-pink { --c: #f48fc1; }
 
 .anno { cursor: move; }
 .anno .shape { fill: color-mix(in srgb, var(--c) 9%, transparent); stroke: var(--c); stroke-width: 1.5; stroke-dasharray: 7 5; }
@@ -211,6 +213,21 @@ pre.out { max-height: 180px; overflow: auto; background: var(--surface-2); paddi
 .pv .bad { color: var(--danger); font-weight: 600; }
 .restore { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-top: 10px; }
 .restore select { width: auto; flex: 1 1 220px; }
+
+/* ---- activity ---- */
+.act-list { flex: 1; min-height: 0; overflow: auto; margin: 0; padding: 4px 0; list-style: none; }
+.act { display: flex; align-items: center; gap: 10px; padding: 5px 12px; border-top: 1px solid var(--line); font-size: 13px; }
+.act:first-child { border-top: 0; }
+.act time { color: var(--muted); font-variant-numeric: tabular-nums; min-width: 92px; font-size: 12px; }
+.act .who { width: 22px; height: 22px; font-size: 10px; flex: none; }
+.act-text { overflow-wrap: anywhere; }
+.act.danger .act-text { color: var(--danger); }
+.act.danger .act-text b { color: var(--text); }
+.act.system .act-text { color: var(--muted); }
+.act-lab { color: var(--muted); }
+.act.empty { color: var(--muted); justify-content: center; padding: 16px; }
+.act-toggle { display: inline-flex; align-items: center; gap: 6px; font-size: 13px; color: var(--muted); white-space: nowrap; }
+.pv-bar input[type="checkbox"] { flex: none; width: 16px !important; height: 16px; min-height: 0; }
 
 /* ---- packet view ---- */
 #terms > .pv { margin: -6px; height: calc(100% + 12px); display: flex; flex-direction: column; background: var(--surface); color: var(--text); }

@@ -1013,3 +1013,99 @@ def test_nuke_empties_the_lab_and_keeps_it(client, monkeypatch):
     assert client.rt.disk_path(client.rt.store.state.lab(other).node(keep["id"])).exists()
     # A fresh device can be added straight away.
     assert add_node(client, lab, name="R1")["name"] == "R1"
+
+
+# -- instant updates and the activity log ------------------------------------
+
+def _next_event(ws, wanted, tries=20):
+    for _ in range(tries):
+        msg = ws.receive_json()
+        if msg.get("t") == wanted:
+            return msg
+    raise AssertionError(f"no {wanted} event")
+
+
+def test_changes_are_pushed_to_open_workspaces(client):
+    with client.websocket_connect("/api/events") as ws:
+        assert ws.receive_json() == {"t": "hello"}
+        lab = make_lab(client)
+        _next_event(ws, "labs")
+        r1 = add_node(client, lab, name="R1")
+        _next_event(ws, "labs")
+        client.post(f"/api/labs/{lab}/nodes/{r1['id']}/start")  # not saved to the file, still pushed
+        _next_event(ws, "labs")
+        entry = _next_event(ws, "activity")["entry"]
+        assert entry["user"] == "tester" and entry["lab"] == lab
+        client.post("/api/presence", json={"client": "tab-zzzz", "lab": lab})
+        _next_event(ws, "presence")
+
+
+def test_events_need_a_sign_in(client):
+    from starlette.websockets import WebSocketDisconnect
+
+    with pytest.raises(WebSocketDisconnect):
+        with TestClient(client.app).websocket_connect("/api/events") as ws:
+            ws.receive_json()
+
+
+def test_activity_log_records_who_did_what(client):
+    lab = make_lab(client)
+    r1 = add_node(client, lab, name="R1")
+    r2 = add_node(client, lab, name="R2", role="switch")
+    pc = add_node(client, lab, kind="client", name="PC1")
+    link = client.post(f"/api/labs/{lab}/links", json={"a": {"node": r1["id"], "port": 2},
+                                                     "b": {"node": r2["id"], "port": 1}}).json()
+    client.post(f"/api/labs/{lab}/links", json={"a": {"node": r1["id"], "port": 1}})
+    client.patch(f"/api/labs/{lab}/nodes/{r1['id']}", json={"x": 5, "y": 5})  # a move is not logged
+    client.patch(f"/api/labs/{lab}/nodes/{r1['id']}", json={"ports": 4, "name": "EDGE1"})
+    client.post(f"/api/labs/{lab}/nodes/{pc['id']}/start")
+    client.post(f"/api/labs/{lab}/nodes/{pc['id']}/stop")
+    client.post(f"/api/labs/{lab}/annotations", json={"kind": "rect", "x": 0, "y": 0, "w": 10, "h": 10, "text": "Site A"})
+    anno = client.get(f"/api/labs/{lab}").json()["annotations"][0]["id"]
+    client.delete(f"/api/labs/{lab}/annotations/{anno}")
+    client.delete(f"/api/labs/{lab}/links/{link['id']}")
+    client.delete(f"/api/labs/{lab}/nodes/{r2['id']}")
+
+    every = client.get("/api/activity", params={"lab": lab}).json()
+    assert every[0]["text"] == "created the first account" and every[0]["lab"] is None  # server-wide entries show too
+    entries = [e for e in every if e["lab"] == lab]
+    texts = [e["text"] for e in entries]
+    assert texts == [
+        "created the lab first", "added the router R1", "added the switch R2", "added the client PC1",
+        "linked R1 ether2 to R2 ether1", "linked R1 ether1 to the Cloud",
+        "renamed R1 to EDGE1", "changed EDGE1's ports",
+        "started PC1", "stopped PC1", "added an area", 'deleted an area "Site A"',
+        "removed the link EDGE1 ether2 to R2 ether1", "deleted the switch R2",
+    ]
+    assert {e["user"] for e in entries} == {"tester"}
+    assert [e["kind"] for e in entries][-2:] == ["danger", "danger"]
+
+    # Kept on disk, so it survives a restart.
+    from mikrobox.activity import Activity
+    from mikrobox.events import Events
+    again = Activity(client.tmp / "data" / "activity.jsonl", Events())
+    assert [e["text"] for e in again.recent(lab) if e["lab"] == lab] == texts
+    assert again.record("x")["id"] > entries[-1]["id"]
+
+
+def test_activity_for_accounts_and_sign_ins(client):
+    anon = TestClient(client.app)
+    anon.post("/api/auth/login", json={"username": "tester", "password": "nope"})
+    anon.post("/api/auth/login", json={"username": "ghost", "password": "nope"})
+    anon.post("/api/auth/login", json={"username": "tester", "password": "correct-horse"})
+    client.post("/api/users", json={"username": "anna", "password": "long-enough"})
+    client.delete("/api/users/anna")
+    got = [(e["user"], e["text"], e["kind"]) for e in client.get("/api/activity").json()]
+    assert ("tester", "failed to sign in (wrong password)", "danger") in got
+    assert ("someone", "failed to sign in as an unknown user, ghost", "danger") in got
+    assert ("tester", "signed in", "info") in got
+    assert ("tester", "added the account anna", "info") in got
+    assert ("tester", "removed the account anna", "danger") in got
+
+
+def test_template_and_nuke_are_logged_once(client):
+    lab = client.post("/api/templates/spine-leaf", json={}).json()
+    client.post(f"/api/labs/{lab['id']}/clear", json={"confirm": "spine-leaf"})
+    texts = [e["text"] for e in client.get("/api/activity", params={"lab": lab["id"]}).json() if e["lab"] == lab["id"]]
+    assert texts == ["created the lab spine-leaf from the Spine and leaf template",
+                     "nuked the lab: removed 10 devices, 12 links and 3 shapes and notes"]

@@ -26,6 +26,8 @@ from .backup import INTERVALS, Backups
 from .auth import COOKIE, SESSION_SECONDS, Auth, AuthError, AuthMiddleware
 from .config import Settings
 from . import console as consoles
+from .activity import Activity
+from .events import Events
 from . import docs
 from .packets import parse_line
 from .models import (
@@ -36,6 +38,7 @@ from .shell import CommandError
 from .store import Store
 
 STATIC = Path(__file__).parent / "static"
+ANNO_WORDS = {"rect": "an area", "ellipse": "an area", "text": "a text label", "note": "a note"}
 
 
 class LabCreate(BaseModel):
@@ -206,8 +209,31 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     backups = Backups(rt)
 
+    events = Events()
+    activity = Activity(settings.data_dir / "activity.jsonl", events)
+    store.on_save = lambda: events.publish({"t": "labs"})
+    backups.activity, backups.events = activity, events
+
+    def changed() -> None:
+        """For changes that are not saved to the lab file, such as starting a device."""
+        events.publish({"t": "labs"})
+
+    def what(node: Node) -> str:
+        if node.kind == NodeKind.client:
+            return "client"
+        return "switch" if node.role == "switch" else "router"
+
+    def link_text(lab: Lab, link: Link) -> str:
+        a = lab.node(link.a.node)
+        a_text = f"{a.name} {docs.port_name(a, link.a.port)}" if a else "?"
+        if link.b is None:
+            return f"{a_text} to the Cloud"
+        b = lab.node(link.b.node)
+        return f"{a_text} to {b.name} {docs.port_name(b, link.b.port)}" if b else f"{a_text} to ?"
+
     @asynccontextmanager
     async def lifespan(app: FastAPI):
+        events.bind(asyncio.get_running_loop())
         rt.ensure_host()
         if not settings.dry_run:
             threading.Thread(target=backups.loop, daemon=True).start()
@@ -216,6 +242,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app = FastAPI(title="Mikrobox", version=__version__, lifespan=lifespan)
     app.state.rt = rt
     app.state.backups = backups
+    app.state.events, app.state.activity = events, activity
     hubs: dict[str, consoles.Hub] = {}  # shared consoles, by "lab/node"
     presence: dict[str, dict] = {}  # browser tab -> who, where, when
     auth = Auth(settings.data_dir, enabled=settings.auth_enabled)
@@ -326,13 +353,19 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             if auth.users:
                 raise Conflict("An account already exists. Sign in instead.")
             name = auth.create_user(body.username, body.password)
+        activity.record("created the first account", user=name)
         return signed_in(JSONResponse({"user": name}), name)
 
     @app.post("/api/auth/login")
     def auth_login(body: Login):
         name = auth.verify(body.username, body.password)
         if name is None:
+            known = body.username.lower() in auth.users
+            activity.record("failed to sign in (wrong password)" if known else
+                            f"failed to sign in as an unknown user, {body.username[:32]}",
+                            kind="danger", user=body.username[:32] if known else "someone")
             return JSONResponse({"detail": "Wrong username or password."}, status_code=401)
+        activity.record("signed in", user=name)
         return signed_in(JSONResponse({"user": name}), name)
 
     @app.post("/api/auth/logout")
@@ -348,7 +381,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @app.post("/api/users", status_code=201)
     def create_user(body: Login):
-        return {"user": auth.create_user(body.username, body.password)}
+        name = auth.create_user(body.username, body.password)
+        activity.record(f"added the account {name}")
+        return {"user": name}
 
     @app.delete("/api/users/{name}", status_code=204)
     def delete_user(name: str, request: Request):
@@ -356,6 +391,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         if me and me.lower() == name.lower():
             raise Conflict("You cannot remove the account you are signed in with.")
         auth.delete_user(name)
+        activity.record(f"removed the account {name}", kind="danger")
 
     @app.post("/api/account/password")
     def change_password(body: PasswordChange, request: Request):
@@ -365,23 +401,38 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         if auth.verify(me, body.current) is None:
             raise Invalid("The current password is wrong.")
         auth.set_password(me, body.new)
+        activity.record("changed their password")
         return {"user": me}
 
     @app.post("/api/presence")
     def presence_beat(body: PresenceBeat, request: Request):
         """Each open workspace reports in every few seconds; returns who else is around."""
         now = time.time()
+        before = presence.get(body.client)
         presence[body.client] = {"user": current_user(request) or "someone", "lab": body.lab,
                                  "node": body.node, "ts": now}
-        for key in [k for k, v in presence.items() if now - v["ts"] > 12]:
+        stale = [k for k, v in presence.items() if now - v["ts"] > 30]
+        for key in stale:
             del presence[key]
+        if stale or before is None or (before["lab"], before["node"]) != (body.lab, body.node):
+            events.publish({"t": "presence"})
         return {"others": [{"user": v["user"], "lab": v["lab"], "node": v["node"]}
                            for k, v in presence.items() if k != body.client]}
 
     @app.post("/api/presence/leave", status_code=204)
     def presence_leave(body: PresenceLeave):
         """Sent when a tab closes or reloads, so it does not linger as a ghost."""
-        presence.pop(body.client, None)
+        if presence.pop(body.client, None) is not None:
+            events.publish({"t": "presence"})
+
+    @app.websocket("/api/events")
+    async def event_stream(ws: WebSocket):
+        """Pushes {"t": "labs" | "presence" | "activity"} hints to the workspace."""
+        await events.serve(ws)
+
+    @app.get("/api/activity")
+    def list_activity(lab: Optional[int] = None, limit: int = Query(default=200, ge=1, le=2000)):
+        return activity.recent(lab, limit)
 
     # -- system ----------------------------------------------------------
 
@@ -417,11 +468,17 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             lab = Lab(id=free_id({l.id for l in store.state.labs}), name=body.name)
             store.state.labs.append(lab)
             store.save()
+            activity.record(f"created the lab {lab.name}", lab)
             return lab_view(lab)
 
     @app.post("/api/labs/import", status_code=201)
     def import_lab(body: LabImport):
         """Recreate a lab from an export. Topology only; router disks start fresh."""
+        view = do_import(body)
+        activity.record(f"imported the lab {view['name']}", view["id"])
+        return view
+
+    def do_import(body: LabImport) -> dict:
         with rt.lock:
             names = {l.name for l in store.state.labs}
             name, n = body.name, 1
@@ -468,7 +525,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         if template_id not in templates.TEMPLATES:
             raise NotFound(f"No template called {template_id}.")
         data = templates.TEMPLATES[template_id][2]().data(body.name or template_id)
-        return import_lab(LabImport.model_validate(data))
+        view = do_import(LabImport.model_validate(data))
+        activity.record(f"created the lab {view['name']} from the {templates.TEMPLATES[template_id][0]} template",
+                        view["id"])
+        return view
 
     @app.get("/api/labs/{lab_id}/export")
     def export_lab(lab_id: int):
@@ -497,6 +557,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 z.writestr("SKIPPED.txt", "\n".join(problems) + "\n")
         if not done:
             raise Conflict("No router config could be exported. " + " ".join(problems))
+        activity.record(f"exported the configs of {done} router{'s' if done != 1 else ''}", lab)
         return Response(buf.getvalue(), media_type="application/zip", headers={
             "Content-Disposition": f'attachment; filename="{lab.name}-configs.zip"',
             "X-Mikrobox-Skipped": str(len(problems))})
@@ -513,9 +574,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             name = changes.get("name")
             if name and any(l.name == name and l.id != lab.id for l in store.state.labs):
                 raise Conflict(f"A lab named {name} already exists.")
+            old_name = lab.name
             for key, value in changes.items():
                 setattr(lab, key, value)
             store.save()
+            if name and name != old_name:
+                activity.record(f"renamed the lab {old_name} to {name}", lab)
             return lab_view(lab)
 
     @app.delete("/api/labs/{lab_id}", status_code=204)
@@ -529,17 +593,24 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             store.state.labs.remove(lab)
             store.save()
             rt.sync_dhcp()
+            activity.record(f"deleted the lab {lab.name}", lab, kind="danger")
 
     @app.post("/api/labs/{lab_id}/start")
     def start_lab(lab_id: int):
         lab = get_lab(lab_id)
-        rt.start_lab(lab)
+        try:
+            rt.start_lab(lab)
+        finally:
+            changed()
+        activity.record("started every device", lab)
         return lab_view(lab)
 
     @app.post("/api/labs/{lab_id}/stop")
     def stop_lab(lab_id: int):
         lab = get_lab(lab_id)
         rt.stop_lab(lab)
+        changed()
+        activity.record("stopped every device", lab)
         return lab_view(lab)
 
     @app.post("/api/labs/{lab_id}/clear")
@@ -566,6 +637,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             lab.mgmt_x, lab.mgmt_y = defaults.mgmt_x, defaults.mgmt_y
             store.save()
             rt.sync_dhcp()
+            activity.record(f"nuked the lab: removed {removed['devices']} devices, {removed['links']} links "
+                            f"and {removed['annotations']} shapes and notes", lab, kind="danger")
             return {"removed": removed, "lab": lab_view(lab)}
 
     # -- nodes -----------------------------------------------------------
@@ -591,6 +664,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             )
             lab.nodes.append(node)
             store.save()
+            activity.record(f"added the {what(node)} {node.name}", lab)
             return node_view(lab, node)
 
     @app.patch("/api/labs/{lab_id}/nodes/{node_id}")
@@ -618,6 +692,14 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             lab.nodes[lab.nodes.index(node)] = updated
             store.save()
             rt.sync_dhcp()
+            settings_changed = sorted(k for k in changes if k not in ("x", "y", "name")
+                                      and getattr(node, k) != getattr(updated, k))
+            if updated.name != node.name:
+                activity.record(f"renamed {node.name} to {updated.name}", lab)
+            if settings_changed:
+                words = {"ports": "ports", "cpus": "vCPUs", "ram_mb": "RAM", "address": "address",
+                         "gateway": "gateway", "dns": "DNS"}
+                activity.record(f"changed {updated.name}'s {', '.join(words.get(k, k) for k in settings_changed)}", lab)
             return node_view(lab, updated)
 
     @app.delete("/api/labs/{lab_id}/nodes/{node_id}", status_code=204)
@@ -633,12 +715,17 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             lab.nodes.remove(node)
             store.save()
             rt.sync_dhcp()
+            activity.record(f"deleted the {what(node)} {node.name}", lab, kind="danger")
 
     @app.post("/api/labs/{lab_id}/nodes/{node_id}/start")
     def start_node(lab_id: int, node_id: int):
         lab = get_lab(lab_id)
         node = get_node(lab, node_id)
-        rt.start_node(lab, node)
+        try:
+            rt.start_node(lab, node)
+        finally:
+            changed()
+        activity.record(f"started {node.name}", lab)
         return node_view(lab, node)
 
     @app.post("/api/labs/{lab_id}/nodes/{node_id}/stop")
@@ -646,6 +733,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         lab = get_lab(lab_id)
         node = get_node(lab, node_id)
         rt.stop_node(lab, node)
+        changed()
+        activity.record(f"stopped {node.name}", lab)
         return node_view(lab, node)
 
     @app.post("/api/labs/{lab_id}/nodes/{node_id}/duplicate", status_code=201)
@@ -669,6 +758,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             copied = body.copy_config and rt.copy_disk(src, node)
             lab.nodes.append(node)
             store.save()
+            activity.record(f"duplicated {src.name} as {node.name}" + (" with its configuration" if copied else ""), lab)
             return {**node_view(lab, node), "config_copied": bool(copied)}
 
     @app.post("/api/labs/{lab_id}/nodes/{node_id}/reset")
@@ -680,6 +770,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             if rt.node_running(node):
                 raise Conflict(f"Stop {node.name} before resetting it.")
             rt.delete_disk(node)
+            changed()
+            activity.record(f"reset {node.name} to factory defaults", lab, kind="danger")
             return node_view(lab, node)
 
     @app.post("/api/labs/{lab_id}/nodes/{node_id}/config/export")
@@ -688,6 +780,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         node = get_node(lab, node_id)
         text = routeros.export_config(
             router_host(lab, node, body.host), body.username, body.password, body.sensitive)
+        activity.record(f"exported {node.name}'s config", lab)
         return PlainTextResponse(text, headers={
             "Content-Disposition": f'attachment; filename="{node.name}.txt"'})
 
@@ -697,6 +790,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         node = get_node(lab, node_id)
         output = routeros.import_config(
             router_host(lab, node, body.host), body.username, body.password, body.config)
+        activity.record(f"imported a config into {node.name}", lab)
         return {"output": output}
 
     @app.post("/api/labs/{lab_id}/nodes/{node_id}/identity")
@@ -706,6 +800,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         node = get_node(lab, node_id)
         output = routeros.set_identity(
             router_host(lab, node, body.host), body.username, body.password, node.name)
+        activity.record(f"set {node.name}'s RouterOS identity", lab)
         return {"output": output}
 
     # -- automatic backups and revisions ---------------------------------
@@ -715,7 +810,16 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         lab = get_lab(lab_id)
         if body.interval is not None and body.interval not in INTERVALS:
             raise Invalid(f"The interval must be one of {', '.join(map(str, INTERVALS))} minutes.")
+        before = backups.settings(lab.id)
         backups.update(lab.id, body.model_dump(exclude_unset=True))
+        after = backups.settings(lab.id)
+        every = {15: "15 minutes", 60: "hour", 360: "6 hours", 1440: "24 hours"}.get(after["interval"], "")
+        if after["enabled"] != before["enabled"]:
+            activity.record(f"turned automatic backups on, every {every}" if after["enabled"]
+                            else "turned automatic backups off", lab)
+        elif after != before:
+            activity.record("changed the automatic backup settings", lab)
+        changed()
         return backups.summary(lab)
 
     @app.post("/api/labs/{lab_id}/backup/run")
@@ -726,13 +830,19 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             node = get_node(lab, body.node)
             if node.kind != NodeKind.chr:
                 raise Invalid(f"{node.name} is not a router.")
-        return {"results": backups.run(lab, body.node)}
+        results = backups.run(lab, body.node)
+        changed()
+        saved = [r["name"] for r in results if r.get("changed")]
+        target = lab.node(body.node).name if body.node is not None else "all routers"
+        activity.record(f"backed up {target}" + (f": new revisions of {', '.join(saved)}" if saved else ", no changes"), lab)
+        return {"results": results}
 
     @app.put("/api/labs/{lab_id}/nodes/{node_id}/backup")
     def include_in_backup(lab_id: int, node_id: int, body: BackupInclude):
         lab = get_lab(lab_id)
         node = get_node(lab, node_id)
         backups.set_node(lab.id, node.id, body.included)
+        changed()
         return node_view(lab, node)
 
     @app.get("/api/labs/{lab_id}/nodes/{node_id}/revisions")
@@ -754,9 +864,15 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         lab = get_lab(lab_id)
         node = get_node(lab, node_id)
         try:
-            return backups.restore(lab, node, rev, replace=body.mode == "replace")
+            result = backups.restore(lab, node, rev, replace=body.mode == "replace")
         except KeyError:
             raise NotFound(f"No revision {rev} for {node.name}.")
+        if result.get("ok"):
+            when = f"{rev[0:4]}-{rev[4:6]}-{rev[6:8]} {rev[9:11]}:{rev[11:13]} UTC"
+            activity.record(f"restored {node.name} to the revision from {when}"
+                            + (" (applied on top)" if body.mode == "merge" else ""), lab, kind="danger")
+        changed()
+        return result
 
     @app.post("/api/labs/{lab_id}/documentation")
     def documentation(lab_id: int, body: DocExport):
@@ -817,6 +933,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             anno = Annotation(id=free_id({a.id for a in lab.annotations}), **body.model_dump())
             lab.annotations.append(anno)
             store.save()
+            activity.record(f"added {ANNO_WORDS[anno.kind]}", lab)
             return anno.model_dump(mode="json")
 
     @app.patch("/api/labs/{lab_id}/annotations/{anno_id}")
@@ -836,8 +953,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     def delete_annotation(lab_id: int, anno_id: int):
         with rt.lock:
             lab = get_lab(lab_id)
+            gone = next((a for a in lab.annotations if a.id == anno_id), None)
             lab.annotations = [a for a in lab.annotations if a.id != anno_id]
             store.save()
+            if gone:
+                label = f' "{gone.text.splitlines()[0][:40]}"' if gone.text.strip() else ""
+                activity.record(f"deleted {ANNO_WORDS[gone.kind]}{label}", lab)
 
     # -- links -----------------------------------------------------------
 
@@ -857,6 +978,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             store.save()
             rt.sync_dhcp()
             rt.apply_link(lab, link)
+            activity.record(f"linked {link_text(lab, link)}", lab)
             return link.model_dump(mode="json")
 
     @app.delete("/api/labs/{lab_id}/links/{link_id}", status_code=204)
@@ -867,9 +989,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             if link is None:
                 raise NotFound(f"Link {link_id} not found in lab {lab_id}.")
             rt.remove_link(link)
+            text = link_text(lab, link)
             lab.links.remove(link)
             store.save()
             rt.sync_dhcp()
+            activity.record(f"removed the link {text}", lab, kind="danger")
 
     # -- capture ---------------------------------------------------------
 

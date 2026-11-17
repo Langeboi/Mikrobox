@@ -150,14 +150,16 @@ window.addEventListener("pagehide", () => {
   const body = new Blob([JSON.stringify({ client: CLIENT })], { type: "application/json" });
   if (navigator.sendBeacon) navigator.sendBeacon("/api/presence/leave", body);
 });
-const WHO_COLORS = ["purple", "green", "amber", "red", "blue"];
-const whoColor = (name) => WHO_COLORS[[...name].reduce((sum, ch) => sum + ch.charCodeAt(0), 0) % WHO_COLORS.length];
+const WHO_COLORS = ["purple", "green", "amber", "red", "blue", "teal", "pink"];
+// FNV-1a: a stable colour per name that spreads short names well.
+const whoColor = (name) => WHO_COLORS[[...name].reduce((hash, ch) => Math.imul(hash ^ ch.charCodeAt(0), 16777619) >>> 0, 2166136261) % WHO_COLORS.length];
+
+const beatBody = () => ({ client: CLIENT, lab: state.lab ? state.lab.id : null,
+  node: state.sel && state.sel.type === "node" ? state.sel.id : null });
 
 async function refresh(force) {
-  const beat = { client: CLIENT, lab: state.lab ? state.lab.id : null,
-    node: state.sel && state.sel.type === "node" ? state.sel.id : null };
   const [labs, sys, pres] = await Promise.all([api("GET", "/labs"), api("GET", "/system"),
-    api("POST", "/presence", beat).catch(() => ({ others: [] }))]);
+    api("POST", "/presence", beatBody()).catch(() => ({ others: [] }))]);
   state.labs = labs;
   state.sys = sys;
   state.others = pres.others;
@@ -225,6 +227,7 @@ function selectedRouter() {
 function select(ref) {
   state.sel = ref;
   render(true);
+  beatSoon(); // others see what you selected straight away
 }
 
 function setTool(tool) {
@@ -1508,6 +1511,7 @@ const ACTIONS = {
   "cfg-import": () => { const n = selectedRouter(); if (n) importConfig(n); },
   "cfg-identity": () => { const n = selectedRouter(); if (n) pushIdentity(n); },
   "tool-packets": () => packetDialog(),
+  "tool-activity": () => openActivity(),
   "tool-nuke": () => nukeDialog(),
   "tool-test": () => reachDialog(),
   "tool-docs": async () => {
@@ -1774,6 +1778,8 @@ function switchLab(lab) {
   state.linkFrom = null;
   writeStore("lab", lab.id);
   loadView();
+  beatSoon();
+  if (activityState.list && !activityState.all) loadActivity().catch(() => {});
 }
 
 function closeMenus() {
@@ -1891,9 +1897,115 @@ window.addEventListener("keydown", (e) => {
   }
 });
 
-setInterval(() => {
-  if (!drag && $("#modal").hidden) refresh(false).catch(() => {});
-}, 3000);
+// ---------------------------------------------------- instant updates
+
+// The server pushes a hint whenever something changes; the workspace then fetches again.
+// A slow poll stays as a safety net, e.g. for a device that stops by itself.
+let refreshTimer = null, refreshing = false, refreshAgain = false, eventDelay = 1000;
+
+function scheduleRefresh(delay = 120) {
+  clearTimeout(refreshTimer);
+  refreshTimer = setTimeout(runRefresh, delay);
+}
+
+async function runRefresh() {
+  if (drag || !$("#modal").hidden) { scheduleRefresh(400); return; } // not mid-drag or mid-dialog
+  if (refreshing) { refreshAgain = true; return; }
+  refreshing = true;
+  try { await refresh(false); } catch (e) { /* the next event or the poll tries again */ }
+  refreshing = false;
+  if (refreshAgain) { refreshAgain = false; scheduleRefresh(0); }
+}
+
+function connectEvents() {
+  const ws = new WebSocket(wsUrl("/events"));
+  ws.onmessage = (e) => {
+    let msg;
+    try { msg = JSON.parse(e.data); } catch (err) { return; }
+    if (msg.t === "hello") { eventDelay = 1000; scheduleRefresh(0); return; }
+    if (msg.t === "activity") { onActivity(msg.entry); return; }
+    scheduleRefresh();
+  };
+  ws.onclose = () => {
+    setTimeout(connectEvents, eventDelay);
+    eventDelay = Math.min(eventDelay * 2, 15000);
+  };
+}
+
+let beatTimer = null;
+function beatSoon() {
+  clearTimeout(beatTimer);
+  beatTimer = setTimeout(async () => {
+    try {
+      state.others = (await api("POST", "/presence", beatBody())).others;
+      renderTop();
+      renderCanvas();
+    } catch (e) { /* the poll sends the next one */ }
+  }, 150);
+}
+
+setInterval(() => scheduleRefresh(0), 10000);
+connectEvents();
+
+// ---------------------------------------------------------- activity
+
+const activityState = { entries: [], all: false, list: null };
+
+function openActivity() {
+  const key = "activity";
+  if (!dock.has(key)) {
+    const list = h("ol", { class: "act-list", tabindex: 0, "aria-label": "Activity, newest first" });
+    const all = h("input", { type: "checkbox", id: "act-all", onchange: () => {
+      activityState.all = all.checked;
+      loadActivity().catch((e) => toast(e.message, true));
+    } });
+    const pane = h("div", { class: "pv" },
+      h("div", { class: "pv-bar" }, h("strong", {}, "Activity"),
+        h("label", { class: "act-toggle", for: "act-all" }, all, "All labs"),
+        h("span", { class: "pv-status" }, "Updates live")),
+      list);
+    $("#terms").append(pane);
+    activityState.list = list;
+    dock.set(key, { name: "Activity", pane, onShow: null, close: () => { activityState.list = null; } });
+    loadActivity().catch((e) => toast(e.message, true));
+  }
+  dockShow(key);
+}
+
+async function loadActivity() {
+  const lab = !activityState.all && state.lab ? `lab=${state.lab.id}&` : "";
+  activityState.entries = await api("GET", `/activity?${lab}limit=300`);
+  renderActivity();
+}
+
+function activityRow(e) {
+  const t = new Date(e.ts * 1000);
+  const today = t.toDateString() === new Date().toDateString();
+  const when = today ? t.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })
+    : t.toLocaleDateString([], { day: "numeric", month: "short" }) + " " + t.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+  return h("li", { class: `act ${e.kind}` },
+    h("time", { datetime: t.toISOString(), title: t.toLocaleString() }, when),
+    h("span", { class: `who c-${e.kind === "system" ? "gray" : whoColor(e.user)}`, "aria-hidden": "true" }, e.user.slice(0, 2)),
+    h("span", { class: "act-text" }, h("b", {}, e.user), " ", e.text,
+      activityState.all && e.lab_name ? h("span", { class: "act-lab" }, ` · ${e.lab_name}`) : null));
+}
+
+function renderActivity() {
+  const list = activityState.list;
+  if (!list) return;
+  const rows = activityState.entries.slice(-300).reverse().map(activityRow);
+  list.replaceChildren(...(rows.length ? rows : [h("li", { class: "act empty" }, "Nothing has happened here yet.")]));
+}
+
+function onActivity(entry) {
+  const mine = state.lab && entry.lab === state.lab.id;
+  if (activityState.list && (activityState.all || entry.lab == null || mine)) {
+    activityState.entries.push(entry);
+    renderActivity();
+  }
+  // Someone else removing or resetting things in your lab deserves a heads-up.
+  if (entry.kind === "danger" && mine && state.user && entry.user !== state.user) toast(`${entry.user} ${entry.text}`);
+}
 
 applyPrefs();
 fetch("/api/auth/status").then((r) => r.json()).then((st) => {
