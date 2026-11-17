@@ -328,10 +328,15 @@ function renderTop() {
   sel.hidden = !state.labs.length;
   for (const b of document.querySelectorAll("[data-needs-lab], #lab-start, #lab-stop")) b.disabled = !state.lab;
 
-  // Other people with this lab open, one badge per person.
-  const here = [...new Set((state.others || []).filter((o) => state.lab && o.lab === state.lab.id).map((o) => o.user))];
-  $("#who").replaceChildren(...here.map((name) =>
-    h("span", { class: `who c-${whoColor(name)}`, title: `${name} is in this lab`, role: "img", "aria-label": `${name} is in this lab` }, name.slice(0, 2))));
+  // Other people with this lab open, one badge per person. Hovering says which device they
+  // have selected; nothing is drawn on the canvas for it.
+  const inLab = (state.others || []).filter((o) => state.lab && o.lab === state.lab.id);
+  const here = [...new Set(inLab.map((o) => o.user))];
+  $("#who").replaceChildren(...here.map((name) => {
+    const on = [...new Set(inLab.filter((o) => o.user === name && o.node !== null).map((o) => nodeById(o.node)).filter(Boolean).map((n) => n.name))];
+    const text = `${name} is in this lab` + (on.length ? `, on ${on.join(" and ")}` : "");
+    return h("span", { class: `who c-${whoColor(name)}`, title: text, role: "img", "aria-label": text }, name.slice(0, 2));
+  }));
 
   const sys = state.sys;
   // A side-by-side install (e.g. a test build) names itself so the two never get mixed up.
@@ -575,20 +580,6 @@ function renderCanvas() {
           s("text", { class: "sub", y: 62 }, n.mgmt_ip || (n.kind === "client" && clientAddress(n)) || "")),
       ),
     );
-  }
-
-  // Name tags over devices that other people have selected.
-  const watching = new Map();
-  for (const o of state.others || []) {
-    if (o.lab !== lab.id || o.node === null || !nodeById(o.node)) continue;
-    if (!watching.has(o.node)) watching.set(o.node, new Set());
-    watching.get(o.node).add(o.user);
-  }
-  for (const [id, names] of watching) {
-    const n = nodeById(id), label = [...names].join(", "), w = 14 + label.length * 6.4;
-    world.append(s("g", { class: `who-tag c-${whoColor([...names][0])}`, transform: `translate(${n.x},${n.y - 52})`, "aria-hidden": "true" },
-      s("rect", { x: -w / 2, y: -10, width: w, height: 20, rx: 10 }),
-      s("text", { y: 4 }, label)));
   }
 
   if (drag && drag.kind === "draw" && drag.moved) {
