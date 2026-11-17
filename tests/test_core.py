@@ -770,6 +770,8 @@ def test_presence_lists_other_people(client):
     assert b["others"] == [{"user": "tester", "lab": 1, "node": 3}]
     a = client.post("/api/presence", json={"client": "tab-aaaa", "lab": 1}).json()
     assert a["others"] == [{"user": "anna", "lab": 1, "node": None}]
+    assert anna.post("/api/presence/leave", json={"client": "tab-bbbb"}).status_code == 204
+    assert client.post("/api/presence", json={"client": "tab-aaaa", "lab": 1}).json()["others"] == []
 
 
 def test_console_is_shared_between_viewers(client, monkeypatch):
