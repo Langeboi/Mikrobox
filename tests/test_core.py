@@ -1159,3 +1159,53 @@ def test_ksm_endpoint(client):
     assert st["enabled"] is True and st["available"] is False
     assert client.put("/api/host/ksm", json={"enabled": False}).json()["enabled"] is False
     assert client.get("/api/system").json()["ksm"]["enabled"] is False
+
+
+def test_nuke_empties_the_lab_and_keeps_it(client, monkeypatch):
+    lab = make_lab(client)
+    other = client.post("/api/labs", json={"name": "keep-me"}).json()["id"]
+    keep = add_node(client, other, name="SAFE")
+    r1 = add_node(client, lab, name="R1")
+    r2 = add_node(client, lab, name="R2")
+    pc = add_node(client, lab, kind="client", name="PC1")
+    client.post(f"/api/labs/{lab}/links", json={"a": {"node": r1["id"], "port": 1}})
+    client.post(f"/api/labs/{lab}/links", json={"a": {"node": r1["id"], "port": 2}, "b": {"node": r2["id"], "port": 2}})
+    client.post(f"/api/labs/{lab}/annotations", json={"kind": "note", "x": 0, "y": 0, "w": 100, "h": 80, "text": "hi"})
+    client.patch(f"/api/labs/{lab}", json={"mgmt_x": 700, "mgmt_y": 500})
+    client.put(f"/api/labs/{lab}/backup", json={"enabled": True, "scope": "selected", "username": "admin"})
+    client.put(f"/api/labs/{lab}/nodes/{r1['id']}/backup", json={"included": True})
+    backups = client.app.state.backups
+    backups.store(r1["id"], "/system identity\nset name=R1\n")
+    for n in (r1, keep):
+        disk = client.rt.disk_path(client.rt.store.state.lab(lab if n is r1 else other).node(n["id"]))
+        disk.parent.mkdir(parents=True, exist_ok=True)
+        disk.write_bytes(b"disk")
+
+    url = f"/api/labs/{lab}/clear"
+    r = client.post(url, json={"confirm": "wrong"})
+    assert r.status_code == 400 and "first" in r.json()["detail"]
+    assert len(client.get(f"/api/labs/{lab}").json()["nodes"]) == 3  # nothing happened
+
+    stopped = []
+    real_stop = client.rt.stop_node
+    monkeypatch.setattr(client.rt, "stop_node", lambda l, n: stopped.append(n.name) or real_stop(l, n))
+    r = client.post(url, json={"confirm": " first "})
+    assert r.status_code == 200, r.text
+    assert r.json()["removed"] == {"devices": 3, "links": 2, "annotations": 1, "revisions": 1}
+    assert sorted(stopped) == ["PC1", "R1", "R2"]
+    view = client.get(f"/api/labs/{lab}").json()
+    assert view["name"] == "first" and view["id"] == lab
+    assert view["nodes"] == [] and view["links"] == [] and view["annotations"] == []
+    assert (view["mgmt_x"], view["mgmt_y"]) == (90, 80)
+    assert view["backup"]["enabled"] is True  # lab settings stay
+    assert backups.settings(lab)["nodes"] == []
+    assert backups.revisions(r1["id"]) == []
+    assert not (client.tmp / "data" / "disks" / f"n{r1['id']}.qcow2").exists()
+    assert (client.tmp / "data" / "dhcp-hosts").exists() is False or "R1" not in (client.tmp / "run" / "dhcp-hosts").read_text()
+
+    # The other lab is untouched.
+    kept = client.get(f"/api/labs/{other}").json()
+    assert [n["name"] for n in kept["nodes"]] == ["SAFE"]
+    assert client.rt.disk_path(client.rt.store.state.lab(other).node(keep["id"])).exists()
+    # A fresh device can be added straight away.
+    assert add_node(client, lab, name="R1")["name"] == "R1"

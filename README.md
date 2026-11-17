@@ -92,6 +92,8 @@ Windows-only H3C Cloud Lab, so neither is included.
 - Documentation export: a zip with a Markdown write-up (devices, cabling, areas, notes),
   the topology image and each router's latest config.
 - Connectivity test: ping and traceroute from a client, from the Tools menu.
+- Nuke (Tools menu): empties the current lab in one go (devices, disks, links, shapes,
+  notes and saved revisions) after a warning and typing the lab's name. The lab stays.
 - Settings: light or dark theme, grid, snapping, port labels, defaults for new routers.
 - Browser console for routers (serial port) and clients (shell), over a websocket.
 - Live packet capture of any port as a pcap stream you can pipe into Wireshark.
