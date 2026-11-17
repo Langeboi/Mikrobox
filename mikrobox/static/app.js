@@ -1115,7 +1115,8 @@ function nodeInspector(n) {
   const access = [];
   if (n.mgmt_ip && (isChr || isCx)) {
     access.push(copyRow(n.ssh), h("p", {}, h("a", { href: `ssh://admin@${n.mgmt_ip}` }, "Open in your SSH client"),
-      ". WinBox and MobaXterm can connect to the same address."));
+      isCx ? [". The web interface is at ", h("a", { href: `https://${n.mgmt_ip}`, target: "_blank", rel: "noopener" }, `https://${n.mgmt_ip}`), "."]
+        : ". WinBox and MobaXterm can connect to the same address."));
   } else if (n.mgmt_ip) {
     access.push(copyRow(n.mgmt_ip));
   } else if (n.cloud_port) {
