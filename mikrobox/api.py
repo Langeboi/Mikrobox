@@ -12,6 +12,7 @@ import re
 import subprocess
 import threading
 import zipfile
+from collections import deque
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Literal, Optional
@@ -30,7 +31,8 @@ from . import console as consoles
 from .activity import Activity
 from .events import Events
 from . import docs
-from .packets import parse_line
+from .packets import Assembler
+from .packets import decode as decode_packet
 from .models import (
     NAME_PATTERN, Annotation, Endpoint, Lab, Link, Node, NodeKind, default_chr_ram, free_id,
 )
@@ -1076,39 +1078,87 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             await ws.close()
             return
         proc = await asyncio.create_subprocess_exec(
-            "tcpdump", "-l", "-n", "-e", "-i", iface, *bpf.split(),
-            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+            "tcpdump", "-l", "-n", "-e", "-xx", "-i", iface, *bpf.split(),
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE, limit=1 << 20)
+        await packet_session(ws, proc)
+
+    async def packet_session(ws: WebSocket, proc) -> None:
+        """Stream tcpdump -xx output as rows; answer {"decode": n} and {"pause": bool} from the page.
+
+        The bytes of the last few thousand packets are kept so any visible row can be decoded.
+        While paused, packets are read and dropped, so nothing the page shows is pushed out.
+        """
+        kept: dict[int, tuple[bytes, float, int]] = {}
+        order: deque[int] = deque()
+        st = {"n": 0, "paused": False}
+        send_lock = asyncio.Lock()
+
+        async def send(obj) -> None:
+            async with send_lock:
+                await ws.send_text(json.dumps(obj))
+
+        def take(done: list) -> list[dict]:
+            rows = []
+            now = time.time()
+            for row, data in done:
+                if st["paused"]:
+                    continue
+                st["n"] += 1
+                n = st["n"]
+                kept[n] = (data, now, row["length"])
+                order.append(n)
+                while len(order) > 5000:
+                    kept.pop(order.popleft(), None)
+                rows.append({**row, "n": n})
+            return rows
 
         async def pump():
+            asm = Assembler()
             while True:
                 line = await proc.stdout.readline()
                 if not line:
                     break
-                batch = [line]
+                done = asm.feed(line.decode(errors="replace"))
                 # Group whatever else arrives within a moment into one message.
                 try:
-                    while len(batch) < 200:
+                    for _ in range(4000):
                         more = await asyncio.wait_for(proc.stdout.readline(), 0.1)
                         if not more:
                             break
-                        batch.append(more)
+                        done += asm.feed(more.decode(errors="replace"))
+                        if len(done) >= 200:
+                            break
                 except asyncio.TimeoutError:
                     pass
-                rows = [r for r in (parse_line(l.decode(errors="replace")) for l in batch) if r]
+                done += asm.flush()  # tcpdump writes each packet whole, so a pause means it is complete
+                rows = take(done)
                 if rows:
-                    await ws.send_text(json.dumps({"packets": rows}))
+                    await send({"packets": rows})
             err = (await proc.stderr.read()).decode(errors="replace")
             bad = [l for l in err.splitlines() if "error" in l.lower()]
             if bad:
-                await ws.send_text(json.dumps({"error": bad[-1].replace("tcpdump: ", "")}))
+                await send({"error": bad[-1].replace("tcpdump: ", "")})
 
-        async def wait_closed():
+        async def listen():
             while True:
                 msg = await ws.receive()
                 if msg["type"] == "websocket.disconnect":
                     return
+                try:
+                    ask = json.loads(msg.get("text") or "{}")
+                except ValueError:
+                    continue
+                if "pause" in ask:
+                    st["paused"] = bool(ask["pause"])
+                if isinstance(ask.get("decode"), int):
+                    n = ask["decode"]
+                    if n not in kept:
+                        await send({"decoded": n, "error": "That packet is no longer kept. Newer traffic pushed it out."})
+                        continue
+                    data, ts, length = kept[n]
+                    await send({"decoded": n, **(await decode_packet(data, ts, length))})
 
-        tasks = [asyncio.create_task(pump()), asyncio.create_task(wait_closed())]
+        tasks = [asyncio.create_task(pump()), asyncio.create_task(listen())]
         try:
             await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
         finally:

@@ -1217,3 +1217,102 @@ def test_throughput_test_command(client, monkeypatch):
     monkeypatch.setattr(client.rt, "node_running", lambda n: True)
     r = client.post(f"/api/labs/{lab}/nodes/{pc['id']}/test", json={"target": "10.0.0.2", "tool": "iperf"}).json()
     assert r["command"].startswith("iperf3 -c 10.0.0.2 -t 5")
+
+
+# -- full packet decode --------------------------------------------------------
+
+TCPDUMP_XX = """\
+21:49:03.648828 00:00:00:00:00:00 > 00:00:00:00:00:00, ethertype IPv4 (0x0800), length 71: 127.0.0.1.54004 > 127.0.0.1.53: 4660+ A? example.com. (29)
+\t0x0000:  0000 0000 0000 0000 0000 0000 0800 4500
+\t0x0010:  0039 adfe 4000 4011 8eb3 7f00 0001 7f00
+\t0x0020:  0001 d2f4 0035 0025 fe38 1234 0100 0001
+\t0x0030:  0000 0000 0000 0765 7861 6d70 6c65 0363
+\t0x0040:  6f6d 0000 0100 01
+21:49:03.700001 52:54:00:00:01:02 > ff:ff:ff:ff:ff:ff, ethertype ARP (0x0806), length 42: Request who-has 10.0.12.2 tell 10.0.12.1, length 28
+\t0x0000:  ffff ffff ffff 5254 0000 0102 0806 0001
+\t0x0010:  0800 0604 0001 5254 0000 0102 0a00 0c01
+\t0x0020:  0000 0000 0000 0a00 0c02
+"""
+
+
+def test_tcpdump_hex_is_joined_to_its_packet():
+    from mikrobox.packets import Assembler
+
+    asm = Assembler()
+    done = []
+    for line in TCPDUMP_XX.splitlines():
+        done += asm.feed(line)
+    assert len(done) == 1 and done[0][0]["proto"] == "DNS" and len(done[0][1]) == 71
+    assert done[0][1][12:14] == b"\x08\x00"
+    last = asm.flush()
+    assert last[0][0]["proto"] == "ARP" and len(last[0][1]) == 42 and asm.flush() == []
+    # Lines tcpdump could not summarise drop their bytes with them.
+    asm.feed("tcpdump: something odd")
+    asm.feed("\t0x0000:  ffff")
+    assert asm.flush() == []
+
+
+def test_pdml_becomes_a_tree():
+    from mikrobox.packets import parse_pdml
+
+    pdml = """<?xml version="1.0"?><pdml><packet>
+      <proto name="geninfo" pos="0" showname="General information" size="42"/>
+      <proto name="eth" showname="Ethernet II, Src: 52:54:00:00:01:02" size="14" pos="0">
+        <field name="eth.dst" showname="Destination: Broadcast" size="6" pos="0" show="ff:ff:ff:ff:ff:ff"/>
+        <field name="eth.dst_resolved" showname="Destination (resolved)" hide="yes" size="6" pos="0"/>
+        <field name="eth.type" showname="Type: ARP (0x0806)" size="2" pos="12" show="0x0806"/>
+      </proto>
+      <proto name="arp" showname="Address Resolution Protocol (request)" size="28" pos="14">
+        <field name="" show="Some text without a name" size="0" pos="14"/>
+        <field name="arp.opcode" size="2" pos="20" show="1"/>
+      </proto>
+      <proto name="fake-field-wrapper"><field name="_ws.expert" showname="Expert Info" size="0" pos="0"/></proto>
+    </packet></pdml>"""
+    tree = parse_pdml(pdml)
+    assert [n["t"] for n in tree] == ["Ethernet II, Src: 52:54:00:00:01:02", "Address Resolution Protocol (request)", "Expert Info"]
+    eth = tree[0]
+    assert (eth["p"], eth["s"]) == (0, 14) and [c["t"] for c in eth["c"]] == ["Destination: Broadcast", "Type: ARP (0x0806)"]
+    assert tree[1]["c"][0] == {"t": "Some text without a name"}  # size 0: nothing to highlight
+    assert tree[1]["c"][1] == {"t": "arp.opcode: 1", "n": "arp.opcode", "p": 20, "s": 2}
+    assert eth["n"] == "eth" and "n" not in tree[2]
+
+
+def test_tshark_never_runs_as_root(monkeypatch):
+    from mikrobox import packets
+
+    monkeypatch.setattr(packets.os, "geteuid", lambda: 0)
+    monkeypatch.setattr(packets.shutil, "which", lambda name: "/usr/bin/" + name)
+    assert packets.tshark_argv()[:4] == ["setpriv", "--reuid=nobody", "--regid=nogroup", "--clear-groups"]
+    monkeypatch.setattr(packets.os, "geteuid", lambda: 1000)
+    assert packets.tshark_argv()[0] == "tshark"
+
+
+def test_live_packets_can_be_decoded(client, tmp_path, monkeypatch):
+    import os, shutil
+
+    fake = tmp_path / "fakebin"
+    fake.mkdir()
+    (tmp_path / "td.txt").write_text(TCPDUMP_XX)
+    (fake / "tcpdump").write_text(f"#!/bin/sh\ncat {tmp_path / 'td.txt'}\nexec sleep 30\n")
+    (fake / "tcpdump").chmod(0o755)
+    monkeypatch.setenv("PATH", f"{fake}:{os.environ['PATH']}")
+    lab = make_lab(client)
+    r1 = add_node(client, lab, name="R1")
+    monkeypatch.setattr(client.rt.net, "exists", lambda iface: True)
+    with client.websocket_connect(f"/api/labs/{lab}/nodes/{r1['id']}/ports/1/packets") as ws:
+        rows = ws.receive_json()["packets"]
+        assert [(r["n"], r["proto"]) for r in rows] == [(1, "DNS"), (2, "ARP")]
+        ws.send_json({"decode": 99})
+        assert "no longer kept" in ws.receive_json()["error"]
+        ws.send_json({"decode": 2})
+        got = ws.receive_json()
+        assert got["decoded"] == 2
+        if shutil.which("tshark"):
+            names = [n["t"] for n in got["tree"]]
+            assert names[1].startswith("Ethernet II") and names[2].startswith("Address Resolution Protocol (request)")
+            assert got["hex"].startswith("ffffffffffff52540000") and got["length"] == 42
+            arp = got["tree"][2]
+            target = next(c for c in arp["c"] if c["t"].startswith("Target IP address"))
+            assert (target["p"], target["s"], target["t"]) == (38, 4, "Target IP address: 10.0.12.2")
+        else:
+            assert "needs tshark" in got["error"]

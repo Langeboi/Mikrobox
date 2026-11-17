@@ -335,7 +335,7 @@ function renderTop() {
       type: "button", class: on ? "on" : "", title: t.tip, "aria-pressed": t.add ? null : String(on),
       disabled: !state.lab && t.id !== "select",
       onclick: () => (t.add ? addNodeDialog(t.id) : setTool(t.id)),
-    }, icon(t.id), t.label);
+    }, icon(t.id), h("span", { class: "lbl" }, t.label));
   }));
 
   const draw = !!DRAW[state.tool];
@@ -1274,10 +1274,10 @@ function openPackets(node, port) {
   if (!dock.has(key)) {
     const title = `${node.name} ${portName(node, port)}`;
     const path = `${labPath()}/nodes/${node.id}/ports/${port}`;
-    const st = { ws: null, paused: false, n: 0, picked: null };
+    // gen counts connections: packet numbers from the server only mean something on the one that sent them.
+    const st = { ws: null, gen: 0, paused: false, n: 0, picked: null, want: null, cache: new Map(), open: new Set(), closed: new Set() };
     const rows = h("tbody", {});
     const status = h("span", { class: "pv-status" }, "Connecting");
-    const detail = h("div", { class: "pv-detail mono" }, "Select a packet to see tcpdump's full line for it.");
     const filter = h("input", { type: "text", placeholder: "Filter, e.g. icmp   or   port 179   or   not arp", "aria-label": "Capture filter" });
     const scroller = h("div", { class: "pv-scroll" },
       h("table", { class: "pv-table" },
@@ -1287,27 +1287,151 @@ function openPackets(node, port) {
       st.paused = !st.paused;
       pause.textContent = st.paused ? "Resume" : "Pause";
       status.textContent = st.paused ? "Paused" : "Listening";
+      // The server stops keeping new packets too, so everything on screen stays decodable.
+      if (st.ws && st.ws.readyState === 1) st.ws.send(JSON.stringify({ pause: st.paused }));
     } }, "Pause");
+
+    // ---- detail: protocol tree and bytes
+    const sideHead = h("div", { class: "pv-side-head" });
+    const raw = h("div", { class: "pv-raw mono" });
+    const tree = h("div", { class: "pv-tree", role: "tree" });
+    const hex = h("div", { class: "pv-hex mono" });
+    const side = h("div", { class: "pv-side", hidden: true }, sideHead, raw, tree, hex);
+    let bytes = [];  // [hex span, ascii span] per byte
+    let marked = [];
+    let current = null;  // the decoded packet on show
+    const mark = (p, size) => {
+      for (const el of marked) el.classList.remove("hl");
+      marked = [];
+      if (p === undefined) return;
+      for (let i = p; i < Math.min(p + size, bytes.length); i++) for (const el of bytes[i]) { el.classList.add("hl"); marked.push(el); }
+      const first = marked[0];
+      if (first) {
+        const top = first.offsetTop - hex.offsetTop;
+        if (top < hex.scrollTop || top > hex.scrollTop + hex.clientHeight - 16) hex.scrollTop = top - 16;
+      }
+    };
+    let chosen = null;
+    const choose = (row, f) => {
+      if (chosen) chosen.classList.remove("on");
+      chosen = row;
+      row.classList.add("on");
+      mark(f.p, f.s);
+    };
+    const renderTree = (nodes, last) => nodes.map((f, i) => {
+      const row = h("div", { class: "pv-f", tabindex: -1, title: f.n || "" }, f.t);
+      row.addEventListener("click", (e) => { e.preventDefault(); choose(row, f); });
+      row.addEventListener("mouseenter", () => { if (!chosen) mark(f.p, f.s); });
+      row.addEventListener("mouseleave", () => { if (!chosen) mark(); });
+      f.el = row;
+      if (!f.c) return row;
+      const byDefault = last && i === nodes.length - 1;  // the top layer, e.g. OSPF or BGP, starts open
+      const box = h("details", { open: st.open.has(f.n) || (byDefault && !st.closed.has(f.n)) },
+        h("summary", {}, row), h("div", { class: "pv-kids" }, renderTree(f.c, false)));
+      box.addEventListener("toggle", () => {
+        if (!f.n) return;
+        if (box.open) { st.open.add(f.n); st.closed.delete(f.n); } else { st.closed.add(f.n); st.open.delete(f.n); }
+      });
+      f.box = box;
+      return box;
+    });
+    // Clicking a byte selects the smallest field that covers it, opening its parents.
+    const fieldAt = (nodes, i, trail = [], best = { size: Infinity, trail: null }) => {
+      for (const f of nodes) {
+        const here = [...trail, f];
+        if (f.p !== undefined && i >= f.p && i < f.p + f.s && f.s <= best.size) best = { size: f.s, trail: here };
+        if (f.c) best = fieldAt(f.c, i, here, best);
+      }
+      return best;
+    };
+    // Each byte takes 3 columns, plus one extra after the 8th: pad short last lines so the text column lines up.
+    const pad = (k) => 49 - (k * 3 + (k >= 8 ? 1 : 0));
+    const renderHex = (hx) => {
+      bytes = [];
+      marked = [];
+      const lines = [];
+      for (let off = 0; off < hx.length / 2; off += 16) {
+        const hs = [], as = [];
+        for (let i = off; i < Math.min(off + 16, hx.length / 2); i++) {
+          const b = parseInt(hx.substr(i * 2, 2), 16);
+          const a = h("span", { "data-i": i }, hx.substr(i * 2, 2));
+          const c = h("span", { "data-i": i }, b >= 32 && b < 127 ? String.fromCharCode(b) : "·");
+          bytes.push([a, c]);
+          hs.push(a, i % 16 === 7 ? "  " : " ");
+          as.push(c);
+        }
+        lines.push(h("div", {}, h("span", { class: "off" }, off.toString(16).padStart(4, "0")), "  ", ...hs,
+          " ".repeat(pad(hs.length / 2)), " ", h("span", { class: "asc" }, ...as)));
+      }
+      hex.replaceChildren(...lines);
+    };
+    hex.addEventListener("click", (e) => {
+      const i = e.target.dataset && e.target.dataset.i;
+      if (i === undefined || !current) return;
+      const trail = fieldAt(current.tree, Number(i)).trail;
+      if (!trail) return;
+      for (const f of trail.slice(0, -1)) if (f.box) f.box.open = true;
+      const f = trail[trail.length - 1];
+      choose(f.el, f);
+      f.el.scrollIntoView({ block: "nearest" });
+    });
+    const showDecoded = (num, pk, d) => {
+      sideHead.replaceChildren(h("strong", {}, `Packet ${num}`), h("span", {}, d.length ? `${d.length} bytes` : ""),
+        h("button", { type: "button", class: "ghost", title: "Close the details", "aria-label": "Close the details", onclick: closeSide }, "×"));
+      raw.textContent = pk.raw;
+      chosen = null;
+      current = d.tree ? d : null;
+      if (d.error) { tree.replaceChildren(h("p", { class: "pv-note" }, d.error)); hex.replaceChildren(); bytes = []; return; }
+      const frame = d.tree.find((f) => f.n === "frame");
+      if (frame) frame.t = frame.t.replace(/^Frame 1:/, `Frame ${num}:`);
+      tree.replaceChildren(...renderTree(d.tree, true));
+      renderHex(d.hex);
+    };
+    const closeSide = () => {
+      side.hidden = true;
+      if (st.picked) st.picked.classList.remove("on");
+      st.picked = null;
+    };
+
+    const pick = (tr, pk, num) => {
+      if (st.picked) st.picked.classList.remove("on");
+      st.picked = tr;
+      tr.classList.add("on");
+      side.hidden = false;
+      const cached = st.cache.get(tr);
+      if (cached) { showDecoded(num, pk, cached); return; }
+      if (pk.gen !== st.gen || !st.ws || st.ws.readyState !== 1) {
+        showDecoded(num, pk, { error: "This packet is from an earlier capture, so its bytes are gone. Download the pcap to keep traffic." });
+        return;
+      }
+      st.want = { n: pk.n, tr, pk, num };
+      showDecoded(num, pk, { error: "Decoding…" });
+      st.ws.send(JSON.stringify({ decode: pk.n }));
+    };
 
     const add = (list) => {
       const stick = scroller.scrollTop + scroller.clientHeight >= scroller.scrollHeight - 30;
       for (const pk of list) {
         st.n += 1;
+        const num = st.n;
+        pk.gen = st.gen;
         const tr = h("tr", { tabindex: 0 },
-          h("td", {}, st.n), h("td", {}, pk.time), h("td", {}, pk.src), h("td", {}, pk.dst),
+          h("td", {}, num), h("td", {}, pk.time), h("td", {}, pk.src), h("td", {}, pk.dst),
           h("td", {}, h("span", { class: `tag c-${PROTO_COLOR[pk.proto] || "blue"}` }, pk.proto)),
           h("td", {}, pk.length), h("td", {}, pk.info));
-        const pick = () => {
-          if (st.picked) st.picked.classList.remove("on");
-          st.picked = tr;
-          tr.classList.add("on");
-          detail.textContent = pk.raw;
-        };
-        tr.addEventListener("click", pick);
-        tr.addEventListener("keydown", (e) => { if (e.key === "Enter") pick(); });
+        tr.addEventListener("click", () => pick(tr, pk, num));
+        tr.addEventListener("keydown", (e) => {
+          if (e.key === "Enter") pick(tr, pk, num);
+          const next = e.key === "ArrowDown" ? tr.nextElementSibling : e.key === "ArrowUp" ? tr.previousElementSibling : null;
+          if (next) { e.preventDefault(); next.focus(); next.click(); }
+        });
         rows.append(tr);
       }
-      while (rows.children.length > 2000) rows.firstChild.remove();
+      while (rows.children.length > 2000) {
+        if (rows.firstChild === st.picked) closeSide();
+        st.cache.delete(rows.firstChild);
+        rows.firstChild.remove();
+      }
       if (stick) scroller.scrollTop = scroller.scrollHeight;
     };
 
@@ -1315,12 +1439,23 @@ function openPackets(node, port) {
       if (st.ws) { st.ws.onclose = null; st.ws.close(); }
       const f = filter.value.trim();
       status.textContent = "Connecting";
+      st.gen += 1;
       const ws = new WebSocket(wsUrl(`${path}/packets`) + (f ? `?filter=${encodeURIComponent(f)}` : ""));
       st.ws = ws;
       let failed = false;
-      ws.onopen = () => { status.textContent = st.paused ? "Paused" : "Listening"; };
+      ws.onopen = () => {
+        status.textContent = st.paused ? "Paused" : "Listening";
+        if (st.paused) ws.send(JSON.stringify({ pause: true }));
+      };
       ws.onmessage = (e) => {
         const msg = JSON.parse(e.data);
+        if (msg.decoded !== undefined) {
+          const w = st.want;
+          if (!w || w.n !== msg.decoded) return;
+          if (!msg.error) st.cache.set(w.tr, msg);
+          if (st.picked === w.tr) showDecoded(w.num, w.pk, msg);
+          return;
+        }
         if (msg.error) { failed = true; status.textContent = msg.error; return; }
         if (!st.paused && msg.packets) add(msg.packets);
       };
@@ -1332,10 +1467,10 @@ function openPackets(node, port) {
         h("strong", {}, title), filter,
         h("button", { type: "submit" }, "Apply"),
         pause,
-        h("button", { type: "button", onclick: () => { rows.replaceChildren(); st.n = 0; st.picked = null; } }, "Clear"),
+        h("button", { type: "button", onclick: () => { rows.replaceChildren(); st.n = 0; st.cache.clear(); closeSide(); } }, "Clear"),
         h("a", { href: `/api${path}/capture?seconds=30`, download: "", title: "Download a 30 second pcap for Wireshark" }, "pcap"),
         status),
-      scroller, detail);
+      h("div", { class: "pv-body" }, scroller, side));
     $("#terms").append(pane);
     dock.set(key, { name: `${title} packets`, pane, onShow: null, close: () => { if (st.ws) { st.ws.onclose = null; st.ws.close(); } } });
     connect();
@@ -1448,9 +1583,63 @@ function packetDialog() {
 }
 
 window.addEventListener("resize", () => {
+  setDockHeight(readStore("dockHeight", null), false);
   const d = dock.get(state.activeDock);
   if (d && d.onShow) d.onShow();
 });
+
+// A short canvas (tall bottom panel, small window) gets an icon-only tool rail; labels stay as tooltips.
+if (window.ResizeObserver) {
+  new ResizeObserver(() => {
+    const stage = $("#stage");
+    const vertical = getComputedStyle($("#tools")).flexDirection === "column";
+    $("#tools").classList.toggle("compact", vertical && stage.clientHeight < 560);
+  }).observe($("#stage"));
+}
+
+// The bottom panel can be made taller by dragging its top edge; the height is kept per browser.
+function setDockHeight(px, save = true) {
+  const el = $("#dock");
+  if (px === null || px === undefined) { el.style.height = ""; return; }
+  const height = Math.round(Math.max(140, Math.min(px, window.innerHeight * 0.8)));
+  el.style.height = height + "px";
+  if (save) writeStore("dockHeight", height);
+  const d = dock.get(state.activeDock);
+  if (d && d.onShow) requestAnimationFrame(d.onShow);
+}
+(() => {
+  const grip = $("#dock-grip");
+  setDockHeight(readStore("dockHeight", null), false);
+  grip.addEventListener("pointerdown", (e) => {
+    e.preventDefault();
+    grip.setPointerCapture(e.pointerId);
+    grip.classList.add("drag");
+    const bottom = $("#dock").getBoundingClientRect().bottom;
+    let frame = 0;
+    const move = (ev) => {
+      cancelAnimationFrame(frame);
+      frame = requestAnimationFrame(() => setDockHeight(bottom - ev.clientY, false));
+    };
+    const up = () => {
+      grip.classList.remove("drag");
+      grip.removeEventListener("pointermove", move);
+      setDockHeight($("#dock").getBoundingClientRect().height);
+    };
+    grip.addEventListener("pointermove", move);
+    grip.addEventListener("pointerup", up, { once: true });
+    grip.addEventListener("pointercancel", up, { once: true });
+  });
+  grip.addEventListener("dblclick", () => {
+    const now = $("#dock").getBoundingClientRect().height;
+    setDockHeight(now < window.innerHeight * 0.45 ? window.innerHeight * 0.6 : 300);
+  });
+  grip.addEventListener("keydown", (e) => {
+    const step = e.key === "ArrowUp" ? 30 : e.key === "ArrowDown" ? -30 : 0;
+    if (!step) return;
+    e.preventDefault();
+    setDockHeight($("#dock").getBoundingClientRect().height + step);
+  });
+})();
 
 // ------------------------------------------------------- export as PNG
 

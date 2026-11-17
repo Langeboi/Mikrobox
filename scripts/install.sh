@@ -16,7 +16,7 @@ apt-get update
 apt-get install -y --no-install-recommends \
   qemu-system-x86 qemu-utils iproute2 dnsmasq-base nftables tcpdump arp-scan bridge-utils \
   traceroute iputils-ping bash python3 python3-venv unzip curl ca-certificates \
-  iperf3 dnsutils nmap mtr-tiny netcat-openbsd busybox iputils-arping
+  iperf3 dnsutils nmap mtr-tiny netcat-openbsd busybox iputils-arping tshark
 
 if [ ! -e /dev/kvm ]; then
   echo "WARNING: /dev/kvm is missing. Routers will run without acceleration and be very slow." >&2
