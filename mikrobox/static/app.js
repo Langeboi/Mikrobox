@@ -242,6 +242,7 @@ function selectedRouter() {
 
 function select(ref) {
   state.sel = ref;
+  if (ref && ref.type === "node") followDock(ref.id);
   render(true);
   beatSoon(); // others see what you selected straight away
 }
@@ -1423,10 +1424,17 @@ function dockClose(key) {
   renderDock();
 }
 
+const isNodeTab = (key, nodeId) => key === `c:${nodeId}` || key.startsWith(`p:${nodeId}:`) || key.startsWith(`t:${nodeId}:`);
+
 function closeNodeTabs(nodeId) {
-  for (const key of [...dock.keys()]) {
-    if (key === `c:${nodeId}` || key.startsWith(`p:${nodeId}:`) || key.startsWith(`t:${nodeId}:`)) dockClose(key);
-  }
+  for (const key of [...dock.keys()]) if (isNodeTab(key, nodeId)) dockClose(key);
+}
+
+// Selecting a device brings its console to the front of the panel, if it is open. A tab of
+// that device already on show (its packets, a test) stays. Nothing new is opened.
+function followDock(nodeId) {
+  if (state.activeDock && isNodeTab(state.activeDock, nodeId)) return;
+  if (dock.has(`c:${nodeId}`)) dockShow(`c:${nodeId}`);
 }
 
 function renderTabs() {
