@@ -3,42 +3,196 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Sign in to Mikrobox</title>
+<title>Sign in · Mikrobox</title>
 <link rel="icon" href="/static/favicon.svg" type="image/svg+xml">
 <link rel="stylesheet" href="/static/app.css">
 <style>
-  body { align-items: center; justify-content: center; padding: 16px; }
-  #card { width: 380px; max-width: 100%; background: var(--surface); border: 1px solid var(--line); border-radius: 14px; box-shadow: var(--shadow); padding: 28px; }
-  #card .brand { font-size: 20px; margin-bottom: 18px; }
-  #card h1 { font-size: 18px; margin: 0 0 4px; }
-  #card p { color: var(--muted); margin: 0 0 16px; font-size: 13px; }
-  #card button { width: 100%; margin-top: 6px; }
-  #error { color: var(--danger); min-height: 1.3em; margin: 6px 0 0; }
+  /* ---- page ---- */
+  :root { --a-off: #98a2b0; --a-link: #8793a3; --mono: ui-monospace, "SF Mono", Consolas, monospace; }
+  :root[data-theme="dark"] { --a-off: #5b6675; --a-link: #46525f; }
+  #page { flex: 1; display: flex; min-height: 100vh; transition: opacity .25s; }
+  #page.leaving { opacity: 0; }
+
+  /* ---- left: a small lab on a loop ---- */
+  #art {
+    --cycle: 14s;
+    flex: 1 1 58%; min-width: 0; position: relative; overflow: hidden; display: flex; flex-direction: column;
+    background-color: var(--bg); background-image: radial-gradient(circle, var(--dots) 1px, transparent 1.4px);
+    background-size: 24px 24px; border-right: 1px solid var(--line);
+  }
+  #lab { flex: 1; min-height: 0; width: 100%; padding: 40px 48px 8px; box-sizing: border-box; }
+  #log { padding: 0 44px 34px; font: 12px/1.65 var(--mono); color: var(--muted); }
+  #log b { color: var(--text); font-weight: 600; }
+
+  #lab text { font: 600 13px system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; fill: var(--text); text-anchor: middle; paint-order: stroke; stroke: var(--bg); stroke-width: 4; }
+  #lab text.a-sub { font-size: 11px; font-weight: 400; fill: var(--muted); }
+  #lab text.a-port { font: 11px var(--mono); fill: var(--muted); }
+  .a-cloud { fill: var(--surface); stroke: var(--line); stroke-width: 1.5; stroke-linejoin: round; filter: drop-shadow(0 2px 4px rgba(16, 24, 40, .12)); }
+  .a-box { fill: var(--surface); stroke: var(--line); stroke-width: 1.5; filter: drop-shadow(0 2px 4px rgba(16, 24, 40, .12)); }
+  .a-glyph { fill: none; stroke: var(--muted); stroke-width: 1.5; stroke-linecap: round; stroke-linejoin: round; vector-effect: non-scaling-stroke; }
+  .a-dot { fill: var(--a-off); stroke: var(--surface); stroke-width: 2.5; }
+  .a-rip { fill: none; stroke: var(--ok); stroke-width: 2; opacity: 0; transform-box: fill-box; transform-origin: center; }
+  .a-tile { transform-box: fill-box; transform-origin: center; }
+  .a-link { stroke: var(--a-link); stroke-width: 2; }
+  .a-pkt { fill: var(--ok); filter: drop-shadow(0 0 3px var(--ok)); }
+  .a-flow { opacity: 0; }
+  .a-line { white-space: pre; overflow: hidden; width: 0; }
+  .a-caret { display: inline-block; width: .62em; height: 1.15em; vertical-align: -.22em; background: var(--muted); }
+
+  /* One loop: devices start one by one (status dot, glyph, ripple, a green edge), links come up,
+     traffic flows, the log types out; at 82% everything stops again. Each element's --d is when
+     it switches on, minus the 8% where the keyframes do that. */
+  @media (prefers-reduced-motion: no-preference) {
+    .a-tile { animation: a-dim var(--cycle) ease-in-out var(--d) infinite; }
+    .a-box { animation: a-boot var(--cycle) ease-out var(--d) infinite; }
+    .a-glyph { animation: a-glyph var(--cycle) linear var(--d) infinite; }
+    .a-dot { animation: a-dot var(--cycle) linear var(--d) infinite; }
+    .a-rip { animation: a-rip var(--cycle) cubic-bezier(.2, .6, .3, 1) var(--d) infinite; }
+    .a-link { animation: a-link var(--cycle) linear var(--d) infinite; }
+    .a-flow { animation: a-flow var(--cycle) linear var(--d) infinite; }
+    .a-line { animation: a-type var(--cycle) steps(var(--n)) var(--d) infinite; }
+    .a-caret { animation: a-blink 1.1s steps(2, jump-none) infinite; }
+  }
+  /* Asked for less motion: a lab that is simply up and running. */
+  @media (prefers-reduced-motion: reduce) {
+    .a-dot { fill: var(--ok); }
+    .a-glyph { stroke: var(--accent-fg); }
+    .a-link { stroke: var(--ok); }
+    .a-line { width: auto; }
+  }
+  @keyframes a-dot { 0%, 8% { fill: var(--a-off); } 9%, 82% { fill: var(--ok); } 84%, 100% { fill: var(--a-off); } }
+  @keyframes a-glyph { 0%, 8% { stroke: var(--muted); } 10%, 82% { stroke: var(--accent-fg); } 86%, 100% { stroke: var(--muted); } }
+  @keyframes a-boot { 0%, 8% { stroke: var(--line); stroke-width: 1.5; } 8.6% { stroke: var(--ok); stroke-width: 2.5; } 18%, 100% { stroke: var(--line); stroke-width: 1.5; } }
+  @keyframes a-rip { 0%, 8% { opacity: 0; transform: scale(1); } 8.4% { opacity: .7; transform: scale(1); } 17% { opacity: 0; transform: scale(3.6); } 100% { opacity: 0; transform: scale(3.6); } }
+  @keyframes a-dim { 0%, 82% { opacity: 1; transform: scale(1); } 84.5% { opacity: .55; transform: scale(.96); } 89%, 100% { opacity: 1; transform: scale(1); } }
+  @keyframes a-link { 0%, 8% { stroke: var(--a-link); } 10%, 82% { stroke: var(--ok); } 84%, 100% { stroke: var(--a-link); } }
+  @keyframes a-flow { 0%, 9% { opacity: 0; } 12%, 80% { opacity: 1; } 82%, 100% { opacity: 0; } }
+  @keyframes a-type { 0%, 8% { width: 0; opacity: 1; } 11.5%, 82% { width: calc(var(--n) * 1ch); opacity: 1; } 86%, 100% { width: calc(var(--n) * 1ch); opacity: 0; } }
+  @keyframes a-blink { 0% { opacity: 1; } 100% { opacity: 0; } }
+
+  /* ---- right: the form ---- */
+  #side { flex: 1 1 42%; max-width: 580px; min-width: 400px; display: flex; flex-direction: column; padding: 30px 48px 26px; box-sizing: border-box; background: var(--surface); }
+  .side-top { display: flex; align-items: center; gap: 10px; }
+  .side-top .brand { font-size: 17px; margin: 0; }
+  .side-top .brand span { display: inline; }  /* the workspace hides it on small screens; here there is room */
+  .pill { font-size: 11px; font-weight: 600; padding: 2px 8px; border-radius: 999px; background: var(--accent-soft); color: var(--accent-fg); }
+  .icon-btn { width: 40px; height: 40px; min-height: 0; padding: 0; display: inline-flex; align-items: center; justify-content: center; border-radius: 10px; border-color: transparent; background: none; color: var(--muted); }
+  .icon-btn:hover { background: var(--surface-2); color: var(--text); }
+  .icon-btn svg { width: 19px; height: 19px; fill: none; stroke: currentColor; stroke-width: 1.7; stroke-linecap: round; stroke-linejoin: round; }
+  .side-mid { flex: 1; display: flex; align-items: center; padding: 28px 0; }
+  #card { width: 100%; max-width: 368px; display: flex; flex-direction: column; gap: 16px; }
+  #card.in { animation: card-in .35s ease-out both; }
+  #card h1 { margin: 0; font-size: 30px; font-weight: 650; letter-spacing: -.02em; }
+  #lead { margin: -8px 0 6px; color: var(--muted); font-size: 15px; line-height: 1.5; }
+  #card .field { margin: 0; gap: 6px; }
+  #card .field > label { font-size: 13px; }
+  #card input { height: 44px; padding: 0 14px; border-radius: 10px; font-size: 15px; transition: border-color .15s, box-shadow .15s; }
+  #card input:focus { outline: none; border-color: var(--accent-fg); box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent-fg) 22%, transparent); }
+  .pw { position: relative; }
+  .pw input { padding-right: 46px; }
+  .pw .icon-btn { position: absolute; right: 2px; top: 2px; }
+  /* The form is centred, so anything that comes and goes must not change its height:
+     a button that moves between press and release loses the click. */
+  .label-row { display: flex; align-items: baseline; justify-content: space-between; gap: 10px; }
+  .label-row label { font-size: 13px; color: var(--muted); }
+  .hint { margin: 0; display: flex; align-items: center; gap: 6px; font-size: 12.5px; color: var(--muted); }
+  .hint svg { width: 14px; height: 14px; flex: none; fill: none; stroke: currentColor; stroke-width: 2.2; stroke-linecap: round; stroke-linejoin: round; }
+  .hint.good { color: var(--ok); }
+  .hint.bad { color: var(--danger); }
+  .hint.warn { color: #b25e09; }
+  :root[data-theme="dark"] .hint.warn { color: #f0b264; }
+  #go { height: 46px; margin-top: 4px; border-radius: 10px; font-size: 15px; font-weight: 600; display: inline-flex; align-items: center; justify-content: center; gap: 10px; }
+  #go:disabled { opacity: 1; color: #fff; cursor: progress; }
+  #go .spin { display: none; width: 15px; height: 15px; border-radius: 50%; border: 2px solid rgba(255, 255, 255, .35); border-top-color: #fff; animation: spin .8s linear infinite; }
+  #go.busy .spin { display: inline-block; }
+  #go .tick { display: none; width: 17px; height: 17px; fill: none; stroke: #fff; stroke-width: 2.4; stroke-linecap: round; stroke-linejoin: round; }
+  #go.done .tick { display: inline-block; }
+  #go.done { background: var(--ok); border-color: var(--ok); }
+  #error { margin: 0; min-height: 1.4em; color: var(--danger); font-size: 13.5px; }
+  #card.shake { animation: shake .36s ease-in-out; }
+  .side-foot { display: flex; align-items: center; gap: 8px; font-size: 12px; color: var(--muted); }
+  .side-foot .mono { font: 12px var(--mono); }
+  .live { position: relative; width: 8px; height: 8px; flex: none; }
+  .live::before, .live::after { content: ""; position: absolute; inset: 0; border-radius: 50%; background: var(--ok); }
+  .live::before { animation: ping 2.4s ease-out infinite; }
+  .live.down::before, .live.down::after { background: var(--danger); }
+  .live.down::before { animation: none; }
+  @keyframes ping { 0% { transform: scale(1); opacity: .55; } 70%, 100% { transform: scale(2.8); opacity: 0; } }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  @keyframes shake { 0%, 100% { transform: none; } 20% { transform: translateX(-7px); } 45% { transform: translateX(6px); } 70% { transform: translateX(-3px); } }
+  @keyframes card-in { from { opacity: 0; transform: translateY(6px); } }
+  @media (prefers-reduced-motion: reduce) {
+    .live::before, #card.shake, #card.in { animation: none; }
+    #page { transition: none; }
+  }
+
+  /* ---- narrow screens: the form alone ---- */
+  @media (max-width: 880px) {
+    #art { display: none; }
+    #side { max-width: none; min-width: 0; padding: 22px 20px 20px; }
+    .side-mid { justify-content: center; }
+    #card h1 { font-size: 26px; }
+  }
 </style>
 </head>
 <body>
-<form id="card" hidden>
-  <div class="brand">
-    <svg aria-hidden="true" width="30" height="30" viewBox="0 0 24 24"><rect width="24" height="24" rx="6" fill="var(--accent)"/><path d="M6 16V8l6 5 6-5v8" fill="none" stroke="#fff" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
-    <span>Mikrobox</span>
-  </div>
-  <h1 id="title">Sign in</h1>
-  <p id="lead"></p>
-  <div class="field">
-    <label for="username">Username</label>
-    <input id="username" name="username" type="text" autocomplete="username" autocapitalize="none" spellcheck="false" required>
-  </div>
-  <div class="field">
-    <label for="password">Password</label>
-    <input id="password" name="password" type="password" autocomplete="current-password" required>
-  </div>
-  <div class="field" id="again-field" hidden>
-    <label for="again">Password again</label>
-    <input id="again" name="again" type="password" autocomplete="new-password">
-  </div>
-  <button type="submit" class="primary" id="go">Sign in</button>
-  <p id="error" role="alert"></p>
-</form>
+<div id="page">
+  <section id="art" aria-hidden="true">
+    <svg id="lab" viewBox="0 0 600 480" preserveAspectRatio="xMidYMid meet"></svg>
+    <div id="log"></div>
+  </section>
+
+  <section id="side">
+    <div class="side-top">
+      <div class="brand">
+        <svg aria-hidden="true" width="30" height="30" viewBox="0 0 24 24"><rect width="24" height="24" rx="6" fill="var(--accent)"/><path d="M6 16V8l6 5 6-5v8" fill="none" stroke="#fff" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+        <span>Mikrobox</span>
+      </div>
+      <span id="label" class="install-label" hidden></span>
+      <span class="spacer"></span>
+      <button type="button" id="theme" class="icon-btn"></button>
+    </div>
+
+    <div class="side-mid">
+      <form id="card" hidden novalidate>
+        <h1 id="title">Sign in</h1>
+        <p id="lead">Build, break and fix networks of MikroTik routers, right in your browser.</p>
+        <div class="field">
+          <label for="username">Username</label>
+          <input id="username" name="username" type="text" autocomplete="username" autocapitalize="none" spellcheck="false" required>
+          <p class="hint" id="user-hint" hidden>Letters, digits, dots, dashes or underscores.</p>
+        </div>
+        <div class="field">
+          <div class="label-row">
+            <label for="password">Password</label>
+            <p class="hint warn" id="caps" hidden></p>
+          </div>
+          <div class="pw">
+            <input id="password" name="password" type="password" autocomplete="current-password" required>
+            <button type="button" id="reveal" class="icon-btn" aria-label="Show password" aria-pressed="false" title="Show password"></button>
+          </div>
+          <p class="hint" id="length-hint" hidden></p>
+        </div>
+        <div class="field" id="again-field" hidden>
+          <label for="again">Password again</label>
+          <input id="again" name="again" type="password" autocomplete="new-password">
+          <p class="hint" id="match-hint" data-keep="1" hidden></p>
+        </div>
+        <button type="submit" class="primary" id="go"><span class="spin" aria-hidden="true"></span><svg class="tick" viewBox="0 0 24 24" aria-hidden="true"><path d="M5 12.5l4.5 4.5L19 7.5"/></svg><span id="go-text">Sign in</span></button>
+        <p id="error" role="alert"></p>
+      </form>
+    </div>
+
+    <div class="side-foot">
+      <span class="live" id="live"></span>
+      <span id="server">Lab server online</span>
+      <span aria-hidden="true">·</span>
+      <span class="mono" id="host"></span>
+      <span class="spacer"></span>
+      <span class="mono" id="version"></span>
+    </div>
+  </section>
+</div>
 <script src="/static/login.js"></script>
 </body>
 </html>
