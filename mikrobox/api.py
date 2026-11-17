@@ -1248,18 +1248,26 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     await send({"decoded": n, **(await decode_packet(data, ts, length))})
 
         tasks = [asyncio.create_task(pump()), asyncio.create_task(listen())]
-        try:
-            await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
-        finally:
+
+        def stop() -> None:
             for t in tasks:
                 t.cancel()
-            await asyncio.gather(*tasks, return_exceptions=True)
             if proc.returncode is None:
                 proc.terminate()
-            try:
-                await ws.close()
-            except Exception:  # the browser already went away
-                pass
+
+        try:
+            await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+        except BaseException:
+            # Cancelled (the server is shutting down) or failed: clean up without waiting on
+            # anything, or a cancellation is caught again mid-cleanup and reported as an error.
+            stop()
+            raise
+        stop()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        try:
+            await ws.close()
+        except Exception:  # the browser already went away
+            pass
 
     # -- console ---------------------------------------------------------
 

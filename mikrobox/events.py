@@ -65,16 +65,22 @@ class Events:
                     return
 
         tasks = [asyncio.create_task(writer()), asyncio.create_task(reader())]
+
+        def stop() -> None:
+            self.queues.discard(q)
+            for t in tasks:
+                t.cancel()
+
         try:
             await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
         except WebSocketDisconnect:
             pass
-        finally:
-            self.queues.discard(q)
-            for t in tasks:
-                t.cancel()
-            await asyncio.gather(*tasks, return_exceptions=True)
-            try:
-                await ws.close()
-            except Exception:
-                pass
+        except BaseException:
+            stop()  # cancelled or failed: nothing to wait for (see packet_session in api.py)
+            raise
+        stop()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        try:
+            await ws.close()
+        except Exception:
+            pass
