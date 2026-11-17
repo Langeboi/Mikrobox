@@ -1283,3 +1283,304 @@ def test_installs_do_not_share_sign_in(tmp_path):
     headers = {b"cookie": f"mikrobox_session={token}".encode()}
     assert main.user_from_headers(headers) == "anna"
     assert test.user_from_headers(headers) is None  # the main install's cookie means nothing here
+# -- instant updates and the activity log ------------------------------------
+
+def _next_event(ws, wanted, tries=20):
+    for _ in range(tries):
+        msg = ws.receive_json()
+        if msg.get("t") == wanted:
+            return msg
+    raise AssertionError(f"no {wanted} event")
+
+
+def test_changes_are_pushed_to_open_workspaces(client):
+    with client.websocket_connect("/api/events") as ws:
+        assert ws.receive_json() == {"t": "hello"}
+        lab = make_lab(client)
+        _next_event(ws, "labs")
+        r1 = add_node(client, lab, name="R1")
+        _next_event(ws, "labs")
+        client.post(f"/api/labs/{lab}/nodes/{r1['id']}/start")  # not saved to the file, still pushed
+        _next_event(ws, "labs")
+        entry = _next_event(ws, "activity")["entry"]
+        assert entry["user"] == "tester" and entry["lab"] == lab
+        client.post("/api/presence", json={"client": "tab-zzzz", "lab": lab})
+        _next_event(ws, "presence")
+
+
+def test_events_need_a_sign_in(client):
+    from starlette.websockets import WebSocketDisconnect
+
+    with pytest.raises(WebSocketDisconnect):
+        with TestClient(client.app).websocket_connect("/api/events") as ws:
+            ws.receive_json()
+
+
+def test_activity_log_records_who_did_what(client):
+    lab = make_lab(client)
+    r1 = add_node(client, lab, name="R1")
+    r2 = add_node(client, lab, name="R2", role="switch")
+    pc = add_node(client, lab, kind="client", name="PC1")
+    link = client.post(f"/api/labs/{lab}/links", json={"a": {"node": r1["id"], "port": 2},
+                                                     "b": {"node": r2["id"], "port": 1}}).json()
+    client.post(f"/api/labs/{lab}/links", json={"a": {"node": r1["id"], "port": 1}})
+    client.patch(f"/api/labs/{lab}/nodes/{r1['id']}", json={"x": 5, "y": 5})  # a move is not logged
+    client.patch(f"/api/labs/{lab}/nodes/{r1['id']}", json={"ports": 4, "name": "EDGE1"})
+    client.post(f"/api/labs/{lab}/nodes/{pc['id']}/start")
+    client.post(f"/api/labs/{lab}/nodes/{pc['id']}/stop")
+    client.post(f"/api/labs/{lab}/annotations", json={"kind": "rect", "x": 0, "y": 0, "w": 10, "h": 10, "text": "Site A"})
+    anno = client.get(f"/api/labs/{lab}").json()["annotations"][0]["id"]
+    client.delete(f"/api/labs/{lab}/annotations/{anno}")
+    client.delete(f"/api/labs/{lab}/links/{link['id']}")
+    client.delete(f"/api/labs/{lab}/nodes/{r2['id']}")
+
+    every = client.get("/api/activity", params={"lab": lab}).json()
+    assert every[0]["text"] == "created the first account" and every[0]["lab"] is None  # server-wide entries show too
+    entries = [e for e in every if e["lab"] == lab]
+    texts = [e["text"] for e in entries]
+    assert texts == [
+        "created the lab first", "added the router R1", "added the switch R2", "added the client PC1",
+        "linked R1 ether2 to R2 ether1", "linked R1 ether1 to the Cloud",
+        "renamed R1 to EDGE1", "changed EDGE1's ports",
+        "started PC1", "stopped PC1", "added an area", 'deleted an area "Site A"',
+        "removed the link EDGE1 ether2 to R2 ether1", "deleted the switch R2",
+    ]
+    assert {e["user"] for e in entries} == {"tester"}
+    assert [e["kind"] for e in entries][-2:] == ["danger", "danger"]
+
+    # Kept on disk, so it survives a restart.
+    from mikrobox.activity import Activity
+    from mikrobox.events import Events
+    again = Activity(client.tmp / "data" / "activity.jsonl", Events())
+    assert [e["text"] for e in again.recent(lab) if e["lab"] == lab] == texts
+    assert again.record("x")["id"] > entries[-1]["id"]
+
+
+def test_activity_for_accounts_and_sign_ins(client):
+    anon = TestClient(client.app)
+    anon.post("/api/auth/login", json={"username": "tester", "password": "nope"})
+    anon.post("/api/auth/login", json={"username": "ghost", "password": "nope"})
+    anon.post("/api/auth/login", json={"username": "tester", "password": "correct-horse"})
+    client.post("/api/users", json={"username": "anna", "password": "long-enough"})
+    client.delete("/api/users/anna")
+    got = [(e["user"], e["text"], e["kind"]) for e in client.get("/api/activity").json()]
+    assert ("tester", "failed to sign in (wrong password)", "danger") in got
+    assert ("someone", "failed to sign in as an unknown user, ghost", "danger") in got
+    assert ("tester", "signed in", "info") in got
+    assert ("tester", "added the account anna", "info") in got
+    assert ("tester", "removed the account anna", "danger") in got
+
+
+def test_template_and_nuke_are_logged_once(client):
+    lab = client.post("/api/templates/spine-leaf", json={}).json()
+    client.post(f"/api/labs/{lab['id']}/clear", json={"confirm": "spine-leaf"})
+    texts = [e["text"] for e in client.get("/api/activity", params={"lab": lab["id"]}).json() if e["lab"] == lab["id"]]
+    assert texts == ["created the lab spine-leaf from the Spine and leaf template",
+                     "nuked the lab: removed 10 devices, 12 links and 3 shapes and notes"]
+
+
+# -- better clients -----------------------------------------------------------
+
+def test_client_with_dhcp_and_services(client):
+    lab = make_lab(client)
+    pc = add_node(client, lab, kind="client", name="PC1", addressing="dhcp", services=["web", "iperf", "web"])
+    assert pc["addressing"] == "dhcp" and pc["services"] == ["iperf", "web"]
+    client.rt.sh.history.clear()
+    assert client.post(f"/api/labs/{lab}/nodes/{pc['id']}/start").status_code == 200
+    flat = [" ".join(c) for c in client.rt.sh.history]
+    ns = f"mbc{pc['id']}"
+    assert not any(" addr add " in c for c in flat)  # no fixed address
+    udhcpc = next(c for c in flat if "udhcpc" in c)
+    assert udhcpc.startswith(f"ip netns exec {ns} busybox udhcpc -f -i eth0 -s ") and "-x hostname:PC1" in udhcpc
+    assert any(c.startswith(f"ip netns exec {ns} ") and "http.server 80" in c for c in flat)
+    assert f"ip netns exec {ns} iperf3 -s" in flat
+    assert (client.tmp / "etcns" / ns / "resolv.conf").exists()  # before udhcpc runs
+    assert "Hello from PC1" in (client.tmp / "run" / f"n{pc['id']}.www" / "index.html").read_text()
+
+
+def test_client_dhcp_and_dns_server(client):
+    lab = make_lab(client)
+    r1 = add_node(client, lab, name="R1")
+    client.post(f"/api/labs/{lab}/links", json={"a": {"node": r1["id"], "port": 1}})
+    add_node(client, lab, kind="client", name="PC2", address="192.168.10.20/24")
+    url = f"/api/labs/{lab}/nodes"
+    bad = client.post(url, json={"kind": "client", "name": "S0", "addressing": "dhcp", "services": ["dhcp"]})
+    assert bad.status_code == 400 and "fixed address" in bad.json()["detail"]
+    assert client.post(url, json={"kind": "client", "name": "S1", "address": "10.0.0.1/30",
+                                  "services": ["dhcp"]}).status_code == 400  # no room for a pool
+    assert client.post(url, json={"name": "R9", "services": ["web"]}).status_code == 400  # clients only
+    srv = add_node(client, lab, kind="client", name="SRV", address="192.168.10.2/24", gateway="192.168.10.1",
+                   dns="9.9.9.9", services=["dhcp", "dns"])
+    client.rt.sh.history.clear()
+    client.post(f"/api/labs/{lab}/nodes/{srv['id']}/start")
+    dnsmasq = next(c for c in client.rt.sh.history if "dnsmasq" in c)
+    assert dnsmasq[:4] == ["ip", "netns", "exec", f"mbc{srv['id']}"]
+    for arg in ("--keep-in-foreground", "--interface=eth0", "--port=53", "--server=9.9.9.9", "--domain=lab",
+                "--dhcp-range=192.168.10.100,192.168.10.199,255.255.255.0,1h",
+                "--dhcp-option=3,192.168.10.1", "--dhcp-option=6,192.168.10.2"):
+        assert arg in dnsmasq, arg
+    hosts = (client.tmp / "run" / f"n{srv['id']}.hosts").read_text()
+    assert "192.168.10.20 pc2\n" in hosts and "192.168.10.2 srv\n" in hosts and "10.99.1.1 r1\n" in hosts
+    # Changing to DHCP while the DHCP server is on is refused, even in one step.
+    client.post(f"/api/labs/{lab}/nodes/{srv['id']}/stop")
+    assert client.patch(f"{url}/{srv['id']}", json={"addressing": "dhcp"}).status_code == 400
+    assert client.patch(f"{url}/{srv['id']}", json={"addressing": "dhcp", "services": []}).status_code == 200
+
+
+def test_dhcp_pool_sizes():
+    from mikrobox.clients import dhcp_range
+
+    assert dhcp_range("192.168.10.2/24") == ("192.168.10.100", "192.168.10.199", "255.255.255.0")
+    assert dhcp_range("10.1.1.1/28") == ("10.1.1.8", "10.1.1.14", "255.255.255.240")
+    assert dhcp_range("10.1.0.1/16") == ("10.1.0.100", "10.1.0.199", "255.255.0.0")
+    with pytest.raises(ValueError):
+        dhcp_range("10.0.0.1/30")
+
+
+def test_udhcpc_script_writes_only_the_clients_resolv_conf(tmp_path):
+    import os, stat, subprocess
+    from mikrobox.clients import UDHCPC_SCRIPT
+
+    script = tmp_path / "udhcpc.sh"
+    script.write_text(UDHCPC_SCRIPT)
+    script.chmod(script.stat().st_mode | stat.S_IEXEC)
+    fakebin = tmp_path / "bin"
+    fakebin.mkdir()
+    (fakebin / "ip").write_text(f"#!/bin/sh\necho \"$@\" >> {tmp_path}/ip.log\n")
+    (fakebin / "ip").chmod(0o755)
+    resolv = tmp_path / "resolv.conf"
+    resolv.write_text("old\n")
+    env = {"PATH": f"{fakebin}:{os.environ['PATH']}", "interface": "eth0", "ip": "192.168.88.254",
+           "subnet": "255.255.255.0", "router": "192.168.88.1", "dns": "192.168.88.1 1.1.1.1",
+           "MIKROBOX_RESOLV": str(resolv)}
+    assert subprocess.run([str(script), "bound"], env=env).returncode == 0
+    calls = (tmp_path / "ip.log").read_text().splitlines()
+    assert calls == ["-4 addr flush dev eth0", "addr add 192.168.88.254/255.255.255.0 dev eth0",
+                     "route del default", "route add default via 192.168.88.1 dev eth0"]
+    assert resolv.read_text() == "nameserver 192.168.88.1\nnameserver 1.1.1.1\n"
+    # With mask (CIDR bits) set, that is used instead of the dotted subnet.
+    (tmp_path / "ip.log").unlink()
+    subprocess.run([str(script), "renew"], env={**env, "mask": "24", "dns": ""})
+    assert "addr add 192.168.88.254/24 dev eth0" in (tmp_path / "ip.log").read_text()
+    assert resolv.read_text() == "nameserver 192.168.88.1\nnameserver 1.1.1.1\n"  # untouched without DNS
+
+
+def test_client_services_are_stopped(client, tmp_path):
+    import subprocess, sys, time as _time
+
+    lab = make_lab(client)
+    pc = add_node(client, lab, kind="client", name="PC1", services=["iperf"])
+    node = client.rt.store.state.lab(lab).node(pc["id"])
+    proc = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)", "iperf3"])
+    client.rt.s.run_dir.mkdir(parents=True, exist_ok=True)
+    (client.rt.s.run_dir / f"n{node.id}.svc-iperf.pid").write_text(f"{proc.pid}\n")
+    client.rt.clients.stop(node)
+    assert proc.wait(timeout=5) is not None
+    assert not (client.rt.s.run_dir / f"n{node.id}.svc-iperf.pid").exists()
+
+
+def test_throughput_test_command(client, monkeypatch):
+    lab = make_lab(client)
+    pc = add_node(client, lab, kind="client", name="PC1")
+    monkeypatch.setattr(client.rt, "node_running", lambda n: True)
+    r = client.post(f"/api/labs/{lab}/nodes/{pc['id']}/test", json={"target": "10.0.0.2", "tool": "iperf"}).json()
+    assert r["command"].startswith("iperf3 -c 10.0.0.2 -t 5")
+
+
+# -- full packet decode --------------------------------------------------------
+
+TCPDUMP_XX = """\
+21:49:03.648828 00:00:00:00:00:00 > 00:00:00:00:00:00, ethertype IPv4 (0x0800), length 71: 127.0.0.1.54004 > 127.0.0.1.53: 4660+ A? example.com. (29)
+\t0x0000:  0000 0000 0000 0000 0000 0000 0800 4500
+\t0x0010:  0039 adfe 4000 4011 8eb3 7f00 0001 7f00
+\t0x0020:  0001 d2f4 0035 0025 fe38 1234 0100 0001
+\t0x0030:  0000 0000 0000 0765 7861 6d70 6c65 0363
+\t0x0040:  6f6d 0000 0100 01
+21:49:03.700001 52:54:00:00:01:02 > ff:ff:ff:ff:ff:ff, ethertype ARP (0x0806), length 42: Request who-has 10.0.12.2 tell 10.0.12.1, length 28
+\t0x0000:  ffff ffff ffff 5254 0000 0102 0806 0001
+\t0x0010:  0800 0604 0001 5254 0000 0102 0a00 0c01
+\t0x0020:  0000 0000 0000 0a00 0c02
+"""
+
+
+def test_tcpdump_hex_is_joined_to_its_packet():
+    from mikrobox.packets import Assembler
+
+    asm = Assembler()
+    done = []
+    for line in TCPDUMP_XX.splitlines():
+        done += asm.feed(line)
+    assert len(done) == 1 and done[0][0]["proto"] == "DNS" and len(done[0][1]) == 71
+    assert done[0][1][12:14] == b"\x08\x00"
+    last = asm.flush()
+    assert last[0][0]["proto"] == "ARP" and len(last[0][1]) == 42 and asm.flush() == []
+    # Lines tcpdump could not summarise drop their bytes with them.
+    asm.feed("tcpdump: something odd")
+    asm.feed("\t0x0000:  ffff")
+    assert asm.flush() == []
+
+
+def test_pdml_becomes_a_tree():
+    from mikrobox.packets import parse_pdml
+
+    pdml = """<?xml version="1.0"?><pdml><packet>
+      <proto name="geninfo" pos="0" showname="General information" size="42"/>
+      <proto name="eth" showname="Ethernet II, Src: 52:54:00:00:01:02" size="14" pos="0">
+        <field name="eth.dst" showname="Destination: Broadcast" size="6" pos="0" show="ff:ff:ff:ff:ff:ff"/>
+        <field name="eth.dst_resolved" showname="Destination (resolved)" hide="yes" size="6" pos="0"/>
+        <field name="eth.type" showname="Type: ARP (0x0806)" size="2" pos="12" show="0x0806"/>
+      </proto>
+      <proto name="arp" showname="Address Resolution Protocol (request)" size="28" pos="14">
+        <field name="" show="Some text without a name" size="0" pos="14"/>
+        <field name="arp.opcode" size="2" pos="20" show="1"/>
+      </proto>
+      <proto name="fake-field-wrapper"><field name="_ws.expert" showname="Expert Info" size="0" pos="0"/></proto>
+    </packet></pdml>"""
+    tree = parse_pdml(pdml)
+    assert [n["t"] for n in tree] == ["Ethernet II, Src: 52:54:00:00:01:02", "Address Resolution Protocol (request)", "Expert Info"]
+    eth = tree[0]
+    assert (eth["p"], eth["s"]) == (0, 14) and [c["t"] for c in eth["c"]] == ["Destination: Broadcast", "Type: ARP (0x0806)"]
+    assert tree[1]["c"][0] == {"t": "Some text without a name"}  # size 0: nothing to highlight
+    assert tree[1]["c"][1] == {"t": "arp.opcode: 1", "n": "arp.opcode", "p": 20, "s": 2}
+    assert eth["n"] == "eth" and "n" not in tree[2]
+
+
+def test_tshark_never_runs_as_root(monkeypatch):
+    from mikrobox import packets
+
+    monkeypatch.setattr(packets.os, "geteuid", lambda: 0)
+    monkeypatch.setattr(packets.shutil, "which", lambda name: "/usr/bin/" + name)
+    assert packets.tshark_argv()[:4] == ["setpriv", "--reuid=nobody", "--regid=nogroup", "--clear-groups"]
+    monkeypatch.setattr(packets.os, "geteuid", lambda: 1000)
+    assert packets.tshark_argv()[0] == "tshark"
+
+
+def test_live_packets_can_be_decoded(client, tmp_path, monkeypatch):
+    import os, shutil
+
+    fake = tmp_path / "fakebin"
+    fake.mkdir()
+    (tmp_path / "td.txt").write_text(TCPDUMP_XX)
+    (fake / "tcpdump").write_text(f"#!/bin/sh\ncat {tmp_path / 'td.txt'}\nexec sleep 30\n")
+    (fake / "tcpdump").chmod(0o755)
+    monkeypatch.setenv("PATH", f"{fake}:{os.environ['PATH']}")
+    lab = make_lab(client)
+    r1 = add_node(client, lab, name="R1")
+    monkeypatch.setattr(client.rt.net, "exists", lambda iface: True)
+    with client.websocket_connect(f"/api/labs/{lab}/nodes/{r1['id']}/ports/1/packets") as ws:
+        rows = ws.receive_json()["packets"]
+        assert [(r["n"], r["proto"]) for r in rows] == [(1, "DNS"), (2, "ARP")]
+        ws.send_json({"decode": 99})
+        assert "no longer kept" in ws.receive_json()["error"]
+        ws.send_json({"decode": 2})
+        got = ws.receive_json()
+        assert got["decoded"] == 2
+        if shutil.which("tshark"):
+            names = [n["t"] for n in got["tree"]]
+            assert names[1].startswith("Ethernet II") and names[2].startswith("Address Resolution Protocol (request)")
+            assert got["hex"].startswith("ffffffffffff52540000") and got["length"] == 42
+            arp = got["tree"][2]
+            target = next(c for c in arp["c"] if c["t"].startswith("Target IP address"))
+            assert (target["p"], target["s"], target["t"]) == (38, 4, "Target IP address: 10.0.12.2")
+        else:
+            assert "needs tshark" in got["error"]

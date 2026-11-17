@@ -32,6 +32,8 @@ class Node(BaseModel):
     address: Optional[str] = None
     gateway: Optional[str] = None
     dns: Optional[str] = None  # one to three resolver addresses, comma separated
+    addressing: Literal["static", "dhcp"] = "static"  # clients: fixed address, or ask DHCP
+    services: list[Literal["web", "iperf", "dhcp", "dns"]] = Field(default_factory=list)  # clients only
     # Position on the topology canvas.
     x: float = 0
     y: float = 0

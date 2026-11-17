@@ -23,6 +23,8 @@ import time
 from http.cookies import SimpleCookie
 from pathlib import Path
 
+from .events import CURRENT_USER
+
 COOKIE = "mikrobox_session"
 SESSION_SECONDS = 30 * 24 * 3600
 USERNAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,31}$")
@@ -200,7 +202,11 @@ class AuthMiddleware:
         user = self.auth.user_from_headers(dict(scope.get("headers") or []))
         if user:
             scope.setdefault("state", {})["user"] = user
-            return await self.app(scope, receive, send)
+            token = CURRENT_USER.set(user)  # so the activity log knows who did it
+            try:
+                return await self.app(scope, receive, send)
+            finally:
+                CURRENT_USER.reset(token)
         if scope["type"] == "websocket":
             await receive()
             await send({"type": "websocket.close", "code": 4401})

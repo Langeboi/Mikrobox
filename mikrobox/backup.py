@@ -42,6 +42,8 @@ def _meaningful(text: str) -> list[str]:
 class Backups:
     def __init__(self, rt) -> None:
         self.rt = rt
+        self.activity = None  # set by the API: automatic runs are logged there
+        self.events = None
         self.dir = rt.s.data_dir / "backups"
         self.file = rt.s.data_dir / "backup.json"
         self.lock = threading.RLock()
@@ -271,5 +273,11 @@ class Backups:
                         results = self.run(lab)
                         log.info("backup of lab %s: %s", lab.name,
                                  ", ".join(f"{r['name']}: {r['message']}" for r in results) or "no routers")
+                        changed = [r["name"] for r in results if r.get("changed")]
+                        if changed and self.activity:
+                            self.activity.record(f"Automatic backup saved new revisions of {', '.join(changed)}",
+                                                 lab, kind="system")
+                        if self.events:
+                            self.events.publish({"t": "labs"})
             except Exception:
                 log.exception("automatic backup failed")

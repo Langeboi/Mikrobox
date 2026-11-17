@@ -63,10 +63,15 @@ def markdown(lab: Lab, rt, backups, has_image: bool) -> str:
     if not lab.links:
         out.append("| (no links) | | | |")
 
-    clients = [n for n in lab.nodes if n.kind == NodeKind.client and (n.address or n.gateway or n.dns)]
+    clients = [n for n in lab.nodes if n.kind == NodeKind.client
+               and (n.address or n.gateway or n.dns or n.addressing == "dhcp" or n.services)]
     if clients:
-        out += ["", "## Client addressing", "", "| Client | Address | Gateway | DNS |", "|---|---|---|---|"]
-        out += [f"| {_cell(n.name)} | {n.address or ''} | {n.gateway or ''} | {n.dns or ''} |" for n in clients]
+        names = {"web": "web", "iperf": "iperf3", "dhcp": "DHCP server", "dns": "DNS server"}
+        out += ["", "## Clients", "", "| Client | Address | Gateway | DNS | Runs |", "|---|---|---|---|---|"]
+        for n in clients:
+            dhcp = n.addressing == "dhcp"
+            out.append(f"| {_cell(n.name)} | {'DHCP' if dhcp else n.address or ''} | {'' if dhcp else n.gateway or ''} "
+                       f"| {'' if dhcp else n.dns or ''} | {', '.join(names[s] for s in n.services)} |")
 
     areas = [a for a in lab.annotations if a.kind in AREA_KINDS and a.text.strip()]
     if areas:

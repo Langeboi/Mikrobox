@@ -47,6 +47,7 @@
   <div class="menu">
     <button type="button" class="menu-btn" aria-haspopup="true">Tools</button>
     <div class="menu-list" hidden>
+      <button type="button" data-act="tool-activity">Activity</button>
       <button type="button" data-act="tool-packets" data-needs-lab>Packet view</button>
       <button type="button" data-act="tool-test" data-needs-lab>Connectivity test</button>
       <hr>
@@ -88,6 +89,7 @@
     <aside id="inspector" aria-label="Details" hidden></aside>
   </div>
   <section id="dock" hidden aria-label="Consoles">
+    <div id="dock-grip" role="separator" aria-orientation="horizontal" aria-label="Resize the panel (arrow keys)" tabindex="0" title="Drag to resize. Double-click to switch between small and tall."></div>
     <div id="tabs"></div>
     <div id="terms"></div>
   </section>

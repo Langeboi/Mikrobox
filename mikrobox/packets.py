@@ -95,3 +95,145 @@ def parse_line(line: str) -> dict | None:
     if vlan is not None:
         row["info"] = f"VLAN {vlan}  {row['info']}"
     return row
+
+
+# -- full decode --------------------------------------------------------------
+#
+# The live view runs `tcpdump -xx`, which prints each packet's bytes as hex lines
+# under its summary line. The server keeps the bytes of recent packets, and when
+# someone opens one it is handed to tshark on its own, so the browser can show the
+# same protocol tree and byte view as Wireshark. Each packet is decoded alone: TCP
+# streams are not reassembled across packets (download the pcap for that).
+
+import asyncio
+import os
+import shutil
+import struct
+import tempfile
+import xml.etree.ElementTree as ET
+
+
+class Assembler:
+    """Joins tcpdump -xx output (a summary line, then indented hex lines) into packets."""
+
+    def __init__(self) -> None:
+        self.row: dict | None = None
+        self.hex: list[str] = []
+
+    def feed(self, line: str) -> list[tuple[dict, bytes]]:
+        if line[:1] in (" ", "\t"):
+            body = line.strip()
+            if self.row is not None and body.startswith("0x") and ":" in body:
+                self.hex.append("".join(body.split(":", 1)[1].split()))
+            return []
+        done = self.flush()
+        self.row = parse_line(line)
+        return done
+
+    def flush(self) -> list[tuple[dict, bytes]]:
+        row, hexes = self.row, self.hex
+        self.row, self.hex = None, []
+        if row is None:
+            return []
+        try:
+            return [(row, bytes.fromhex("".join(hexes)))]
+        except ValueError:
+            return [(row, b"")]
+
+
+def pcap_of(data: bytes, ts: float, length: int | None = None) -> bytes:
+    """A one-packet pcap file (Ethernet link type)."""
+    head = struct.pack("<IHHiIII", 0xA1B2C3D4, 2, 4, 0, 0, 262144, 1)
+    sec = int(ts)
+    rec = struct.pack("<IIII", sec, int((ts - sec) * 1_000_000), len(data), max(length or 0, len(data)))
+    return head + rec + data
+
+
+MAX_TREE = 4000  # fields; a normal packet has well under a few hundred
+
+
+def parse_pdml(text: str) -> list[dict]:
+    """tshark -T pdml for one packet -> [{"t": text, "p": byte offset, "s": size, "c": [...]}, ...]"""
+    root = ET.fromstring(text)
+    packet = root.find("packet")
+    if packet is None:
+        return []
+    count = 0
+
+    def node(el) -> dict | None:
+        nonlocal count
+        if el.get("hide") == "yes" or count >= MAX_TREE:
+            return None
+        name, show, showname = el.get("name") or "", el.get("show"), el.get("showname")
+        text = showname or (f"{name}: {show}" if name and show is not None else show or name)
+        kids = nodes(el)
+        if not text:
+            return None
+        count += 1
+        out = {"t": text}
+        if name and not name.startswith("_ws."):
+            out["n"] = name  # lets the page remember which parts were expanded
+        try:
+            pos, size = int(el.get("pos", "")), int(el.get("size", ""))
+            if size > 0:
+                out["p"], out["s"] = pos, size
+        except ValueError:
+            pass
+        if kids:
+            out["c"] = kids
+        return out
+
+    def nodes(el) -> list[dict]:
+        out = []
+        for child in el:
+            if child.tag not in ("proto", "field"):
+                continue
+            if child.get("name") == "geninfo":
+                continue
+            if child.get("name") == "fake-field-wrapper":
+                out += nodes(child)
+                continue
+            n = node(child)
+            if n:
+                out.append(n)
+        return out
+
+    return nodes(packet)
+
+
+def tshark_argv() -> list[str]:
+    argv = ["tshark", "-r", "-", "-n", "-T", "pdml"]
+    # Dissectors parse whatever is on the wire; never do that as root.
+    if os.geteuid() == 0 and shutil.which("setpriv"):
+        argv = ["setpriv", "--reuid=nobody", "--regid=nogroup", "--clear-groups", "--", *argv]
+    return argv
+
+
+async def decode(data: bytes, ts: float, length: int | None = None) -> dict:
+    if not data:
+        return {"error": "No bytes were captured for this packet."}
+    if not shutil.which("tshark"):
+        return {"error": "Full decode needs tshark. Run the installer again, or: apt install tshark"}
+    # tshark only reads a capture from stdin when it is a pipe or a file, and some event
+    # loops (uvloop, under uvicorn) give subprocesses socket pairs. An unlinked temp file
+    # works everywhere, and the unprivileged tshark reads it through the inherited descriptor.
+    with tempfile.TemporaryFile() as f:
+        f.write(pcap_of(data, ts, length))
+        f.flush()
+        f.seek(0)
+        proc = await asyncio.create_subprocess_exec(
+            *tshark_argv(), stdin=f, stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE, env={**os.environ, "HOME": "/tmp"})
+        try:
+            out, err = await asyncio.wait_for(proc.communicate(), 15)
+        except asyncio.TimeoutError:
+            proc.kill()
+            return {"error": "tshark took too long on this packet."}
+    try:
+        tree = parse_pdml(out.decode(errors="replace"))
+    except ET.ParseError:
+        tree = []
+    if not tree:
+        msg = [l for l in err.decode(errors="replace").splitlines() if l and "dangerous" not in l]
+        return {"error": msg[-1] if msg else "tshark could not decode this packet."}
+    return {"tree": tree, "hex": data.hex(), "length": len(data)}

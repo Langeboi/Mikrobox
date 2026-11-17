@@ -13,6 +13,7 @@ from pathlib import Path
 from . import __version__
 from .config import Settings
 from .models import Endpoint, Lab, Link, Node, NodeKind
+from .clients import ClientServices
 from .ksm import Ksm
 from .network import Net, pid_alive
 from .platforms import PLATFORMS, is_vm, platform
@@ -51,6 +52,7 @@ class Runtime:
         self.sh = sh or Shell(dry_run=settings.dry_run)
         self.net = Net(settings, self.sh)
         self.ksm = Ksm(settings)
+        self.clients = ClientServices(self)
         self.lock = threading.RLock()
         self.cloud_ips: dict[str, str] = {}  # MAC -> address, discovered in bridged mode
         self._scanner: threading.Thread | None = None
@@ -255,14 +257,17 @@ class Runtime:
             if is_vm(node):
                 self._start_vm(node)
             else:
+                self.clients.stop(node)  # leftovers from a crash
                 self.net.delete_client(self.netns(node.id))
+                static = node.addressing == "static"
                 self.net.create_client(
                     self.netns(node.id),
                     [self.iface(node.id, p) for p in range(1, node.ports + 1)],
-                    node.address,
-                    node.gateway,
-                    node.dns,
+                    node.address if static else None,
+                    node.gateway if static else None,
+                    node.dns if static else None,
                 )
+                self.clients.start(lab, node)
             for link in lab.links:
                 if link.touches(node.id):
                     self.apply_link(lab, link)
@@ -309,6 +314,7 @@ class Runtime:
                 for port in range(1, node.ports + 1):
                     self.net.delete(self.iface(node.id, port))
             else:
+                self.clients.stop(node)
                 self.net.delete_client(self.netns(node.id))
 
     def _kill(self, pidfile: Path) -> None:

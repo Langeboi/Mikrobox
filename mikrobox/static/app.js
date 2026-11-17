@@ -150,20 +150,23 @@ window.addEventListener("pagehide", () => {
   const body = new Blob([JSON.stringify({ client: CLIENT })], { type: "application/json" });
   if (navigator.sendBeacon) navigator.sendBeacon("/api/presence/leave", body);
 });
-const WHO_COLORS = ["purple", "green", "amber", "red", "blue"];
-const whoColor = (name) => WHO_COLORS[[...name].reduce((sum, ch) => sum + ch.charCodeAt(0), 0) % WHO_COLORS.length];
+const WHO_COLORS = ["purple", "green", "amber", "red", "blue", "teal", "pink"];
+// FNV-1a: a stable colour per name that spreads short names well.
+const whoColor = (name) => WHO_COLORS[[...name].reduce((hash, ch) => Math.imul(hash ^ ch.charCodeAt(0), 16777619) >>> 0, 2166136261) % WHO_COLORS.length];
+
+const beatBody = () => ({ client: CLIENT, lab: state.lab ? state.lab.id : null,
+  node: state.sel && state.sel.type === "node" ? state.sel.id : null });
 
 async function refresh(force) {
-  const beat = { client: CLIENT, lab: state.lab ? state.lab.id : null,
-    node: state.sel && state.sel.type === "node" ? state.sel.id : null };
   const [labs, sys, pres] = await Promise.all([api("GET", "/labs"), api("GET", "/system"),
-    api("POST", "/presence", beat).catch(() => ({ others: [] }))]);
+    api("POST", "/presence", beatBody()).catch(() => ({ others: [] }))]);
   state.labs = labs;
   state.sys = sys;
   state.others = pres.others;
   const before = state.lab ? state.lab.id : null;
   const wanted = before ?? readStore("lab", null);
   state.lab = labs.find((l) => l.id === wanted) || labs[0] || null;
+  if (state.lab) noteChanges(state.lab);
   if (state.lab && state.lab.id !== before) loadView();
   if (textEdit && state.lab) {
     // Keep what is being typed; the server copy is a moment behind.
@@ -240,6 +243,7 @@ function selectedRouter() {
 function select(ref) {
   state.sel = ref;
   render(true);
+  beatSoon(); // others see what you selected straight away
 }
 
 function setTool(tool) {
@@ -353,7 +357,7 @@ function renderTop() {
       type: "button", class: on ? "on" : "", title: t.tip, "aria-pressed": t.add ? null : String(on),
       disabled: !state.lab && t.id !== "select",
       onclick: () => (t.add ? addNodeDialog(t.id) : setTool(t.id)),
-    }, icon(t.id), t.label);
+    }, icon(t.id), h("span", { class: "lbl" }, t.label));
   }));
 
   const draw = !!DRAW[state.tool];
@@ -420,6 +424,49 @@ function annoElement(a, selected) {
   return g;
 }
 
+// ---------------------------------------------------------------- motion
+//
+// Short animations for what just changed: a device starting or stopping, a new device,
+// a new link, a link coming up. The canvas is rebuilt on every update, so each change is
+// noted with its time and the rebuilt element starts its animation that far in (a negative
+// delay): it plays once, smoothly, however often the canvas redraws. Only changes seen
+// while a lab is open animate, never what was already there when it loaded. Turned off
+// for people who ask their system for reduced motion (see app.css).
+const MOTION_MS = { start: 1400, stop: 800, add: 420, link: 520, up: 1000 };
+const motion = { lab: null, seen: null, nodes: new Map(), links: new Map() };
+const linkUp = (lab, l) => {
+  const a = lab.nodes.find((n) => n.id === l.a.node), b = l.b && lab.nodes.find((n) => n.id === l.b.node);
+  return !!(a && a.running && (l.b ? b && b.running : true));
+};
+function noteChanges(lab) {
+  const now = performance.now();
+  const cur = { nodes: new Map(lab.nodes.map((n) => [n.id, n.running])), links: new Map(lab.links.map((l) => [l.id, linkUp(lab, l)])) };
+  const prev = motion.lab === lab.id ? motion.seen : null;
+  if (prev) {
+    for (const [id, running] of cur.nodes) {
+      if (!prev.nodes.has(id)) motion.nodes.set(id, { kind: "add", at: now });
+      else if (running !== prev.nodes.get(id)) motion.nodes.set(id, { kind: running ? "start" : "stop", at: now });
+    }
+    for (const [id, up] of cur.links) {
+      if (!prev.links.has(id)) motion.links.set(id, { kind: "link", at: now });
+      else if (up && !prev.links.get(id)) motion.links.set(id, { kind: "up", at: now });
+    }
+  } else {
+    motion.nodes.clear();
+    motion.links.clear();
+  }
+  motion.lab = lab.id;
+  motion.seen = cur;
+}
+// " m-<kind>" and the delay to put on the element, or null when nothing is playing.
+function motionOf(map, id) {
+  const m = map.get(id);
+  if (!m) return null;
+  const t = performance.now() - m.at;
+  if (t >= MOTION_MS[m.kind]) { map.delete(id); return null; }
+  return { cls: " m-" + m.kind, kind: m.kind, style: `--md:${-Math.round(t)}ms` };
+}
+
 function renderCanvas() {
   const world = $("#world");
   world.replaceChildren();
@@ -469,13 +516,15 @@ function renderCanvas() {
       const da = Math.min(60 + 14 * Math.max(0, uy), len * 0.45);
       const db = Math.min(60 + 14 * Math.max(0, -uy), len * 0.45);
       const up = na.running && (nb ? nb.running : true);
+      const mo = motionOf(motion.links, l.id);
       const down = (e) => {
         if (state.tool !== "select") return; // drawing or linking passes through
         e.stopPropagation();
         select({ type: "link", id: l.id });
       };
       world.append(
-        s("g", { class: "link" + (isSel("link", l.id) ? " sel" : "") + (up ? " up" : "") },
+        s("g", { class: "link" + (isSel("link", l.id) ? " sel" : "") + (up ? " up" : "") + (mo ? mo.cls : ""),
+          style: mo ? `${mo.style};--len:${Math.hypot(B.x - A.x, B.y - A.y).toFixed(1)}` : null },
           s("line", { class: "vis", x1: A.x, y1: A.y, x2: B.x, y2: B.y }),
           prefs.labels && s("text", { x: A.x + ux * da, y: A.y + uy * da + 4 }, portName(na, l.a.port)),
           prefs.labels && nb && s("text", { x: B.x - ux * db, y: B.y - uy * db + 4 }, portName(nb, l.b.port)),
@@ -507,15 +556,22 @@ function renderCanvas() {
   );
   for (const n of lab.nodes) {
     const ref = { type: "node", id: n.id };
+    const mo = motionOf(motion.nodes, n.id);
     world.append(
-      s("g", { class: cls(ref, (n.running ? " running" : "") + ` k-${n.kind}`), transform: `translate(${n.x},${n.y})`, ...handlers(ref) },
-        s("title", {}, `${n.name} (${n.running ? "running" : "stopped"})`),
-        s("rect", { class: "box", x: -30, y: -30, width: 60, height: 60, rx: 14 }),
-        s("path", { class: "glyph", d: ICONS[n.kind === "client" ? "client" : n.role === "switch" ? "switch" : "chr"], transform: "translate(-19.2,-19.2) scale(1.6)", "vector-effect": "non-scaling-stroke" }),
-        osBadge(n),
-        s("circle", { class: "dot", cx: 26, cy: -26, r: 6.5 }),
-        s("text", { y: 48 }, n.name),
-        s("text", { class: "sub", y: 62 }, n.mgmt_ip || (n.kind === "client" && n.address) || ""),
+      s("g", { class: cls(ref, (n.running ? " running" : "") + ` k-${n.kind}` + (mo ? mo.cls : "")), transform: `translate(${n.x},${n.y})`,
+        style: mo ? mo.style : null, ...handlers(ref) },
+        s("title", {}, `${n.name} (${n.running ? "running" : "stopped"})` +
+          (n.services && n.services.length ? `\nRuns: ${n.services.map((x) => SERVICES.find((d) => d[0] === x)[1]).join(", ")}` : "")),
+        // Its own group, so an animation can scale the tile without touching where it sits.
+        s("g", { class: "tile" },
+          s("rect", { class: "box", x: -30, y: -30, width: 60, height: 60, rx: 14 }),
+          s("path", { class: "glyph", d: ICONS[n.kind === "client" ? "client" : n.role === "switch" ? "switch" : "chr"], transform: "translate(-19.2,-19.2) scale(1.6)", "vector-effect": "non-scaling-stroke" }),
+          osBadge(n),
+          mo && mo.kind === "start" && [s("circle", { class: "ripple", cx: 26, cy: -26, r: 6.5 }),
+                                        s("circle", { class: "ripple r2", cx: 26, cy: -26, r: 6.5 })],
+          s("circle", { class: "dot", cx: 26, cy: -26, r: 6.5 }),
+          s("text", { y: 48 }, n.name),
+          s("text", { class: "sub", y: 62 }, n.mgmt_ip || (n.kind === "client" && clientAddress(n)) || "")),
       ),
     );
   }
@@ -773,15 +829,20 @@ function addNodeDialog(tool) {
   if (tool === "client") {
     openModal("Add client", [
       { key: "name", label: "Hostname", value: nextName("PC") },
+      { key: "addressing", label: "Addressing", type: "select", value: "static",
+        options: [{ value: "static", label: "Fixed address" }, { value: "dhcp", label: "Ask DHCP for an address" }] },
       { key: "address", label: "IP address (optional)", placeholder: "192.168.10.2/24" },
       { key: "gateway", label: "Gateway (optional)", placeholder: "192.168.10.1" },
       { key: "dns", label: "DNS servers (optional)", placeholder: "1.1.1.1, 9.9.9.9" },
+      { node: h("p", { class: "hint" }, "Web, iperf3, DHCP and DNS servers can be switched on in the client's settings.") },
     ], "Add", async (v) => {
-      const body = { kind: "client", name: v.name, ...at };
-      for (const k of ["address", "gateway", "dns"]) if (v[k]) body[k] = v[k];
+      const body = { kind: "client", name: v.name, addressing: v.addressing, ...at };
+      if (v.addressing !== "dhcp") for (const k of ["address", "gateway", "dns"]) if (v[k]) body[k] = v[k];
       const node = await api("POST", `${labPath()}/nodes`, body);
       state.sel = { type: "node", id: node.id };
     });
+    const mode = $("#m-addressing");
+    mode.addEventListener("change", () => { for (const k of ["address", "gateway", "dns"]) $("#m-" + k).disabled = mode.value === "dhcp"; });
     return;
   }
   addDeviceDialog(tool === "switch" ? "switch" : "router", at);
@@ -926,6 +987,18 @@ function imagesDialog(kind, reason) {
       if (st.state === "error") { progress.hidden = true; showStatus(info); throw new Error(st.message); }
     }
   });
+}
+
+// What a client runs, in the words shown in the inspector and on hover.
+const SERVICES = [
+  ["web", "Web server", "Serves a small page on port 80. Try curl from another client."],
+  ["iperf", "iperf3 server", "Target for throughput tests from other clients."],
+  ["dhcp", "DHCP server", "Hands out addresses .100 to .199 of its subnet, with its gateway and DNS."],
+  ["dns", "DNS server", "Answers for every device in the lab as <name>.lab and forwards the rest."],
+];
+function clientAddress(n) {
+  if (n.addressing === "dhcp") return n.leased || (n.running ? "DHCP…" : "DHCP");
+  return n.address || "";
 }
 
 // ------------------------------------------------- router config tools
@@ -1156,9 +1229,12 @@ function nodeInspector(n) {
     inputs[key] = h("input", { id, type, value: n[key] ?? "", disabled: n.running, ...extra });
     return h("div", { class: "field" }, h("label", { for: id }, label), inputs[key]);
   };
+  const svcBoxes = {};
   const save = () => act(async () => {
     const body = {};
+    const dhcp = inputs.addressing && inputs.addressing.value === "dhcp";
     for (const [k, input] of Object.entries(inputs)) {
+      if (dhcp && (k === "address" || k === "gateway" || k === "dns")) continue;  // kept for switching back
       const raw = input.value.trim();
       const value = input.type === "number" ? Number(raw) : (raw || null);
       if (value !== n[k] && !(input.type === "number" && !raw)) body[k] = value;
@@ -1167,6 +1243,27 @@ function nodeInspector(n) {
   });
   const path = `${labPath()}/nodes/${n.id}`;
   const reachable = n.running && !!n.cloud_port;
+  const clientFields = () => {
+    const mode = h("select", { id: "i-addressing", disabled: n.running },
+      h("option", { value: "static" }, "Fixed address"), h("option", { value: "dhcp" }, "DHCP"));
+    mode.value = n.addressing || "static";
+    inputs.addressing = mode;
+    const fixed = [field("address", "IP address", "text", { placeholder: "192.168.10.2/24" }),
+                   field("gateway", "Gateway", "text", { placeholder: "192.168.10.1" }),
+                   field("dns", "DNS servers", "text", { placeholder: "1.1.1.1, 9.9.9.9" })];
+    const lease = h("p", { class: "lease" });
+    const sync = () => {
+      const dhcp = mode.value === "dhcp";
+      for (const k of ["address", "gateway", "dns"]) inputs[k].disabled = n.running || dhcp;
+      for (const f of fixed) f.hidden = dhcp;
+      lease.hidden = !dhcp;
+      lease.textContent = !n.running ? "Asks for an address, gateway and DNS when it starts."
+        : n.leased ? `Leased ${n.leased}.` : "Waiting for a DHCP server to answer.";
+    };
+    mode.addEventListener("change", sync);
+    sync();
+    return [h("div", { class: "field" }, h("label", { for: "i-addressing" }, "Addressing"), mode), lease, ...fixed];
+  };
 
   const rows = [];
   for (let p = 1; p <= n.ports; p++) {
@@ -1219,12 +1316,19 @@ function nodeInspector(n) {
             field("ports", "Ports + mgmt", "number", { min: 2, max: cxInfo ? cxInfo.max_ports : 17 }),
             field("cpus", "vCPUs", "number", { min: 1, max: 8 }),
             field("ram_mb", "RAM (MB)", "number", { min: cxInfo ? cxInfo.min_ram_mb : 2048 }))
-        : [field("address", "IP address", "text", { placeholder: "192.168.10.2/24" }),
-           field("gateway", "Gateway", "text", { placeholder: "192.168.10.1" }),
-           field("dns", "DNS servers", "text", { placeholder: "1.1.1.1, 9.9.9.9" })],
+        : clientFields(),
       n.running
         ? h("p", {}, "Stop the device to change its settings.")
         : h("button", { type: "button", onclick: save }, "Save changes")),
+    n.kind === "client" && h("section", {}, h("h2", {}, "Services"),
+      SERVICES.map(([key, label, tip]) => {
+        svcBoxes[key] = h("input", { id: "i-svc-" + key, type: "checkbox", checked: (n.services || []).includes(key),
+          disabled: n.running, onchange: () => act(() => api("PATCH", path,
+            { services: Object.keys(svcBoxes).filter((k) => svcBoxes[k].checked) })) });
+        return h("div", { class: "field check svc" }, svcBoxes[key],
+          h("label", { for: "i-svc-" + key }, h("strong", {}, label), h("span", {}, tip)));
+      }),
+      n.running && h("p", {}, "Stop the client to change what it runs.")),
     h("section", {}, h("h2", {}, "Interfaces"), h("table", {}, h("tbody", {}, rows))),
     h("section", {}, h("h2", {}, "Access from your PC"), access),
     isChr && h("section", {}, h("h2", {}, "Configuration"),
@@ -1393,10 +1497,10 @@ function openPackets(node, port) {
   if (!dock.has(key)) {
     const title = `${node.name} ${portName(node, port)}`;
     const path = `${labPath()}/nodes/${node.id}/ports/${port}`;
-    const st = { ws: null, paused: false, n: 0, picked: null };
+    // gen counts connections: packet numbers from the server only mean something on the one that sent them.
+    const st = { ws: null, gen: 0, paused: false, n: 0, picked: null, want: null, cache: new Map(), open: new Set(), closed: new Set() };
     const rows = h("tbody", {});
     const status = h("span", { class: "pv-status" }, "Connecting");
-    const detail = h("div", { class: "pv-detail mono" }, "Select a packet to see tcpdump's full line for it.");
     const filter = h("input", { type: "text", placeholder: "Filter, e.g. icmp   or   port 179   or   not arp", "aria-label": "Capture filter" });
     const scroller = h("div", { class: "pv-scroll" },
       h("table", { class: "pv-table" },
@@ -1406,27 +1510,151 @@ function openPackets(node, port) {
       st.paused = !st.paused;
       pause.textContent = st.paused ? "Resume" : "Pause";
       status.textContent = st.paused ? "Paused" : "Listening";
+      // The server stops keeping new packets too, so everything on screen stays decodable.
+      if (st.ws && st.ws.readyState === 1) st.ws.send(JSON.stringify({ pause: st.paused }));
     } }, "Pause");
+
+    // ---- detail: protocol tree and bytes
+    const sideHead = h("div", { class: "pv-side-head" });
+    const raw = h("div", { class: "pv-raw mono" });
+    const tree = h("div", { class: "pv-tree", role: "tree" });
+    const hex = h("div", { class: "pv-hex mono" });
+    const side = h("div", { class: "pv-side", hidden: true }, sideHead, raw, tree, hex);
+    let bytes = [];  // [hex span, ascii span] per byte
+    let marked = [];
+    let current = null;  // the decoded packet on show
+    const mark = (p, size) => {
+      for (const el of marked) el.classList.remove("hl");
+      marked = [];
+      if (p === undefined) return;
+      for (let i = p; i < Math.min(p + size, bytes.length); i++) for (const el of bytes[i]) { el.classList.add("hl"); marked.push(el); }
+      const first = marked[0];
+      if (first) {
+        const top = first.offsetTop - hex.offsetTop;
+        if (top < hex.scrollTop || top > hex.scrollTop + hex.clientHeight - 16) hex.scrollTop = top - 16;
+      }
+    };
+    let chosen = null;
+    const choose = (row, f) => {
+      if (chosen) chosen.classList.remove("on");
+      chosen = row;
+      row.classList.add("on");
+      mark(f.p, f.s);
+    };
+    const renderTree = (nodes, last) => nodes.map((f, i) => {
+      const row = h("div", { class: "pv-f", tabindex: -1, title: f.n || "" }, f.t);
+      row.addEventListener("click", (e) => { e.preventDefault(); choose(row, f); });
+      row.addEventListener("mouseenter", () => { if (!chosen) mark(f.p, f.s); });
+      row.addEventListener("mouseleave", () => { if (!chosen) mark(); });
+      f.el = row;
+      if (!f.c) return row;
+      const byDefault = last && i === nodes.length - 1;  // the top layer, e.g. OSPF or BGP, starts open
+      const box = h("details", { open: st.open.has(f.n) || (byDefault && !st.closed.has(f.n)) },
+        h("summary", {}, row), h("div", { class: "pv-kids" }, renderTree(f.c, false)));
+      box.addEventListener("toggle", () => {
+        if (!f.n) return;
+        if (box.open) { st.open.add(f.n); st.closed.delete(f.n); } else { st.closed.add(f.n); st.open.delete(f.n); }
+      });
+      f.box = box;
+      return box;
+    });
+    // Clicking a byte selects the smallest field that covers it, opening its parents.
+    const fieldAt = (nodes, i, trail = [], best = { size: Infinity, trail: null }) => {
+      for (const f of nodes) {
+        const here = [...trail, f];
+        if (f.p !== undefined && i >= f.p && i < f.p + f.s && f.s <= best.size) best = { size: f.s, trail: here };
+        if (f.c) best = fieldAt(f.c, i, here, best);
+      }
+      return best;
+    };
+    // Each byte takes 3 columns, plus one extra after the 8th: pad short last lines so the text column lines up.
+    const pad = (k) => 49 - (k * 3 + (k >= 8 ? 1 : 0));
+    const renderHex = (hx) => {
+      bytes = [];
+      marked = [];
+      const lines = [];
+      for (let off = 0; off < hx.length / 2; off += 16) {
+        const hs = [], as = [];
+        for (let i = off; i < Math.min(off + 16, hx.length / 2); i++) {
+          const b = parseInt(hx.substr(i * 2, 2), 16);
+          const a = h("span", { "data-i": i }, hx.substr(i * 2, 2));
+          const c = h("span", { "data-i": i }, b >= 32 && b < 127 ? String.fromCharCode(b) : "·");
+          bytes.push([a, c]);
+          hs.push(a, i % 16 === 7 ? "  " : " ");
+          as.push(c);
+        }
+        lines.push(h("div", {}, h("span", { class: "off" }, off.toString(16).padStart(4, "0")), "  ", ...hs,
+          " ".repeat(pad(hs.length / 2)), " ", h("span", { class: "asc" }, ...as)));
+      }
+      hex.replaceChildren(...lines);
+    };
+    hex.addEventListener("click", (e) => {
+      const i = e.target.dataset && e.target.dataset.i;
+      if (i === undefined || !current) return;
+      const trail = fieldAt(current.tree, Number(i)).trail;
+      if (!trail) return;
+      for (const f of trail.slice(0, -1)) if (f.box) f.box.open = true;
+      const f = trail[trail.length - 1];
+      choose(f.el, f);
+      f.el.scrollIntoView({ block: "nearest" });
+    });
+    const showDecoded = (num, pk, d) => {
+      sideHead.replaceChildren(h("strong", {}, `Packet ${num}`), h("span", {}, d.length ? `${d.length} bytes` : ""),
+        h("button", { type: "button", class: "ghost", title: "Close the details", "aria-label": "Close the details", onclick: closeSide }, "×"));
+      raw.textContent = pk.raw;
+      chosen = null;
+      current = d.tree ? d : null;
+      if (d.error) { tree.replaceChildren(h("p", { class: "pv-note" }, d.error)); hex.replaceChildren(); bytes = []; return; }
+      const frame = d.tree.find((f) => f.n === "frame");
+      if (frame) frame.t = frame.t.replace(/^Frame 1:/, `Frame ${num}:`);
+      tree.replaceChildren(...renderTree(d.tree, true));
+      renderHex(d.hex);
+    };
+    const closeSide = () => {
+      side.hidden = true;
+      if (st.picked) st.picked.classList.remove("on");
+      st.picked = null;
+    };
+
+    const pick = (tr, pk, num) => {
+      if (st.picked) st.picked.classList.remove("on");
+      st.picked = tr;
+      tr.classList.add("on");
+      side.hidden = false;
+      const cached = st.cache.get(tr);
+      if (cached) { showDecoded(num, pk, cached); return; }
+      if (pk.gen !== st.gen || !st.ws || st.ws.readyState !== 1) {
+        showDecoded(num, pk, { error: "This packet is from an earlier capture, so its bytes are gone. Download the pcap to keep traffic." });
+        return;
+      }
+      st.want = { n: pk.n, tr, pk, num };
+      showDecoded(num, pk, { error: "Decoding…" });
+      st.ws.send(JSON.stringify({ decode: pk.n }));
+    };
 
     const add = (list) => {
       const stick = scroller.scrollTop + scroller.clientHeight >= scroller.scrollHeight - 30;
       for (const pk of list) {
         st.n += 1;
+        const num = st.n;
+        pk.gen = st.gen;
         const tr = h("tr", { tabindex: 0 },
-          h("td", {}, st.n), h("td", {}, pk.time), h("td", {}, pk.src), h("td", {}, pk.dst),
+          h("td", {}, num), h("td", {}, pk.time), h("td", {}, pk.src), h("td", {}, pk.dst),
           h("td", {}, h("span", { class: `tag c-${PROTO_COLOR[pk.proto] || "blue"}` }, pk.proto)),
           h("td", {}, pk.length), h("td", {}, pk.info));
-        const pick = () => {
-          if (st.picked) st.picked.classList.remove("on");
-          st.picked = tr;
-          tr.classList.add("on");
-          detail.textContent = pk.raw;
-        };
-        tr.addEventListener("click", pick);
-        tr.addEventListener("keydown", (e) => { if (e.key === "Enter") pick(); });
+        tr.addEventListener("click", () => pick(tr, pk, num));
+        tr.addEventListener("keydown", (e) => {
+          if (e.key === "Enter") pick(tr, pk, num);
+          const next = e.key === "ArrowDown" ? tr.nextElementSibling : e.key === "ArrowUp" ? tr.previousElementSibling : null;
+          if (next) { e.preventDefault(); next.focus(); next.click(); }
+        });
         rows.append(tr);
       }
-      while (rows.children.length > 2000) rows.firstChild.remove();
+      while (rows.children.length > 2000) {
+        if (rows.firstChild === st.picked) closeSide();
+        st.cache.delete(rows.firstChild);
+        rows.firstChild.remove();
+      }
       if (stick) scroller.scrollTop = scroller.scrollHeight;
     };
 
@@ -1434,12 +1662,23 @@ function openPackets(node, port) {
       if (st.ws) { st.ws.onclose = null; st.ws.close(); }
       const f = filter.value.trim();
       status.textContent = "Connecting";
+      st.gen += 1;
       const ws = new WebSocket(wsUrl(`${path}/packets`) + (f ? `?filter=${encodeURIComponent(f)}` : ""));
       st.ws = ws;
       let failed = false;
-      ws.onopen = () => { status.textContent = st.paused ? "Paused" : "Listening"; };
+      ws.onopen = () => {
+        status.textContent = st.paused ? "Paused" : "Listening";
+        if (st.paused) ws.send(JSON.stringify({ pause: true }));
+      };
       ws.onmessage = (e) => {
         const msg = JSON.parse(e.data);
+        if (msg.decoded !== undefined) {
+          const w = st.want;
+          if (!w || w.n !== msg.decoded) return;
+          if (!msg.error) st.cache.set(w.tr, msg);
+          if (st.picked === w.tr) showDecoded(w.num, w.pk, msg);
+          return;
+        }
         if (msg.error) { failed = true; status.textContent = msg.error; return; }
         if (!st.paused && msg.packets) add(msg.packets);
       };
@@ -1451,10 +1690,10 @@ function openPackets(node, port) {
         h("strong", {}, title), filter,
         h("button", { type: "submit" }, "Apply"),
         pause,
-        h("button", { type: "button", onclick: () => { rows.replaceChildren(); st.n = 0; st.picked = null; } }, "Clear"),
+        h("button", { type: "button", onclick: () => { rows.replaceChildren(); st.n = 0; st.cache.clear(); closeSide(); } }, "Clear"),
         h("a", { href: `/api${path}/capture?seconds=30`, download: "", title: "Download a 30 second pcap for Wireshark" }, "pcap"),
         status),
-      scroller, detail);
+      h("div", { class: "pv-body" }, scroller, side));
     $("#terms").append(pane);
     dock.set(key, { name: `${title} packets`, pane, onShow: null, close: () => { if (st.ws) { st.ws.onclose = null; st.ws.close(); } } });
     connect();
@@ -1467,13 +1706,17 @@ function reachDialog() {
   if (!clients.length) { toast("Start a client first. The test runs from a PC.", true); return; }
   const known = [];
   for (const n of state.lab.nodes) {
-    if (n.kind === "client" && n.address) known.push([n.address.split("/")[0], n.name]);
+    const addr = n.kind === "client" && (n.addressing === "dhcp" ? n.leased : n.address);
+    if (addr) known.push([addr.split("/")[0], n.name + ((n.services || []).includes("iperf") ? " (iperf3)" : "")]);
     if (n.mgmt_ip) known.push([n.mgmt_ip, `${n.name} (Cloud)`]);
   }
   const sel = state.sel && state.sel.type === "node" ? clients.find((n) => n.id === state.sel.id) : null;
   const to = h("input", { id: "m-to", type: "text", list: "m-to-list", autocomplete: "off", placeholder: "192.168.20.2" });
+  const note = h("p", { class: "hint" });
   openModal("Connectivity test", [
-    { node: h("p", {}, "Runs ping, then traceroute, from a client to an address.") },
+    { key: "kind", label: "Test", type: "select", value: "reach",
+      options: [{ value: "reach", label: "Ping, then traceroute" }, { value: "iperf", label: "Throughput (iperf3, 5 seconds)" }] },
+    { node: note },
     { key: "from", label: "From", type: "select", value: (sel || clients[0]).id,
       options: clients.map((n) => ({ value: n.id, label: n.name + (n.address ? ` (${n.address})` : "") })) },
     { node: h("div", { class: "field" }, h("label", { for: "m-to" }, "To (address or name)"), to,
@@ -1481,12 +1724,20 @@ function reachDialog() {
   ], "Run test", async (v) => {
     const target = to.value.trim();
     if (!/^[A-Za-z0-9][A-Za-z0-9.:-]*$/.test(target)) throw new Error("Enter an IP address or a host name.");
-    openTest(nodeById(Number(v.from)), target);
+    openTest(nodeById(Number(v.from)), target, v.kind === "iperf" ? ["iperf"] : ["ping", "traceroute"]);
   });
+  const kind = $("#m-kind");
+  const sync = () => {
+    note.textContent = kind.value === "iperf"
+      ? "Measures throughput to a client running the iperf3 server (switch it on under Services). Through CHRs on the free licence, expect about 1 Mbit/s: that is the licence limit, not the lab."
+      : "Runs ping, then traceroute, from a client to an address.";
+  };
+  kind.addEventListener("change", sync);
+  sync();
 }
 
-function openTest(node, target) {
-  const key = `t:${node.id}:${target}`;
+function openTest(node, target, tools = ["ping", "traceroute"]) {
+  const key = `t:${node.id}:${target}:${tools.join("+")}`;
   if (!dock.has(key)) {
     const out = h("pre", { tabindex: 0 });
     const status = h("span", { class: "pv-status" });
@@ -1495,7 +1746,7 @@ function openTest(node, target) {
       again.disabled = true;
       out.textContent = "";
       const results = {};
-      for (const tool of ["ping", "traceroute"]) {
+      for (const tool of tools) {
         status.className = "pv-status";
         status.textContent = `Running ${tool}`;
         try {
@@ -1508,15 +1759,21 @@ function openTest(node, target) {
         }
         out.scrollTop = out.scrollHeight;
       }
-      status.className = "pv-status " + (results.ping ? "good" : "bad");
-      status.textContent = results.ping ? `${target} answers` : `No answer from ${target}`;
+      if (tools[0] === "iperf") {
+        const m = /([\d.]+) Mbits\/sec.*receiver/.exec(out.textContent);
+        status.className = "pv-status " + (results.iperf ? "good" : "bad");
+        status.textContent = results.iperf ? (m ? `${m[1]} Mbit/s` : "Done") : `No iperf3 server at ${target}`;
+      } else {
+        status.className = "pv-status " + (results.ping ? "good" : "bad");
+        status.textContent = results.ping ? `${target} answers` : `No answer from ${target}`;
+      }
       again.disabled = false;
     };
     again.addEventListener("click", run);
     const pane = h("div", { class: "pv" },
-      h("div", { class: "pv-bar" }, h("strong", {}, `${node.name} to ${target}`), again, status), out);
+      h("div", { class: "pv-bar" }, h("strong", {}, `${node.name} to ${target}` + (tools[0] === "iperf" ? " (iperf3)" : "")), again, status), out);
     $("#terms").append(pane);
-    dock.set(key, { name: `${node.name} → ${target}`, pane, onShow: null, close: () => {} });
+    dock.set(key, { name: `${node.name} → ${target}` + (tools[0] === "iperf" ? " iperf3" : ""), pane, onShow: null, close: () => {} });
     run();
   }
   dockShow(key);
@@ -1549,9 +1806,63 @@ function packetDialog() {
 }
 
 window.addEventListener("resize", () => {
+  setDockHeight(readStore("dockHeight", null), false);
   const d = dock.get(state.activeDock);
   if (d && d.onShow) d.onShow();
 });
+
+// A short canvas (tall bottom panel, small window) gets an icon-only tool rail; labels stay as tooltips.
+if (window.ResizeObserver) {
+  new ResizeObserver(() => {
+    const stage = $("#stage");
+    const vertical = getComputedStyle($("#tools")).flexDirection === "column";
+    $("#tools").classList.toggle("compact", vertical && stage.clientHeight < 560);
+  }).observe($("#stage"));
+}
+
+// The bottom panel can be made taller by dragging its top edge; the height is kept per browser.
+function setDockHeight(px, save = true) {
+  const el = $("#dock");
+  if (px === null || px === undefined) { el.style.height = ""; return; }
+  const height = Math.round(Math.max(140, Math.min(px, window.innerHeight * 0.8)));
+  el.style.height = height + "px";
+  if (save) writeStore("dockHeight", height);
+  const d = dock.get(state.activeDock);
+  if (d && d.onShow) requestAnimationFrame(d.onShow);
+}
+(() => {
+  const grip = $("#dock-grip");
+  setDockHeight(readStore("dockHeight", null), false);
+  grip.addEventListener("pointerdown", (e) => {
+    e.preventDefault();
+    grip.setPointerCapture(e.pointerId);
+    grip.classList.add("drag");
+    const bottom = $("#dock").getBoundingClientRect().bottom;
+    let frame = 0;
+    const move = (ev) => {
+      cancelAnimationFrame(frame);
+      frame = requestAnimationFrame(() => setDockHeight(bottom - ev.clientY, false));
+    };
+    const up = () => {
+      grip.classList.remove("drag");
+      grip.removeEventListener("pointermove", move);
+      setDockHeight($("#dock").getBoundingClientRect().height);
+    };
+    grip.addEventListener("pointermove", move);
+    grip.addEventListener("pointerup", up, { once: true });
+    grip.addEventListener("pointercancel", up, { once: true });
+  });
+  grip.addEventListener("dblclick", () => {
+    const now = $("#dock").getBoundingClientRect().height;
+    setDockHeight(now < window.innerHeight * 0.45 ? window.innerHeight * 0.6 : 300);
+  });
+  grip.addEventListener("keydown", (e) => {
+    const step = e.key === "ArrowUp" ? 30 : e.key === "ArrowDown" ? -30 : 0;
+    if (!step) return;
+    e.preventDefault();
+    setDockHeight($("#dock").getBoundingClientRect().height + step);
+  });
+})();
 
 // ------------------------------------------------------- export as PNG
 
@@ -1684,6 +1995,7 @@ const ACTIONS = {
   "cfg-import": () => { const n = selectedRouter(); if (n) importConfig(n); },
   "cfg-identity": () => { const n = selectedRouter(); if (n) pushIdentity(n); },
   "tool-packets": () => packetDialog(),
+  "tool-activity": () => openActivity(),
   "tool-nuke": () => nukeDialog(),
   "tool-test": () => reachDialog(),
   "tool-docs": async () => {
@@ -1950,6 +2262,8 @@ function switchLab(lab) {
   state.linkFrom = null;
   writeStore("lab", lab.id);
   loadView();
+  beatSoon();
+  if (activityState.list && !activityState.all) loadActivity().catch(() => {});
 }
 
 function closeMenus() {
@@ -2084,9 +2398,115 @@ window.addEventListener("keydown", (e) => {
   }
 });
 
-setInterval(() => {
-  if (!drag && $("#modal").hidden) refresh(false).catch(() => {});
-}, 3000);
+// ---------------------------------------------------- instant updates
+
+// The server pushes a hint whenever something changes; the workspace then fetches again.
+// A slow poll stays as a safety net, e.g. for a device that stops by itself.
+let refreshTimer = null, refreshing = false, refreshAgain = false, eventDelay = 1000;
+
+function scheduleRefresh(delay = 120) {
+  clearTimeout(refreshTimer);
+  refreshTimer = setTimeout(runRefresh, delay);
+}
+
+async function runRefresh() {
+  if (drag || !$("#modal").hidden) { scheduleRefresh(400); return; } // not mid-drag or mid-dialog
+  if (refreshing) { refreshAgain = true; return; }
+  refreshing = true;
+  try { await refresh(false); } catch (e) { /* the next event or the poll tries again */ }
+  refreshing = false;
+  if (refreshAgain) { refreshAgain = false; scheduleRefresh(0); }
+}
+
+function connectEvents() {
+  const ws = new WebSocket(wsUrl("/events"));
+  ws.onmessage = (e) => {
+    let msg;
+    try { msg = JSON.parse(e.data); } catch (err) { return; }
+    if (msg.t === "hello") { eventDelay = 1000; scheduleRefresh(0); return; }
+    if (msg.t === "activity") { onActivity(msg.entry); return; }
+    scheduleRefresh();
+  };
+  ws.onclose = () => {
+    setTimeout(connectEvents, eventDelay);
+    eventDelay = Math.min(eventDelay * 2, 15000);
+  };
+}
+
+let beatTimer = null;
+function beatSoon() {
+  clearTimeout(beatTimer);
+  beatTimer = setTimeout(async () => {
+    try {
+      state.others = (await api("POST", "/presence", beatBody())).others;
+      renderTop();
+      renderCanvas();
+    } catch (e) { /* the poll sends the next one */ }
+  }, 150);
+}
+
+setInterval(() => scheduleRefresh(0), 10000);
+connectEvents();
+
+// ---------------------------------------------------------- activity
+
+const activityState = { entries: [], all: false, list: null };
+
+function openActivity() {
+  const key = "activity";
+  if (!dock.has(key)) {
+    const list = h("ol", { class: "act-list", tabindex: 0, "aria-label": "Activity, newest first" });
+    const all = h("input", { type: "checkbox", id: "act-all", onchange: () => {
+      activityState.all = all.checked;
+      loadActivity().catch((e) => toast(e.message, true));
+    } });
+    const pane = h("div", { class: "pv" },
+      h("div", { class: "pv-bar" }, h("strong", {}, "Activity"),
+        h("label", { class: "act-toggle", for: "act-all" }, all, "All labs"),
+        h("span", { class: "pv-status" }, "Updates live")),
+      list);
+    $("#terms").append(pane);
+    activityState.list = list;
+    dock.set(key, { name: "Activity", pane, onShow: null, close: () => { activityState.list = null; } });
+    loadActivity().catch((e) => toast(e.message, true));
+  }
+  dockShow(key);
+}
+
+async function loadActivity() {
+  const lab = !activityState.all && state.lab ? `lab=${state.lab.id}&` : "";
+  activityState.entries = await api("GET", `/activity?${lab}limit=300`);
+  renderActivity();
+}
+
+function activityRow(e) {
+  const t = new Date(e.ts * 1000);
+  const today = t.toDateString() === new Date().toDateString();
+  const when = today ? t.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })
+    : t.toLocaleDateString([], { day: "numeric", month: "short" }) + " " + t.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+  return h("li", { class: `act ${e.kind}` },
+    h("time", { datetime: t.toISOString(), title: t.toLocaleString() }, when),
+    h("span", { class: `who c-${e.kind === "system" ? "gray" : whoColor(e.user)}`, "aria-hidden": "true" }, e.user.slice(0, 2)),
+    h("span", { class: "act-text" }, h("b", {}, e.user), " ", e.text,
+      activityState.all && e.lab_name ? h("span", { class: "act-lab" }, ` · ${e.lab_name}`) : null));
+}
+
+function renderActivity() {
+  const list = activityState.list;
+  if (!list) return;
+  const rows = activityState.entries.slice(-300).reverse().map(activityRow);
+  list.replaceChildren(...(rows.length ? rows : [h("li", { class: "act empty" }, "Nothing has happened here yet.")]));
+}
+
+function onActivity(entry) {
+  const mine = state.lab && entry.lab === state.lab.id;
+  if (activityState.list && (activityState.all || entry.lab == null || mine)) {
+    activityState.entries.push(entry);
+    renderActivity();
+  }
+  // Someone else removing or resetting things in your lab deserves a heads-up.
+  if (entry.kind === "danger" && mine && state.user && entry.user !== state.user) toast(`${entry.user} ${entry.text}`);
+}
 
 applyPrefs();
 fetch("/api/auth/status").then((r) => r.json()).then((st) => {

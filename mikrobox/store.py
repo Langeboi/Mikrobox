@@ -11,6 +11,7 @@ from .models import State
 class Store:
     def __init__(self, path: Path) -> None:
         self.path = path
+        self.on_save = None  # called after every save, e.g. to push the change to browsers
         if path.exists():
             self.state = State.model_validate_json(path.read_text())
         else:
@@ -21,3 +22,5 @@ class Store:
         tmp = self.path.with_suffix(".tmp")
         tmp.write_text(self.state.model_dump_json(indent=2))
         os.replace(tmp, self.path)
+        if self.on_save:
+            self.on_save()

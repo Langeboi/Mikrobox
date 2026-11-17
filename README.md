@@ -116,9 +116,15 @@ Windows-only H3C Cloud Lab, so neither is included.
   factory reset, over SSH on the management network.
 - Templates: ready-made layouts for multi-area OSPF, a collapsed core, spine and leaf, an
   ISP with MPLS, and BGP multihoming. Topology and a suggested plan, not router configs.
-- Clients take an optional DNS server setting next to address and gateway.
+- Clients take a fixed address, gateway and DNS servers, or ask DHCP for all three. Their
+  consoles have ping, traceroute, mtr, dig, nmap, curl, iperf3, netcat and arping.
+- Client services, switched on per client: a web server on port 80, an iperf3 server, a
+  DHCP server (hands out .100-.199 of its subnet) and a DNS server that answers for every
+  device in the lab as `<name>.lab` and forwards everything else.
 - A live packet view in the browser (Tools menu, or Packets on any running port), with
-  capture filters, alongside pcap download for Wireshark.
+  capture filters, alongside pcap download for Wireshark. Clicking a packet shows the
+  full protocol tree from tshark and its bytes: pointing at a field highlights its bytes,
+  clicking a byte finds its field. Arrow keys step through packets.
 - Topology export as a PNG image, device duplication, double-click to open a console.
 - Automatic config backups per lab (all routers or chosen ones, every 15 minutes to 24
   hours), kept as revisions only when the config changed, with a side-by-side compare.
@@ -127,7 +133,13 @@ Windows-only H3C Cloud Lab, so neither is included.
 - Restore a saved revision to a router, replacing its config or applying it on top.
 - Documentation export: a zip with a Markdown write-up (devices, cabling, areas, notes),
   the topology image and each router's latest config.
-- Connectivity test: ping and traceroute from a client, from the Tools menu.
+- Connectivity test from a client (Tools menu): ping then traceroute, or a 5 second
+  iperf3 throughput run to a client running the iperf3 server.
+- Changes appear for everyone in the lab within a moment (pushed over a websocket), and
+  an Activity log (Tools menu) records who did what, per lab or across all labs.
+- Short animations when a device starts, stops or is added, when a link is drawn and when
+  it comes up. Off when your system asks for reduced motion.
+- The bottom panel (consoles, packets, tests) can be made taller by dragging its top edge.
 - Nuke (Tools menu): empties the current lab in one go (devices, disks, links, shapes,
   notes and saved revisions) after a warning and typing the lab's name. The lab stays.
 - Settings: light or dark theme, grid, snapping, port labels, defaults for new routers.
@@ -135,9 +147,9 @@ Windows-only H3C Cloud Lab, so neither is included.
 - Live packet capture of any port as a pcap stream you can pipe into Wireshark.
 - A hard cap of 128 running devices, and a free-memory check before each router starts.
 
-**Not tested end to end yet.** The API, model, limits and generated host commands are
-covered by unit tests, but nothing has booted a real CHR. Expect to fix things on the
-first run on a real VM.
+**Partly tested on real hardware.** Routers, links, the Cloud and consoles have run on a
+real VM. The newer parts listed under Known gaps have only been run against stand-ins;
+the API, model, limits and generated host commands are covered by unit tests.
 
 ## Install
 
@@ -154,6 +166,8 @@ The installer downloads the current stable CHR image from MikroTik. Pin a versio
 `/var/lib/mikrobox/images/chr.img` yourself.
 
 To update later: `git pull && sudo ./scripts/install.sh`. Running routers keep running.
+Updating this way also installs the packages newer features need (tshark for the packet
+decode, iperf3, dig and friends for clients); stopped clients pick them up on their next start.
 
 ## Accounts
 
@@ -246,7 +260,10 @@ Add `?seconds=30` for a capture that ends by itself; the workspace's Capture lin
 | Link | A pair of `tc` redirects between the two port interfaces |
 | Cloud | Linux bridge `mbcloud`: NAT with dnsmasq, or bridged to the VM's network card |
 | Console | QEMU serial socket or a pty, relayed over a websocket |
-| Capture | `tcpdump` on the port interface, streamed as pcap |
+| Capture | `tcpdump` on the port interface, streamed as pcap, or as lines plus bytes for the packet view |
+| Decode | `tshark -T pdml` on one packet at a time, run as `nobody` |
+| Client services | `udhcpc`, `dnsmasq`, `python3 -m http.server` and `iperf3 -s`, started inside the client's namespace |
+| Live updates | A websocket at `/api/events` that tells open workspaces to reload what changed |
 
 ## Known gaps
 
@@ -265,7 +282,12 @@ Add `?seconds=30` for a capture that ends by itself; the workspace's Capture lin
 - A lab file carries the topology only. Export router configs separately.
 - Clients share the VM's filesystem; they are namespaces, not full machines.
 - Stopping a router kills QEMU rather than shutting RouterOS down cleanly.
-- The free CHR license limits each interface to 1 Mbps upload.
+- The free CHR license limits each interface to 1 Mbps upload, so iperf3 through a router
+  shows about 1 Mbit/s. Between two clients on one link it shows the VM's own speed.
+- The packet view decodes each packet on its own, so protocols spread over several TCP
+  segments are not reassembled there. Download the pcap for that.
+- Client services and DHCP were tested with stand-ins for the real programs; the commands
+  they run are covered by tests, but expect to fix things on the first run on a real VM.
 
 ## Development
 
