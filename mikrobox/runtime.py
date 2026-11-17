@@ -13,6 +13,7 @@ from pathlib import Path
 from . import __version__
 from .config import Settings
 from .models import Endpoint, Lab, Link, Node, NodeKind
+from .clients import ClientServices
 from .network import Net, pid_alive
 from .shell import CommandError, Shell
 from .store import Store
@@ -48,9 +49,18 @@ class Runtime:
         self.store = store
         self.sh = sh or Shell(dry_run=settings.dry_run)
         self.net = Net(settings, self.sh)
+        self.clients = ClientServices(self)
         self.lock = threading.RLock()
         self.cloud_ips: dict[str, str] = {}  # MAC -> address, discovered in bridged mode
         self._scanner: threading.Thread | None = None
+
+    # -- host names ------------------------------------------------------
+
+    def iface(self, node_id: int, port: int) -> str:
+        return iface_name(node_id, port)
+
+    def netns(self, node_id: int) -> str:
+        return netns_name(node_id)
 
     # -- paths -----------------------------------------------------------
 
@@ -216,14 +226,17 @@ class Runtime:
             if node.kind == NodeKind.chr:
                 self._start_chr(node)
             else:
+                self.clients.stop(node)  # leftovers from a crash
                 self.net.delete_client(netns_name(node.id))
+                static = node.addressing == "static"
                 self.net.create_client(
                     netns_name(node.id),
                     [iface_name(node.id, p) for p in range(1, node.ports + 1)],
-                    node.address,
-                    node.gateway,
-                    node.dns,
+                    node.address if static else None,
+                    node.gateway if static else None,
+                    node.dns if static else None,
                 )
+                self.clients.start(lab, node)
             for link in lab.links:
                 if link.touches(node.id):
                     self.apply_link(lab, link)
@@ -264,6 +277,7 @@ class Runtime:
                 for port in range(1, node.ports + 1):
                     self.net.delete(iface_name(node.id, port))
             else:
+                self.clients.stop(node)
                 self.net.delete_client(netns_name(node.id))
 
     def _kill(self, pidfile: Path) -> None:

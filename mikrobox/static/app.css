@@ -56,7 +56,7 @@ button.primary { background: var(--accent); border-color: var(--accent); color: 
 button.primary:hover { filter: brightness(1.08); background: var(--accent); }
 button.danger { color: var(--danger); }
 input:not([type="checkbox"]):not([type="file"]), select { width: 100%; }
-input[type="checkbox"] { min-height: 0; width: 18px; height: 18px; padding: 0; accent-color: var(--accent); }
+input[type="checkbox"] { flex: none; min-height: 0; width: 18px; height: 18px; padding: 0; accent-color: var(--accent); }
 input[type="file"] { padding: 6px; width: 100%; }
 input:disabled { background: var(--surface-2); color: var(--muted); }
 :focus-visible { outline: 2px solid var(--accent-fg); outline-offset: 2px; }
@@ -137,6 +137,13 @@ main { flex: 1; min-height: 0; display: flex; flex-direction: column; }
 .field label { font-size: 12px; color: var(--muted); }
 .field.check { flex-direction: row; align-items: center; gap: 10px; }
 .field.check label { font-size: 14px; color: var(--text); }
+.field.check.svc { align-items: flex-start; margin-bottom: 8px; }
+.field.check.svc input { margin-top: 2px; width: 16px; height: 16px; }
+.field.check.svc label { display: flex; flex-direction: column; gap: 1px; font-size: 13px; }
+.field.check.svc label span { color: var(--muted); font-size: 12px; }
+.field.check.svc input:disabled + label { opacity: .75; }
+p.hint { margin: 0 0 10px; color: var(--muted); font-size: 12.5px; }
+#inspector p.lease { margin: -4px 0 10px; }
 .grid3 { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px; }
 table { width: 100%; border-collapse: collapse; font-size: 13px; }
 td { padding: 6px 4px; border-top: 1px solid var(--line); vertical-align: middle; }

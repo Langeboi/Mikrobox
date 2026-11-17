@@ -491,12 +491,13 @@ function renderCanvas() {
     const ref = { type: "node", id: n.id };
     world.append(
       s("g", { class: cls(ref, n.running ? " running" : ""), transform: `translate(${n.x},${n.y})`, ...handlers(ref) },
-        s("title", {}, `${n.name} (${n.running ? "running" : "stopped"})`),
+        s("title", {}, `${n.name} (${n.running ? "running" : "stopped"})` +
+          (n.services && n.services.length ? `\nRuns: ${n.services.map((x) => SERVICES.find((d) => d[0] === x)[1]).join(", ")}` : "")),
         s("rect", { class: "box", x: -30, y: -30, width: 60, height: 60, rx: 14 }),
         s("path", { class: "glyph", d: ICONS[n.role === "switch" ? "switch" : n.kind], transform: "translate(-19.2,-19.2) scale(1.6)", "vector-effect": "non-scaling-stroke" }),
         s("circle", { class: "dot", cx: 26, cy: -26, r: 6.5 }),
         s("text", { y: 48 }, n.name),
-        s("text", { class: "sub", y: 62 }, n.mgmt_ip || (n.kind === "client" && n.address) || ""),
+        s("text", { class: "sub", y: 62 }, n.mgmt_ip || (n.kind === "client" && clientAddress(n)) || ""),
       ),
     );
   }
@@ -760,18 +761,40 @@ function addNodeDialog(kind) {
       ]
     : [
         { key: "name", label: "Hostname", value: nextName("PC") },
+        { key: "addressing", label: "Addressing", type: "select", value: "static",
+          options: [{ value: "static", label: "Fixed address" }, { value: "dhcp", label: "Ask DHCP for an address" }] },
         { key: "address", label: "IP address (optional)", placeholder: "192.168.10.2/24" },
         { key: "gateway", label: "Gateway (optional)", placeholder: "192.168.10.1" },
         { key: "dns", label: "DNS servers (optional)", placeholder: "1.1.1.1, 9.9.9.9" },
+        { node: h("p", { class: "hint" }, "Web, iperf3, DHCP and DNS servers can be switched on in the client's settings.") },
       ];
   openModal(isSwitch ? "Add switch" : kind === "chr" ? "Add router" : "Add client", fields.filter(Boolean), "Add", async (v) => {
     const body = { kind: isSwitch ? "chr" : kind, name: v.name, ...at };
     if (isSwitch) body.role = "switch";
     for (const k of ["ports", "cpus", "ram_mb"]) if (v[k]) body[k] = Number(v[k]);
-    for (const k of ["address", "gateway", "dns"]) if (v[k]) body[k] = v[k];
+    if (kind === "client") body.addressing = v.addressing;
+    if (kind === "client" && v.addressing === "dhcp") { /* the fields below are greyed out */ }
+    else for (const k of ["address", "gateway", "dns"]) if (v[k]) body[k] = v[k];
     const node = await api("POST", `${labPath()}/nodes`, body);
     state.sel = { type: "node", id: node.id };
   });
+  if (kind === "client") {
+    const mode = $("#m-addressing");
+    const sync = () => { for (const k of ["address", "gateway", "dns"]) $("#m-" + k).disabled = mode.value === "dhcp"; };
+    mode.addEventListener("change", sync);
+  }
+}
+
+// What a client runs, in the words shown in the inspector and on hover.
+const SERVICES = [
+  ["web", "Web server", "Serves a small page on port 80. Try curl from another client."],
+  ["iperf", "iperf3 server", "Target for throughput tests from other clients."],
+  ["dhcp", "DHCP server", "Hands out addresses .100 to .199 of its subnet, with its gateway and DNS."],
+  ["dns", "DNS server", "Answers for every device in the lab as <name>.lab and forwards the rest."],
+];
+function clientAddress(n) {
+  if (n.addressing === "dhcp") return n.leased || (n.running ? "DHCP…" : "DHCP");
+  return n.address || "";
 }
 
 // ------------------------------------------------- router config tools
@@ -1000,9 +1023,12 @@ function nodeInspector(n) {
     inputs[key] = h("input", { id, type, value: n[key] ?? "", disabled: n.running, ...extra });
     return h("div", { class: "field" }, h("label", { for: id }, label), inputs[key]);
   };
+  const svcBoxes = {};
   const save = () => act(async () => {
     const body = {};
+    const dhcp = inputs.addressing && inputs.addressing.value === "dhcp";
     for (const [k, input] of Object.entries(inputs)) {
+      if (dhcp && (k === "address" || k === "gateway" || k === "dns")) continue;  // kept for switching back
       const raw = input.value.trim();
       const value = input.type === "number" ? Number(raw) : (raw || null);
       if (value !== n[k] && !(input.type === "number" && !raw)) body[k] = value;
@@ -1011,6 +1037,27 @@ function nodeInspector(n) {
   });
   const path = `${labPath()}/nodes/${n.id}`;
   const reachable = n.running && !!n.cloud_port;
+  const clientFields = () => {
+    const mode = h("select", { id: "i-addressing", disabled: n.running },
+      h("option", { value: "static" }, "Fixed address"), h("option", { value: "dhcp" }, "DHCP"));
+    mode.value = n.addressing || "static";
+    inputs.addressing = mode;
+    const fixed = [field("address", "IP address", "text", { placeholder: "192.168.10.2/24" }),
+                   field("gateway", "Gateway", "text", { placeholder: "192.168.10.1" }),
+                   field("dns", "DNS servers", "text", { placeholder: "1.1.1.1, 9.9.9.9" })];
+    const lease = h("p", { class: "lease" });
+    const sync = () => {
+      const dhcp = mode.value === "dhcp";
+      for (const k of ["address", "gateway", "dns"]) inputs[k].disabled = n.running || dhcp;
+      for (const f of fixed) f.hidden = dhcp;
+      lease.hidden = !dhcp;
+      lease.textContent = !n.running ? "Asks for an address, gateway and DNS when it starts."
+        : n.leased ? `Leased ${n.leased}.` : "Waiting for a DHCP server to answer.";
+    };
+    mode.addEventListener("change", sync);
+    sync();
+    return [h("div", { class: "field" }, h("label", { for: "i-addressing" }, "Addressing"), mode), lease, ...fixed];
+  };
 
   const rows = [];
   for (let p = 1; p <= n.ports; p++) {
@@ -1054,12 +1101,19 @@ function nodeInspector(n) {
             field("ports", "Ports", "number", { min: 1, max: 24 }),
             field("cpus", "vCPUs", "number", { min: 1, max: 8 }),
             field("ram_mb", "RAM (MB)", "number", { min: 128 }))
-        : [field("address", "IP address", "text", { placeholder: "192.168.10.2/24" }),
-           field("gateway", "Gateway", "text", { placeholder: "192.168.10.1" }),
-           field("dns", "DNS servers", "text", { placeholder: "1.1.1.1, 9.9.9.9" })],
+        : clientFields(),
       n.running
         ? h("p", {}, "Stop the device to change its settings.")
         : h("button", { type: "button", onclick: save }, "Save changes")),
+    !isChr && h("section", {}, h("h2", {}, "Services"),
+      SERVICES.map(([key, label, tip]) => {
+        svcBoxes[key] = h("input", { id: "i-svc-" + key, type: "checkbox", checked: (n.services || []).includes(key),
+          disabled: n.running, onchange: () => act(() => api("PATCH", path,
+            { services: Object.keys(svcBoxes).filter((k) => svcBoxes[k].checked) })) });
+        return h("div", { class: "field check svc" }, svcBoxes[key],
+          h("label", { for: "i-svc-" + key }, h("strong", {}, label), h("span", {}, tip)));
+      }),
+      n.running && h("p", {}, "Stop the client to change what it runs.")),
     h("section", {}, h("h2", {}, "Interfaces"), h("table", {}, h("tbody", {}, rows))),
     h("section", {}, h("h2", {}, "Access from your PC"), access),
     isChr && h("section", {}, h("h2", {}, "Configuration"),
@@ -1294,13 +1348,17 @@ function reachDialog() {
   if (!clients.length) { toast("Start a client first. The test runs from a PC.", true); return; }
   const known = [];
   for (const n of state.lab.nodes) {
-    if (n.kind === "client" && n.address) known.push([n.address.split("/")[0], n.name]);
+    const addr = n.kind === "client" && (n.addressing === "dhcp" ? n.leased : n.address);
+    if (addr) known.push([addr.split("/")[0], n.name + ((n.services || []).includes("iperf") ? " (iperf3)" : "")]);
     if (n.mgmt_ip) known.push([n.mgmt_ip, `${n.name} (Cloud)`]);
   }
   const sel = state.sel && state.sel.type === "node" ? clients.find((n) => n.id === state.sel.id) : null;
   const to = h("input", { id: "m-to", type: "text", list: "m-to-list", autocomplete: "off", placeholder: "192.168.20.2" });
+  const note = h("p", { class: "hint" });
   openModal("Connectivity test", [
-    { node: h("p", {}, "Runs ping, then traceroute, from a client to an address.") },
+    { key: "kind", label: "Test", type: "select", value: "reach",
+      options: [{ value: "reach", label: "Ping, then traceroute" }, { value: "iperf", label: "Throughput (iperf3, 5 seconds)" }] },
+    { node: note },
     { key: "from", label: "From", type: "select", value: (sel || clients[0]).id,
       options: clients.map((n) => ({ value: n.id, label: n.name + (n.address ? ` (${n.address})` : "") })) },
     { node: h("div", { class: "field" }, h("label", { for: "m-to" }, "To (address or name)"), to,
@@ -1308,12 +1366,20 @@ function reachDialog() {
   ], "Run test", async (v) => {
     const target = to.value.trim();
     if (!/^[A-Za-z0-9][A-Za-z0-9.:-]*$/.test(target)) throw new Error("Enter an IP address or a host name.");
-    openTest(nodeById(Number(v.from)), target);
+    openTest(nodeById(Number(v.from)), target, v.kind === "iperf" ? ["iperf"] : ["ping", "traceroute"]);
   });
+  const kind = $("#m-kind");
+  const sync = () => {
+    note.textContent = kind.value === "iperf"
+      ? "Measures throughput to a client running the iperf3 server (switch it on under Services). Through CHRs on the free licence, expect about 1 Mbit/s: that is the licence limit, not the lab."
+      : "Runs ping, then traceroute, from a client to an address.";
+  };
+  kind.addEventListener("change", sync);
+  sync();
 }
 
-function openTest(node, target) {
-  const key = `t:${node.id}:${target}`;
+function openTest(node, target, tools = ["ping", "traceroute"]) {
+  const key = `t:${node.id}:${target}:${tools.join("+")}`;
   if (!dock.has(key)) {
     const out = h("pre", { tabindex: 0 });
     const status = h("span", { class: "pv-status" });
@@ -1322,7 +1388,7 @@ function openTest(node, target) {
       again.disabled = true;
       out.textContent = "";
       const results = {};
-      for (const tool of ["ping", "traceroute"]) {
+      for (const tool of tools) {
         status.className = "pv-status";
         status.textContent = `Running ${tool}`;
         try {
@@ -1335,15 +1401,21 @@ function openTest(node, target) {
         }
         out.scrollTop = out.scrollHeight;
       }
-      status.className = "pv-status " + (results.ping ? "good" : "bad");
-      status.textContent = results.ping ? `${target} answers` : `No answer from ${target}`;
+      if (tools[0] === "iperf") {
+        const m = /([\d.]+) Mbits\/sec.*receiver/.exec(out.textContent);
+        status.className = "pv-status " + (results.iperf ? "good" : "bad");
+        status.textContent = results.iperf ? (m ? `${m[1]} Mbit/s` : "Done") : `No iperf3 server at ${target}`;
+      } else {
+        status.className = "pv-status " + (results.ping ? "good" : "bad");
+        status.textContent = results.ping ? `${target} answers` : `No answer from ${target}`;
+      }
       again.disabled = false;
     };
     again.addEventListener("click", run);
     const pane = h("div", { class: "pv" },
-      h("div", { class: "pv-bar" }, h("strong", {}, `${node.name} to ${target}`), again, status), out);
+      h("div", { class: "pv-bar" }, h("strong", {}, `${node.name} to ${target}` + (tools[0] === "iperf" ? " (iperf3)" : "")), again, status), out);
     $("#terms").append(pane);
-    dock.set(key, { name: `${node.name} → ${target}`, pane, onShow: null, close: () => {} });
+    dock.set(key, { name: `${node.name} → ${target}` + (tools[0] === "iperf" ? " iperf3" : ""), pane, onShow: null, close: () => {} });
     run();
   }
   dockShow(key);

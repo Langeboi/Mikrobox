@@ -22,6 +22,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, ValidationError
 
 from . import __version__, routeros, templates
+from . import clients as clients_mod
 from .backup import INTERVALS, Backups
 from .auth import COOKIE, SESSION_SECONDS, Auth, AuthError, AuthMiddleware
 from .config import Settings
@@ -33,7 +34,7 @@ from .packets import parse_line
 from .models import (
     NAME_PATTERN, Annotation, Endpoint, Lab, Link, Node, NodeKind, default_chr_ram, free_id,
 )
-from .runtime import Conflict, Invalid, NotFound, Runtime, iface_name, netns_name
+from .runtime import Conflict, Invalid, NotFound, Runtime
 from .shell import CommandError
 from .store import Store
 
@@ -61,6 +62,8 @@ class NodeCreate(BaseModel):
     address: Optional[str] = None
     gateway: Optional[str] = None
     dns: Optional[str] = None
+    addressing: Literal["static", "dhcp"] = "static"
+    services: list[Literal["web", "iperf", "dhcp", "dns"]] = Field(default_factory=list)
     x: float = 0
     y: float = 0
 
@@ -73,6 +76,8 @@ class NodeUpdate(BaseModel):
     address: Optional[str] = None
     gateway: Optional[str] = None
     dns: Optional[str] = None
+    addressing: Optional[Literal["static", "dhcp"]] = None
+    services: Optional[list[Literal["web", "iperf", "dhcp", "dns"]]] = None
     x: Optional[float] = None
     y: Optional[float] = None
 
@@ -171,7 +176,7 @@ class DocExport(BaseModel):
 
 class ReachTest(BaseModel):
     target: str = Field(min_length=1, max_length=253, pattern=r"^[A-Za-z0-9][A-Za-z0-9.:-]*$")
-    tool: Literal["ping", "traceroute"] = "ping"
+    tool: Literal["ping", "traceroute", "iperf"] = "ping"
 
 
 class PresenceBeat(BaseModel):
@@ -294,7 +299,22 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         view["ssh"] = f"ssh admin@{ip}" if ip and node.kind == NodeKind.chr else None
         view["console"] = f"/console?lab={lab.id}&node={node.id}"
         view["backup"] = backups.node_summary(lab, node)
+        view["leased"] = rt.clients.leased(node) if view["running"] else None
         return view
+
+    def check_client(node: Node) -> None:
+        """Rules for the client-only settings, checked on the final result of a change."""
+        if node.kind != NodeKind.client:
+            if node.addressing != "static" or node.services:
+                raise Invalid("addressing and services apply to clients only.")
+            return
+        if ("dhcp" in node.services or "dns" in node.services) and (node.addressing != "static" or not node.address):
+            raise Invalid("A DHCP or DNS server needs a fixed address. Set one, or switch those off.")
+        if "dhcp" in node.services:
+            try:
+                clients_mod.dhcp_range(node.address)
+            except ValueError as e:
+                raise Invalid(str(e))
 
     def lab_view(lab: Lab) -> dict:
         return {
@@ -655,13 +675,17 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             check_ports(body.kind, ports)
             if is_chr and (body.address or body.gateway or body.dns):
                 raise Invalid("address, gateway and dns apply to client nodes only.")
+            if is_chr and (body.addressing != "static" or body.services):
+                raise Invalid("addressing and services apply to clients only.")
             ram = body.ram_mb or (default_chr_ram(body.cpus, ports) if is_chr else 128)
             node = Node(
                 id=free_id({n.id for n in store.state.all_nodes()}),
                 kind=body.kind, role=body.role, name=body.name, ports=ports, cpus=body.cpus,
                 ram_mb=ram, address=body.address, gateway=body.gateway, dns=body.dns,
+                addressing=body.addressing, services=sorted(set(body.services)),
                 x=body.x, y=body.y,
             )
+            check_client(node)
             lab.nodes.append(node)
             store.save()
             activity.record(f"added the {what(node)} {node.name}", lab)
@@ -688,7 +712,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 )
                 if changes["ports"] < used:
                     raise Conflict(f"Port {used} is connected; remove that link first.")
+            if "services" in changes:
+                changes["services"] = sorted(set(changes["services"] or []))
             updated = Node.model_validate({**node.model_dump(), **changes})
+            check_client(updated)
             lab.nodes[lab.nodes.index(node)] = updated
             store.save()
             rt.sync_dhcp()
@@ -698,7 +725,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 activity.record(f"renamed {node.name} to {updated.name}", lab)
             if settings_changed:
                 words = {"ports": "ports", "cpus": "vCPUs", "ram_mb": "RAM", "address": "address",
-                         "gateway": "gateway", "dns": "DNS"}
+                         "gateway": "gateway", "dns": "DNS", "addressing": "addressing", "services": "services"}
                 activity.record(f"changed {updated.name}'s {', '.join(words.get(k, k) for k in settings_changed)}", lab)
             return node_view(lab, updated)
 
@@ -900,12 +927,16 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             raise Invalid("Tests run from a client. Pick a PC as the source.")
         if not rt.node_running(node):
             raise Conflict(f"Start {node.name} first.")
-        tool = (["ping", "-c", "3", "-W", "2", body.target] if body.tool == "ping"
-                else ["traceroute", "-n", "-w", "2", "-q", "1", "-m", "15", body.target])
+        tool = {
+            "ping": ["ping", "-c", "3", "-W", "2", body.target],
+            "traceroute": ["traceroute", "-n", "-w", "2", "-q", "1", "-m", "15", body.target],
+            # Needs an iperf3 server at the target, e.g. another client with that service on.
+            "iperf": ["iperf3", "-c", body.target, "-t", "5", "-f", "m", "--connect-timeout", "3000"],
+        }[body.tool]
         if settings.dry_run:
             return {"ok": False, "command": " ".join(tool), "output": "Dry-run mode: nothing is running."}
         try:
-            proc = subprocess.run(["ip", "netns", "exec", netns_name(node.id), *tool],
+            proc = subprocess.run(["ip", "netns", "exec", rt.netns(node.id), *tool],
                                   capture_output=True, text=True, timeout=70)
             return {"ok": proc.returncode == 0, "command": " ".join(tool),
                     "output": (proc.stdout + proc.stderr).strip()}
@@ -1004,7 +1035,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     ):
         """Pcap stream. Live: curl -sN URL | wireshark -k -i -   Timed file: add ?seconds=30"""
         node = get_node(get_lab(lab_id), node_id)
-        iface = iface_name(node.id, port)
+        iface = rt.iface(node.id, port)
         if port < 1 or port > node.ports or not rt.net.exists(iface):
             raise Conflict(f"{node.name} port {port} is not up. Start the node first.")
 
@@ -1035,7 +1066,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         await ws.accept()
         lab = store.state.lab(lab_id)
         node = lab.node(node_id) if lab else None
-        iface = iface_name(node_id, port)
+        iface = rt.iface(node_id, port)
         if node is None or port < 1 or port > node.ports or not rt.net.exists(iface):
             await ws.send_text(json.dumps({"error": "That port is not up. Start the device first."}))
             await ws.close()
@@ -1108,7 +1139,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             if node.kind == NodeKind.chr:
                 await consoles.join(hubs, key, lambda: consoles.SerialHub(key, hubs, rt.serial_socket(node)), ws, user)
             else:
-                await consoles.join(hubs, key, lambda: consoles.ShellHub(key, hubs, netns_name(node.id), node.name), ws, user)
+                await consoles.join(hubs, key, lambda: consoles.ShellHub(key, hubs, rt.netns(node.id), node.name), ws, user)
         except OSError as e:
             await ws.send_text(f"\r\nConsole unavailable: {e}\r\n")
         try:

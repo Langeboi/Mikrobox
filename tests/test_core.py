@@ -1109,3 +1109,111 @@ def test_template_and_nuke_are_logged_once(client):
     texts = [e["text"] for e in client.get("/api/activity", params={"lab": lab["id"]}).json() if e["lab"] == lab["id"]]
     assert texts == ["created the lab spine-leaf from the Spine and leaf template",
                      "nuked the lab: removed 10 devices, 12 links and 3 shapes and notes"]
+
+
+# -- better clients -----------------------------------------------------------
+
+def test_client_with_dhcp_and_services(client):
+    lab = make_lab(client)
+    pc = add_node(client, lab, kind="client", name="PC1", addressing="dhcp", services=["web", "iperf", "web"])
+    assert pc["addressing"] == "dhcp" and pc["services"] == ["iperf", "web"]
+    client.rt.sh.history.clear()
+    assert client.post(f"/api/labs/{lab}/nodes/{pc['id']}/start").status_code == 200
+    flat = [" ".join(c) for c in client.rt.sh.history]
+    ns = f"mbc{pc['id']}"
+    assert not any(" addr add " in c for c in flat)  # no fixed address
+    udhcpc = next(c for c in flat if "udhcpc" in c)
+    assert udhcpc.startswith(f"ip netns exec {ns} busybox udhcpc -f -i eth0 -s ") and "-x hostname:PC1" in udhcpc
+    assert any(c.startswith(f"ip netns exec {ns} ") and "http.server 80" in c for c in flat)
+    assert f"ip netns exec {ns} iperf3 -s" in flat
+    assert (client.tmp / "etcns" / ns / "resolv.conf").exists()  # before udhcpc runs
+    assert "Hello from PC1" in (client.tmp / "run" / f"n{pc['id']}.www" / "index.html").read_text()
+
+
+def test_client_dhcp_and_dns_server(client):
+    lab = make_lab(client)
+    r1 = add_node(client, lab, name="R1")
+    client.post(f"/api/labs/{lab}/links", json={"a": {"node": r1["id"], "port": 1}})
+    add_node(client, lab, kind="client", name="PC2", address="192.168.10.20/24")
+    url = f"/api/labs/{lab}/nodes"
+    bad = client.post(url, json={"kind": "client", "name": "S0", "addressing": "dhcp", "services": ["dhcp"]})
+    assert bad.status_code == 400 and "fixed address" in bad.json()["detail"]
+    assert client.post(url, json={"kind": "client", "name": "S1", "address": "10.0.0.1/30",
+                                  "services": ["dhcp"]}).status_code == 400  # no room for a pool
+    assert client.post(url, json={"name": "R9", "services": ["web"]}).status_code == 400  # clients only
+    srv = add_node(client, lab, kind="client", name="SRV", address="192.168.10.2/24", gateway="192.168.10.1",
+                   dns="9.9.9.9", services=["dhcp", "dns"])
+    client.rt.sh.history.clear()
+    client.post(f"/api/labs/{lab}/nodes/{srv['id']}/start")
+    dnsmasq = next(c for c in client.rt.sh.history if "dnsmasq" in c)
+    assert dnsmasq[:4] == ["ip", "netns", "exec", f"mbc{srv['id']}"]
+    for arg in ("--keep-in-foreground", "--interface=eth0", "--port=53", "--server=9.9.9.9", "--domain=lab",
+                "--dhcp-range=192.168.10.100,192.168.10.199,255.255.255.0,1h",
+                "--dhcp-option=3,192.168.10.1", "--dhcp-option=6,192.168.10.2"):
+        assert arg in dnsmasq, arg
+    hosts = (client.tmp / "run" / f"n{srv['id']}.hosts").read_text()
+    assert "192.168.10.20 pc2\n" in hosts and "192.168.10.2 srv\n" in hosts and "10.99.1.1 r1\n" in hosts
+    # Changing to DHCP while the DHCP server is on is refused, even in one step.
+    client.post(f"/api/labs/{lab}/nodes/{srv['id']}/stop")
+    assert client.patch(f"{url}/{srv['id']}", json={"addressing": "dhcp"}).status_code == 400
+    assert client.patch(f"{url}/{srv['id']}", json={"addressing": "dhcp", "services": []}).status_code == 200
+
+
+def test_dhcp_pool_sizes():
+    from mikrobox.clients import dhcp_range
+
+    assert dhcp_range("192.168.10.2/24") == ("192.168.10.100", "192.168.10.199", "255.255.255.0")
+    assert dhcp_range("10.1.1.1/28") == ("10.1.1.8", "10.1.1.14", "255.255.255.240")
+    assert dhcp_range("10.1.0.1/16") == ("10.1.0.100", "10.1.0.199", "255.255.0.0")
+    with pytest.raises(ValueError):
+        dhcp_range("10.0.0.1/30")
+
+
+def test_udhcpc_script_writes_only_the_clients_resolv_conf(tmp_path):
+    import os, stat, subprocess
+    from mikrobox.clients import UDHCPC_SCRIPT
+
+    script = tmp_path / "udhcpc.sh"
+    script.write_text(UDHCPC_SCRIPT)
+    script.chmod(script.stat().st_mode | stat.S_IEXEC)
+    fakebin = tmp_path / "bin"
+    fakebin.mkdir()
+    (fakebin / "ip").write_text(f"#!/bin/sh\necho \"$@\" >> {tmp_path}/ip.log\n")
+    (fakebin / "ip").chmod(0o755)
+    resolv = tmp_path / "resolv.conf"
+    resolv.write_text("old\n")
+    env = {"PATH": f"{fakebin}:{os.environ['PATH']}", "interface": "eth0", "ip": "192.168.88.254",
+           "subnet": "255.255.255.0", "router": "192.168.88.1", "dns": "192.168.88.1 1.1.1.1",
+           "MIKROBOX_RESOLV": str(resolv)}
+    assert subprocess.run([str(script), "bound"], env=env).returncode == 0
+    calls = (tmp_path / "ip.log").read_text().splitlines()
+    assert calls == ["-4 addr flush dev eth0", "addr add 192.168.88.254/255.255.255.0 dev eth0",
+                     "route del default", "route add default via 192.168.88.1 dev eth0"]
+    assert resolv.read_text() == "nameserver 192.168.88.1\nnameserver 1.1.1.1\n"
+    # With mask (CIDR bits) set, that is used instead of the dotted subnet.
+    (tmp_path / "ip.log").unlink()
+    subprocess.run([str(script), "renew"], env={**env, "mask": "24", "dns": ""})
+    assert "addr add 192.168.88.254/24 dev eth0" in (tmp_path / "ip.log").read_text()
+    assert resolv.read_text() == "nameserver 192.168.88.1\nnameserver 1.1.1.1\n"  # untouched without DNS
+
+
+def test_client_services_are_stopped(client, tmp_path):
+    import subprocess, sys, time as _time
+
+    lab = make_lab(client)
+    pc = add_node(client, lab, kind="client", name="PC1", services=["iperf"])
+    node = client.rt.store.state.lab(lab).node(pc["id"])
+    proc = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)", "iperf3"])
+    client.rt.s.run_dir.mkdir(parents=True, exist_ok=True)
+    (client.rt.s.run_dir / f"n{node.id}.svc-iperf.pid").write_text(f"{proc.pid}\n")
+    client.rt.clients.stop(node)
+    assert proc.wait(timeout=5) is not None
+    assert not (client.rt.s.run_dir / f"n{node.id}.svc-iperf.pid").exists()
+
+
+def test_throughput_test_command(client, monkeypatch):
+    lab = make_lab(client)
+    pc = add_node(client, lab, kind="client", name="PC1")
+    monkeypatch.setattr(client.rt, "node_running", lambda n: True)
+    r = client.post(f"/api/labs/{lab}/nodes/{pc['id']}/test", json={"target": "10.0.0.2", "tool": "iperf"}).json()
+    assert r["command"].startswith("iperf3 -c 10.0.0.2 -t 5")
