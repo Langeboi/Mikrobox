@@ -7,6 +7,46 @@ Open `http://<vm-ip>:8080/` for the lab workspace: add routers and clients, drag
 around, link ports, start and stop devices, and open consoles. The same things are
 available through the API (interactive docs at `/docs`).
 
+
+> **This is the `experimental/aruba-cx` branch.** It adds Aruba AOS-CX switches next to
+> MikroTik. The MikroTik build lives on `ui-workspace`; this branch keeps up with it but
+> may break. To go back: `git checkout ui-workspace && sudo ./scripts/install.sh`.
+
+## Experimental: Aruba AOS-CX switches
+
+Aruba CX switches run the official **AOS-CX Switch Simulator**, the real AOS-CX operating
+system as a VM. It does VLANs, LAGs, VSX, OSPF, BGP, VRF and more, and has the same CLI,
+web interface and REST API as the hardware. It is not fully feature-identical to the
+hardware: check HPE's Feature Navigator (platform "CX Simulator") and the simulator
+release notes before relying on a feature. VSF stacking is not supported in the simulator.
+
+The image cannot be shipped with Mikrobox. Download it yourself, free with an HPE account,
+from the HPE Networking Support Portal (it comes as an `.ova` inside a `.zip`). Then either:
+
+- in the workspace: **Settings, Images, Aruba AOS-CX, add**, and pick the `.zip`; or
+- on the server: `sudo /opt/mikrobox/venv/bin/python -m mikrobox.images add aoscx ArubaOS-CX_<version>_ova.zip`
+
+`.ova`, `.vmdk` and `.qcow2` files are accepted too. The disk is converted to qcow2 and
+stored as `/var/lib/mikrobox/images/aoscx.qcow2`. Replacing it later resets every CX switch
+to factory defaults.
+
+How it runs:
+
+| | |
+|---|---|
+| Ports | The first is `mgmt` (out of band); the rest are `1/1/1`, `1/1/2`, ... (up to 16) |
+| Resources | 2 vCPUs and 4 GB RAM by default; 2 GB is the minimum HPE gives for labs |
+| Hardware | Needs KVM. Boots in a few minutes |
+| Login | `admin` with no password; it asks you to set one |
+| QEMU | e1000 NICs (virtio has caused TCP problems with the simulator in other labs), IDE disk |
+
+Link `mgmt` to the Cloud to SSH to the switch from your PC; the console works either way.
+Config export, automatic backups and restore are MikroTik-only for now.
+
+There is no virtual image for HP ProCurve / ArubaOS-Switch (AOS-S) at all. HP Comware
+exists only as the HPE VSR1000 virtual router (routing, few switching features) and the
+Windows-only H3C Cloud Lab, so neither is included.
+
 ## What works in this version
 
 - Labs made of CHR routers and lightweight Linux clients, stored in one JSON file.
