@@ -1615,6 +1615,48 @@ def test_pull_proxy_only_connects_to_https(tmp_path):
         proxy.close()
 
 
+def test_pull_proxy_close_lets_go_of_every_socket():
+    # Sockets made inside a PC keep its network namespace alive, so close() must wake
+    # the accept loop and end open relays, not just drop the listener's file descriptor.
+    import socket as _s, time as _t
+    from mikrobox.docker import PullProxy
+
+    lst = _s.socket(); lst.bind(("127.0.0.1", 0)); lst.listen(4)
+    proxy = PullProxy(lst)
+    c = _s.create_connection(lst.getsockname())
+    c.sendall(b"CONNECT regis")  # an unfinished request: the relay waits for more
+    for _ in range(100):
+        if proxy.conns:
+            break
+        _t.sleep(0.01)
+    assert len(proxy.conns) == 1
+    proxy.close()
+    c.settimeout(2)
+    assert c.recv(10) == b""  # the relay hung up
+    for _ in range(100):
+        if not proxy.conns:
+            break
+        _t.sleep(0.01)
+    assert not proxy.conns and lst.fileno() == -1
+
+
+def test_links_fall_back_when_the_kernel_lacks_matchall(tmp_path):
+    from mikrobox.network import Net
+    from mikrobox.shell import CommandError, Shell
+
+    class NoMatchall(Shell):
+        def run(self, cmd, check=True, input=None):
+            if "matchall" in cmd:
+                raise CommandError("Error: TC classifier not found.")
+            return super().run(cmd, check, input)
+
+    sh = NoMatchall(dry_run=True)
+    Net(Settings(data_dir=tmp_path, run_dir=tmp_path / "run", dry_run=True), sh).connect("mb1p1", "mb2p1")
+    filters = [c for c in sh.history if c[:3] == ["tc", "filter", "add"]]
+    assert [c[4] for c in filters] == ["mb1p1", "mb2p1"]
+    assert all("u32" in c and c[-1] in ("mb1p1", "mb2p1") for c in filters)
+
+
 def test_docker_in_console_and_on_delete(client, monkeypatch):
     lab = make_lab(client)
     pc = add_node(client, lab, kind="client", name="PC1")

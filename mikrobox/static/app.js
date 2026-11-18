@@ -562,6 +562,12 @@ function renderCanvas() {
           mo && mo.kind === "start" && [s("circle", { class: "ripple", cx: 26, cy: -26, r: 6.5 }),
                                         s("circle", { class: "ripple r2", cx: 26, cy: -26, r: 6.5 })],
           s("circle", { class: "dot", cx: 26, cy: -26, r: 6.5 }),
+          // Containers on a PC with Docker: how many, in a small badge on the corner.
+          n.docker_summary && n.docker_summary.total > 0 && s("g", { class: "cbadge", transform: "translate(25,24)" },
+            s("title", {}, `${n.docker_summary.total} container${n.docker_summary.total > 1 ? "s" : ""}, ${n.docker_summary.running} running`),
+            s("rect", { x: -15, y: -10, width: 30 + (String(n.docker_summary.total).length - 1) * 7, height: 20, rx: 10 }),
+            s("path", { d: ICON_PATHS.cube, transform: "translate(-11,-6) scale(0.5)" }),
+            s("text", { x: 7, y: 4 }, String(n.docker_summary.total))),
           s("text", { y: 48 }, n.name),
           s("text", { class: "sub", y: 62 }, n.mgmt_ip || (n.kind === "client" && clientAddress(n)) || "")),
       ),
@@ -1191,6 +1197,7 @@ function nodeInspector(n) {
         ? h("button", { type: "button", onclick: () => act(() => api("POST", path + "/stop")) }, "Stop")
         : h("button", { type: "button", class: "primary", onclick: () => act(() => api("POST", path + "/start")) }, "Start"),
       h("button", { type: "button", disabled: !n.running, onclick: () => openConsole(n) }, "Console")),
+    !isChr && dockerSection(n),
     h("section", {},
       h("h2", {}, "Settings"),
       field("name", "Hostname", "text"),
@@ -1255,6 +1262,416 @@ function duplicateDialog(n) {
   });
 }
 
+// ---------------------------------------------------------------- Docker on a PC
+//
+// Each Linux PC can run its own Docker engine (docker.py). The inspector lists its
+// containers, kept fresh while the PC is selected; containers added here are saved with
+// the lab. Ports a container publishes open in your browser through a link (weblinks.py).
+
+const dockerCache = new Map();  // node id -> { data, at, loading }
+
+function dockerData(n) {
+  const c = dockerCache.get(n.id);
+  if (!c || Date.now() - c.at > 2500) refreshDocker(n);
+  return c && c.data;
+}
+
+async function refreshDocker(n) {
+  const c = dockerCache.get(n.id) || { at: 0 };
+  if (c.loading) return;
+  c.loading = true;
+  dockerCache.set(n.id, c);
+  try {
+    c.data = await api("GET", `${labPath()}/nodes/${n.id}/containers`);
+  } catch (e) { /* shown next time */ }
+  c.at = Date.now();
+  c.loading = false;
+  if (state.sel && state.sel.type === "node" && state.sel.id === n.id) renderInspector();
+}
+
+function setDockerData(n, data) {
+  dockerCache.set(n.id, { data, at: Date.now() });
+  renderInspector(true);
+}
+
+// Keep the list fresh while a running PC with Docker is selected.
+setInterval(() => {
+  const n = state.sel && state.sel.type === "node" && nodeById(state.sel.id);
+  if (n && n.kind === "client" && n.docker && n.running && !document.hidden) refreshDocker(n);
+}, 3000);
+
+const ICON_PATHS = {
+  logs: "M5 6h14 M5 10h14 M5 14h9 M5 18h6",
+  play: "M8 5l11 7-11 7z",
+  stop: "M7 7h10v10H7z",
+  trash: "M4 7h16 M9 7V4h6v3 M6 7l1 13h10l1-13",
+  out: "M14 4h6v6 M20 4l-9 9 M18 14v5a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1V7a1 1 0 0 1 1-1h5",
+  plus: "M12 5v14 M5 12h14",
+  cube: "M12 3l8 4.5v9L12 21l-8-4.5v-9z M12 12l8-4.5 M12 12v9 M12 12L4 7.5",
+  copy: "M9 9h11v11H9z M5 15H4V4h11v1",
+  check: "M5 12.5l4.5 4.5L19 7.5",
+};
+const svgIcon = (name, size = 15) => s("svg", { width: size, height: size, viewBox: "0 0 24 24", "aria-hidden": "true", class: "ico" }, s("path", { d: ICON_PATHS[name] }));
+
+function dockerSection(n) {
+  const path = `${labPath()}/nodes/${n.id}`;
+  const sys = state.sys || {};
+  const d = n.docker ? dockerData(n) : null;
+  const eng = d && d.engine;
+  const rows = (d && d.containers) || [];
+
+  const toggle = (on) => act(async () => {
+    const live = rows.filter((r) => r.running).length;
+    if (!on && live && !confirm(`Turn off Docker on ${n.name}? Its ${live} running container${live > 1 ? "s stop" : " stops"}. Saved containers come back when you turn it on again.`)) {
+      renderInspector(true);
+      return;
+    }
+    setDockerData(n, await api("POST", `${path}/docker`, { on }));
+  });
+
+  let label = "Off";
+  if (n.docker) {
+    const st = eng ? eng.state : (n.running ? "starting" : "stopped");
+    const run = rows.filter((r) => r.running).length;
+    label = st === "running" ? `Docker ${eng.version || ""} · ${run} of ${rows.length} running`.replace("  ", " ")
+      : st === "starting" ? "Starting…" : st === "failed" ? "Did not start" : n.running ? "On" : `On · starts with ${n.name}`;
+  }
+  const head = h("div", { class: "docker-head" },
+    h("h2", {}, "Docker"),
+    sys.docker !== false && h("label", { class: "switch", for: "i-docker" },
+      h("span", { class: "switch-text" }, label),
+      h("input", { id: "i-docker", type: "checkbox", role: "switch", checked: !!n.docker, onchange: (e) => toggle(e.target.checked) }),
+      h("span", { class: "track", "aria-hidden": "true" })));
+
+  if (sys.docker === false) {
+    return h("section", { class: "docker" }, head,
+      h("div", { class: "callout" },
+        h("strong", {}, "Docker isn't installed on this server yet"),
+        h("span", {}, "Run the installer again to add it. Labs and devices are kept."),
+        copyRow("sudo ./scripts/install.sh")));
+  }
+  if (!n.docker) {
+    return h("section", { class: "docker" }, head,
+      h("p", {}, `Gives ${n.name} its own Docker engine: run containers from here or with `, h("code", {}, "docker"),
+        ` in its console, with their own networks and ports published on ${n.name}'s address. Uses about 100 MB of memory while ${n.name} runs.`));
+  }
+
+  const engineOk = eng && eng.state === "running";
+  const list = rows.map((r) => {
+    const tcp = r.ports.filter((p) => p.proto === "tcp");
+    const status = r.error ? h("span", { class: "ctr-error" }, r.error) : h("span", {}, r.busy || r.status);
+    const actions = [];
+    if (engineOk && r.state !== "pending") {
+      actions.push(h("button", { type: "button", class: "icon-btn", title: "Logs", "aria-label": `Logs of ${r.name}`, onclick: () => openContainerLogs(n, r.name) }, svgIcon("logs")));
+      actions.push(h("button", { type: "button", class: "icon-btn", title: r.running ? "Stop" : "Start", "aria-label": `${r.running ? "Stop" : "Start"} ${r.name}`,
+        onclick: () => act(async () => setDockerData(n, await api("POST", `${path}/containers/${encodeURIComponent(r.name)}/${r.running ? "stop" : "start"}`))) },
+        svgIcon(r.running ? "stop" : "play")));
+    }
+    actions.push(h("button", { type: "button", class: "icon-btn", title: "Remove", "aria-label": `Remove ${r.name}`, onclick: () => act(async () => {
+      if (!confirm(`Remove the container ${r.name} from ${n.name}?` + (r.saved ? " It is also taken out of the lab." : ""))) return;
+      setDockerData(n, await api("DELETE", `${path}/containers/${encodeURIComponent(r.name)}`));
+    }) }, svgIcon("trash")));
+    return h("div", { class: "ctr" },
+      h("div", { class: "ctr-top" },
+        h("i", { class: "ctr-dot" + (r.running ? " on" : r.error ? " bad" : "") }),
+        h("strong", {}, r.name),
+        h("span", { class: "ctr-image mono", title: r.image }, r.image),
+        ...actions),
+      h("div", { class: "ctr-meta" },
+        status,
+        h("span", { class: "spacer" }),
+        ...r.ports.map((p) => h("span", { class: "chip mono", title: `${n.name} port ${p.host} leads to port ${p.container} in the container` },
+          `${p.host} → ${p.container}${p.proto === "udp" ? "/udp" : ""}`)),
+        r.running && n.running && tcp.length > 0 && h("button", { type: "button", class: "open-btn", title: "Open in your browser",
+          onclick: () => openWebDialog({ node: n.id, container: r.name }) }, "Open", svgIcon("out", 12))));
+  });
+
+  return h("section", { class: "docker" }, head,
+    eng && eng.state === "failed" && h("p", { class: "ctr-error" }, eng.message || "The Docker engine did not start."),
+    list.length ? h("div", { class: "ctr-list" }, list) : h("p", {}, n.running && !engineOk ? "Starting the Docker engine…" : "No containers yet."),
+    h("button", { type: "button", class: "add-ctr", onclick: () => addContainerDialog(n) }, svgIcon("plus"), "Add container"),
+    h("p", { class: "hint" }, "Containers you start with ", h("code", {}, "docker"), " in the console show up here too. ",
+      n.running && h("a", { href: "#", onclick: (e) => { e.preventDefault(); openWebDialog({ node: n.id }); } }, `Open another web page from ${n.name}`)));
+}
+
+const CONTAINER_PRESETS = [
+  { label: "nginx", what: "Web server", image: "nginx:alpine", name: "web", ports: [[8080, 80]] },
+  { label: "Apache httpd", what: "Web server", image: "httpd:alpine", name: "apache", ports: [[8081, 80]] },
+  { label: "whoami", what: "Echoes each request", image: "traefik/whoami", name: "whoami", ports: [[8082, 80]] },
+  { label: "Portainer", what: "Docker in a web page, HTTPS", image: "portainer/portainer-ce", name: "portainer", ports: [[9443, 9443]], socket: true },
+  { label: "Grafana", what: "Dashboards", image: "grafana/grafana", name: "grafana", ports: [[3000, 3000]] },
+  { label: "Uptime Kuma", what: "Uptime monitor", image: "louislam/uptime-kuma:1", name: "uptime", ports: [[3001, 3001]] },
+  { label: "PostgreSQL", what: "Database", image: "postgres:17", name: "db", ports: [[5432, 5432]], env: [["POSTGRES_PASSWORD", ""]] },
+  { label: "Other image", what: "Any image by name", image: "", name: "", ports: [] },
+];
+
+function addContainerDialog(n) {
+  const known = ((dockerCache.get(n.id) || {}).data || {}).containers || [];
+  const taken = new Set(known.flatMap((r) => r.ports.map((p) => `${p.host}/${p.proto}`)));
+  const names = new Set(known.map((r) => r.name));
+  const freePort = (port, proto = "tcp") => { while (taken.has(`${port}/${proto}`)) port += 1; return port; };
+  const freeName = (base) => { if (!base) return ""; let x = base, i = 2; while (names.has(x)) x = `${base}${i++}`; return x; };
+
+  const image = h("input", { id: "c-image", type: "text", class: "mono", autocomplete: "off", spellcheck: "false", placeholder: "nginx:alpine" });
+  const name = h("input", { id: "c-name", type: "text", autocomplete: "off", spellcheck: "false" });
+  const ports = h("div", { class: "ports-grid" });
+  const envs = h("div", { class: "env-grid" });
+  const restart = h("input", { id: "c-restart", type: "checkbox", checked: true });
+  const socket = h("input", { id: "c-socket", type: "checkbox" });
+  const preview = h("code", { class: "run-preview" });
+  const where = h("span", { class: "hint" });
+  const addr = n.kind === "client" && (n.addressing === "dhcp" ? (n.leased || "").split("/")[0] : (n.address || "").split("/")[0]);
+
+  const portRow = (host = "", cont = "", proto = "tcp") => {
+    const hp = h("input", { type: "number", min: 1, max: 65535, value: host, "aria-label": `Port on ${n.name}` });
+    const cp = h("input", { type: "number", min: 1, max: 65535, value: cont, "aria-label": "Port in the container" });
+    const pr = h("select", { "aria-label": "Protocol" }, h("option", { value: "tcp" }, "TCP"), h("option", { value: "udp" }, "UDP"));
+    pr.value = proto;
+    const row = h("div", { class: "port-row" }, hp, h("span", { "aria-hidden": "true" }, "→"), cp, pr,
+      h("button", { type: "button", class: "icon-btn", "aria-label": "Remove this port", onclick: () => { row.remove(); update(); } }, "×"));
+    row.read = () => ({ host: Number(hp.value), container: Number(cp.value), proto: pr.value });
+    return row;
+  };
+  const envRow = (k = "", v = "") => {
+    const ki = h("input", { type: "text", value: k, class: "mono", placeholder: "NAME", "aria-label": "Variable name", autocomplete: "off" });
+    const vi = h("input", { type: "text", value: v, placeholder: "value", "aria-label": "Value", autocomplete: "off" });
+    const row = h("div", { class: "env-row" }, ki, vi,
+      h("button", { type: "button", class: "icon-btn", "aria-label": "Remove this variable", onclick: () => { row.remove(); update(); } }, "×"));
+    row.read = () => [ki.value.trim(), vi.value];
+    return row;
+  };
+  const read = () => ({
+    name: name.value.trim(), image: image.value.trim(),
+    ports: [...ports.children].map((r) => r.read()).filter((p) => p.host || p.container),
+    env: Object.fromEntries([...envs.children].map((r) => r.read()).filter(([k]) => k)),
+    restart: restart.checked, docker_socket: socket.checked,
+  });
+  const update = () => {
+    const v = read();
+    const parts = ["docker run -d", v.name && `--name ${v.name}`,
+      ...v.ports.map((p) => `-p ${p.host || "?"}:${p.container || "?"}${p.proto === "udp" ? "/udp" : ""}`),
+      ...Object.entries(v.env).map(([k, val]) => `-e ${k}=${/\s/.test(val) ? JSON.stringify(val) : val}`),
+      v.docker_socket && "-v /var/run/docker.sock:/var/run/docker.sock", v.restart && "--restart unless-stopped", v.image || "IMAGE"];
+    preview.textContent = parts.filter(Boolean).join(" ");
+    const first = v.ports.find((p) => p.host && p.proto === "tcp");
+    where.textContent = first ? `Reachable in the lab at ${addr || n.name}:${first.host}` : "";
+  };
+
+  const presetBtns = CONTAINER_PRESETS.map((p) => {
+    const b = h("button", { type: "button", class: "preset", "aria-pressed": "false", onclick: () => choose(p, b) },
+      h("strong", {}, p.label), h("span", {}, p.what));
+    return b;
+  });
+  const choose = (p, btn) => {
+    for (const b of presetBtns) b.setAttribute("aria-pressed", String(b === btn));
+    image.value = p.image;
+    name.value = freeName(p.name);
+    ports.replaceChildren(...p.ports.map(([hp, cp]) => portRow(freePort(hp), cp)));
+    envs.replaceChildren(...(p.env || []).map(([k, v]) => envRow(k, v)));
+    socket.checked = !!p.socket;
+    update();
+    (p.image ? name : image).focus();
+  };
+  const form = h("div", { class: "add-ctr-form", oninput: update, onchange: update },
+    h("p", { class: "lead" }, `Runs on ${n.name}'s own Docker engine, on the lab network.`),
+    h("div", { class: "field" }, h("span", { class: "label" }, "Start from"), h("div", { class: "presets" }, presetBtns)),
+    h("div", { class: "grid2" },
+      h("div", { class: "field" }, h("label", { for: "c-image" }, "Image"), image),
+      h("div", { class: "field" }, h("label", { for: "c-name" }, "Name"), name)),
+    h("div", { class: "field" }, h("span", { class: "label" }, "Published ports"),
+      h("div", { class: "port-head", "aria-hidden": "true" }, h("span", {}, `On ${n.name}`), h("span", {}), h("span", {}, "In the container"), h("span", {}, "Protocol"), h("span", {})),
+      ports,
+      h("div", { class: "row-inline" },
+        h("button", { type: "button", class: "small", onclick: () => { ports.append(portRow(freePort(8080))); update(); } }, "+ Add port"), where)),
+    h("div", { class: "field" }, h("span", { class: "label" }, "Environment variables"), envs,
+      h("div", { class: "row-inline" },
+        h("button", { type: "button", class: "small", onclick: () => { envs.append(envRow()); update(); } }, "+ Add variable"),
+        h("span", { class: "hint" }, "For example a database password"))),
+    h("div", { class: "field check" }, restart, h("label", { for: "c-restart" }, `Start it again whenever ${n.name} starts`)),
+    h("div", { class: "field check" }, socket, h("label", { for: "c-socket" }, `Give it ${n.name}'s Docker socket (for tools that manage Docker, like Portainer)`)),
+    h("div", { class: "run-box" }, h("span", { class: "hint" }, `The same as typing this in ${n.name}'s console:`), preview),
+    h("p", { class: "hint" }, "Images are downloaded through this server, and a PC that already has an image shares it with the others."));
+  choose(CONTAINER_PRESETS[0], presetBtns[0]);
+  openModal(`Add a container to ${n.name}`, [{ node: form }], "Add container", async () => {
+    const v = read();
+    if (!v.image) throw new Error("Enter an image, like nginx:alpine.");
+    if (!/^[A-Za-z0-9][A-Za-z0-9_.-]{0,62}$/.test(v.name)) throw new Error("Give it a name: letters, digits, dots, dashes or underscores.");
+    if (v.ports.some((p) => !(p.host >= 1 && p.host <= 65535 && p.container >= 1 && p.container <= 65535))) throw new Error("Ports are numbers from 1 to 65535.");
+    if (Object.entries(v.env).some(([k, val]) => k === "POSTGRES_PASSWORD" && !val)) throw new Error("Set a password for POSTGRES_PASSWORD.");
+    setDockerData(n, await api("POST", `${labPath()}/nodes/${n.id}/containers`, v));
+    if (n.running) toast(`${v.name} is being set up on ${n.name}. The first time, the image is downloaded.`);
+  }, null, true);
+  setTimeout(() => image.focus(), 0);
+}
+
+function openContainerLogs(n, name) {
+  const key = `l:${n.id}:${name}`;
+  if (!dock.has(key)) {
+    const out = h("pre", { class: "logs-out" }, "Loading…");
+    const follow = h("input", { type: "checkbox", id: `lf-${n.id}-${name}`, checked: true });
+    const status = h("span", { class: "pv-status" });
+    let timer = null;
+    const load = async () => {
+      try {
+        const r = await api("GET", `${labPath()}/nodes/${n.id}/containers/${encodeURIComponent(name)}/logs?tail=500`);
+        const stick = out.scrollTop + out.clientHeight >= out.scrollHeight - 30;
+        out.textContent = r.text || "(no output yet)";
+        if (stick) out.scrollTop = out.scrollHeight;
+        status.textContent = `Updated ${new Date().toLocaleTimeString()}`;
+      } catch (e) { status.textContent = e.message; }
+    };
+    const pane = h("div", { class: "pv logs" },
+      h("div", { class: "pv-bar" }, h("strong", {}, `${n.name} · ${name}`),
+        h("button", { type: "button", onclick: load }, "Refresh"),
+        h("span", { class: "act-toggle" }, follow, h("label", { for: follow.id }, "Follow")), status),
+      out);
+    $("#terms").append(pane);
+    timer = setInterval(() => { if (follow.checked && state.activeDock === key && !document.hidden) load(); }, 2000);
+    dock.set(key, { name: `${n.name} · ${name} logs`, pane, onShow: null, close: () => clearInterval(timer) });
+    load();
+  }
+  dockShow(key);
+}
+
+// ---------------------------------------------------------------- web pages in the lab
+
+function openWebDialog(pre = {}) {
+  const pcs = state.lab.nodes.filter((x) => x.kind === "client" && x.running);
+  if (!pcs.length) { toast("Start a Linux client first: pages are opened from one."); return; }
+  const from = h("select", { id: "w-from" }, pcs.map((x) => h("option", { value: x.id }, `${x.name}${clientAddress(x) ? " · " + clientAddress(x).split("/")[0] : ""}`)));
+  if (pre.node && pcs.some((x) => x.id === pre.node)) from.value = String(pre.node);
+  const targets = h("fieldset", { class: "targets" }, h("legend", {}, "What to open"));
+  const url = h("input", { id: "w-url", type: "text", class: "mono", placeholder: "http://10.0.0.1  or  https://10.99.1.12", autocomplete: "off", spellcheck: "false" });
+  const urlBox = h("div", { class: "field url-box" }, h("label", { for: "w-url" }, "Address, as the PC would type it"), url);
+  const result = h("div", { class: "web-result", hidden: true });
+  let pick = pre.container ? `c:${pre.container}` : "url";
+
+  const fill = () => {
+    const n = nodeById(Number(from.value));
+    const rows = (((dockerCache.get(n.id) || {}).data || {}).containers || []).filter((r) => r.running && r.ports.some((p) => p.proto === "tcp"));
+    if (n.docker && !dockerCache.get(n.id)) refreshDocker(n).then(() => fill());
+    const opts = rows.flatMap((r) => r.ports.filter((p) => p.proto === "tcp").map((p) => ({
+      key: `c:${r.name}:${p.host}`, title: `${r.name} · ${r.image.split("/").pop().split(":")[0]}`,
+      detail: `Container on ${n.name}, port ${p.host}`, container: r.name, port: p.host })));
+    if (pick.startsWith("c:") && !pick.split(":")[2]) { const o = opts.find((x) => x.container === pick.slice(2)); pick = o ? o.key : "url"; }
+    if (pick !== "url" && !opts.some((o) => o.key === pick)) pick = opts.length ? opts[0].key : "url";
+    opts.push({ key: "url", title: "Another address", detail: `Anything ${n.name} can reach, like a router's WebFig` });
+    targets.replaceChildren(h("legend", {}, "What to open"), ...opts.map((o, i) => {
+      const id = `w-t${i}`;
+      const radio = h("input", { id, type: "radio", name: "w-target", checked: pick === o.key, onchange: () => { pick = o.key; fill(); } });
+      radio.option = o;
+      return h("label", { for: id, class: "target" + (pick === o.key ? " on" : "") }, radio,
+        h("span", { class: "t-text" }, h("strong", {}, o.title), h("span", {}, o.detail)));
+    }), urlBox);
+    urlBox.hidden = pick !== "url";
+    result.hidden = true;
+    $("#modal-ok").hidden = false;
+  };
+  const me = h("input", { id: "w-me", type: "radio", name: "w-who", checked: true });
+  const anyone = h("input", { id: "w-any", type: "radio", name: "w-who" });
+  const form = h("div", { class: "web-form" },
+    h("p", { class: "lead" }, "Reach a web page inside the lab from this computer, over HTTP or HTTPS."),
+    h("div", { class: "field" }, h("label", { for: "w-from" }, "From"), from,
+      h("span", { class: "hint" }, "The page is fetched the way that PC sees it, through the lab's own links.")),
+    targets,
+    h("fieldset", { class: "who-can" }, h("legend", {}, "Who can use the link"),
+      h("div", { class: "field check" }, me, h("label", { for: "w-me" }, "Only this computer")),
+      h("div", { class: "field check" }, anyone, h("label", { for: "w-any" }, "Anyone who can reach Mikrobox"))),
+    result,
+    h("p", { class: "hint" }, "Links stay listed under Tools › Web access, and close when their PC stops."));
+  from.addEventListener("change", () => { pick = "url"; fill(); });
+  for (const r of [me, anyone]) r.addEventListener("change", () => { result.hidden = true; $("#modal-ok").hidden = false; });
+
+  openModal("Open in your browser", [{ node: form }], "Make link", async () => {
+    const node = Number(from.value);
+    const chosen = [...targets.querySelectorAll("input[type=radio]")].find((r) => r.checked);
+    const body = { lab: state.lab.id, node, who: anyone.checked ? "anyone" : "me" };
+    if (!chosen || chosen.option.key === "url") {
+      if (!url.value.trim()) throw new Error("Enter the address to open.");
+      body.url = url.value.trim();
+    } else {
+      body.container = chosen.option.container;
+      body.port = chosen.option.port;
+    }
+    const link = await api("POST", "/web", body);
+    const https = link.scheme === "https";
+    result.replaceChildren(
+      h("div", { class: "ok-line" }, svgIcon("check", 16), "Ready"),
+      h("div", { class: "url-row" },
+        h("code", { class: "mono" }, link.url),
+        h("button", { type: "button", onclick: () => copyText(link.url) }, "Copy"),
+        h("a", { class: "button primary", href: link.url, target: "_blank", rel: "noopener" }, "Open", svgIcon("out", 13))),
+      h("span", { class: "hint" }, (https
+        ? "HTTPS passes straight through, so you see the page's own certificate. A self-signed one gets a browser warning; that is expected."
+        : "Plain HTTP, exactly as the page serves it.")
+        + (link.who === "me" ? ` Only ${link.allow} can use this link.` : " Anyone who can reach this server can use this link.")));
+    result.hidden = false;
+    $("#modal-ok").hidden = true;
+    $("#modal-cancel").textContent = "Close";
+    if (dock.has("web")) loadWeb();
+    return true;  // keep the dialog open to show the link
+  });
+  fill();
+}
+
+function copyText(text) {
+  (navigator.clipboard ? navigator.clipboard.writeText(text) : Promise.reject())
+    .then(() => toast("Copied."))
+    .catch(() => { prompt("Copy this:", text); });
+}
+
+const webState = { pane: null, body: null };
+
+function openWebAccess() {
+  if (!dock.has("web")) {
+    const body = h("div", { class: "web-body" });
+    const pane = h("div", { class: "pv web" },
+      h("div", { class: "web-top" },
+        h("div", { class: "web-intro" }, h("strong", {}, "Web pages opened from the lab"),
+          h("span", {}, "Each link leads to one page inside the lab. Links close when their PC stops, or after 8 hours without use.")),
+        h("button", { type: "button", class: "primary", onclick: () => openWebDialog() }, svgIcon("plus"), "Open a web page")),
+      body);
+    $("#terms").append(pane);
+    webState.pane = pane;
+    webState.body = body;
+    dock.set("web", { name: "Web access", pane, onShow: () => loadWeb(), close: () => { webState.pane = null; } });
+  }
+  dockShow("web");
+  loadWeb();
+}
+
+function ago(t) {
+  const s = Math.max(0, Date.now() / 1000 - t);
+  if (s < 45) return "Just now";
+  if (s < 3600) return `${Math.round(s / 60)} minute${Math.round(s / 60) === 1 ? "" : "s"} ago`;
+  const hr = Math.round(s / 3600);
+  return `${hr} hour${hr === 1 ? "" : "s"} ago`;
+}
+
+async function loadWeb() {
+  if (!webState.body || !state.lab) return;
+  let links = [];
+  try { links = await api("GET", `/web?lab=${state.lab.id}`); } catch (e) { webState.body.replaceChildren(h("p", {}, e.message)); return; }
+  if (!links.length) {
+    webState.body.replaceChildren(h("p", { class: "empty" }, "No links open in this lab. Open a container's page from its PC, or open any address the lab can reach."));
+    return;
+  }
+  webState.body.replaceChildren(h("div", { class: "web-scroll" }, h("table", { class: "web-table" },
+    h("thead", {}, h("tr", {}, ["Page", "From", "Link", "Who can use it", "Opened by", "Last used", ""].map((t) => h("th", {}, t)))),
+    h("tbody", {}, links.map((l) => h("tr", {},
+      h("td", {}, h("div", { class: "page" }, h("span", { class: `proto ${l.scheme}` }, l.scheme.toUpperCase()), h("strong", {}, l.title)),
+        h("div", { class: "sub" }, l.detail)),
+      h("td", {}, l.node_name),
+      h("td", {}, h("div", { class: "url-cell" }, h("code", { class: "mono" }, l.url),
+        h("button", { type: "button", class: "icon-btn", title: "Copy", "aria-label": `Copy the link to ${l.title}`, onclick: () => copyText(l.url) }, svgIcon("copy")),
+        h("a", { class: "icon-btn", href: l.url, target: "_blank", rel: "noopener", title: "Open", "aria-label": `Open ${l.title}` }, svgIcon("out")))),
+      h("td", { class: l.who === "anyone" ? "anyone" : "" }, l.who === "anyone" ? "Anyone who can reach Mikrobox" : `Only ${l.allow}`),
+      h("td", {}, l.by || "someone"),
+      h("td", { class: "sub" }, ago(l.used)),
+      h("td", { class: "end" }, h("button", { type: "button", class: "small", "aria-label": `Close the link to ${l.title}`,
+        onclick: () => act(async () => { await api("DELETE", `/web/${l.id}`); loadWeb(); }) }, "Close link"))))))));
+}
+
 function backupLine(n) {
   const b = state.lab.backup;
   let text = !b.enabled ? "Automatic backups are off for this lab."
@@ -1298,7 +1715,7 @@ function dockClose(key) {
   renderDock();
 }
 
-const isNodeTab = (key, nodeId) => key === `c:${nodeId}` || key.startsWith(`p:${nodeId}:`) || key.startsWith(`t:${nodeId}:`);
+const isNodeTab = (key, nodeId) => key === `c:${nodeId}` || [`p:${nodeId}:`, `t:${nodeId}:`, `l:${nodeId}:`].some((p) => key.startsWith(p));
 
 function closeNodeTabs(nodeId) {
   for (const key of [...dock.keys()]) if (isNodeTab(key, nodeId)) dockClose(key);
@@ -1878,6 +2295,7 @@ const ACTIONS = {
   "cfg-identity": () => { const n = selectedRouter(); if (n) pushIdentity(n); },
   "tool-packets": () => packetDialog(),
   "tool-activity": () => openActivity(),
+  "tool-web": () => openWebAccess(),
   "tool-nuke": () => nukeDialog(),
   "tool-test": () => reachDialog(),
   "tool-docs": async () => {
@@ -2295,6 +2713,7 @@ function connectEvents() {
     try { msg = JSON.parse(e.data); } catch (err) { return; }
     if (msg.t === "hello") { eventDelay = 1000; scheduleRefresh(0); return; }
     if (msg.t === "activity") { onActivity(msg.entry); return; }
+    if (msg.t === "web") { if (dock.has("web")) loadWeb(); return; }
     scheduleRefresh();
   };
   ws.onclose = () => {

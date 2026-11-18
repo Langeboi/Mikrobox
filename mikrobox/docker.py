@@ -53,8 +53,19 @@ exec nsenter --net="$ns_path" unshare --mount --propagation private sh -ec '
   # Hide a host-wide containerd, so this engine starts its own.
   if [ -d /run/containerd ]; then mount -t tmpfs tmpfs /run/containerd; fi
   if [ -f "$resolv" ]; then mount --bind "$resolv" /etc/resolv.conf; fi
+  # Let go of the other PCs: a copy of their namespace mounts in here would keep
+  # them from being removed when they stop.
+  umount -l /run/netns 2>/dev/null || true
   exec dockerd "$@"' launch "$resolv" "$stash" "$@"
 """
+
+
+def _state(proc: Path) -> str:
+    """A process's state letter from /proc (Z for a zombie), or "" if it is gone."""
+    try:
+        return (proc / "stat").read_text().rsplit(")", 1)[1].split()[0]
+    except (OSError, IndexError):
+        return ""
 
 
 class EngineError(Exception):
@@ -166,14 +177,20 @@ class PullProxy:
     def __init__(self, listener: socket.socket):
         self.listener = listener
         self.closed = False
+        self.conns: set[socket.socket] = set()
         threading.Thread(target=self._accept, daemon=True).start()
 
     def close(self) -> None:
+        """Close the listener and every relay. Sockets made inside the PC keep its
+        network namespace alive, so none may linger; shutdown() also wakes the
+        threads blocked on them, which close() alone does not."""
         self.closed = True
-        try:
-            self.listener.close()
-        except OSError:
-            pass
+        for s in [self.listener, *list(self.conns)]:
+            for step in (lambda: s.shutdown(socket.SHUT_RDWR), s.close):
+                try:
+                    step()
+                except OSError:
+                    pass
 
     def _accept(self) -> None:
         while not self.closed:
@@ -181,10 +198,13 @@ class PullProxy:
                 conn, _ = self.listener.accept()
             except OSError:
                 return
+            if self.closed:
+                conn.close()
+                return
+            self.conns.add(conn)
             threading.Thread(target=self._serve, args=(conn,), daemon=True).start()
 
-    @staticmethod
-    def _serve(conn: socket.socket) -> None:
+    def _serve(self, conn: socket.socket) -> None:
         upstream = None
         try:
             conn.settimeout(15)
@@ -222,6 +242,7 @@ class PullProxy:
             except OSError:
                 pass
         finally:
+            self.conns.discard(conn)
             for s in (conn, upstream):
                 if s is not None:
                     try:
@@ -376,24 +397,44 @@ class Docker:
                 os.kill(pid, signal.SIGTERM)  # stops the containers, then itself
             except OSError:
                 pass
-            deadline = time.time() + 12
+            # Containers get --shutdown-timeout to finish; one that ignores SIGTERM
+            # makes Docker wait on its own stop timeout (10 s), so cut that short:
+            # killed below, it is still restarted with its PC like the others.
+            deadline = time.time() + 7
             while time.time() < deadline and pid_alive(self.pidfile(node), "dockerd"):
                 time.sleep(0.25)
-        # Whatever is left of this engine (a stuck dockerd, its containerd, shims) goes now.
+        # Whatever is left of this engine goes now: a stuck dockerd, its containerd and
+        # shims, and any container they left running (found by its cgroup, which
+        # carries the container's id whichever cgroup driver Docker uses).
         mark = str(self.root() / f"n{node.id}")
+        ids = self._container_ids(node)
+        killed = []
         for p in Path("/proc").iterdir():
-            if not p.name.isdigit():
+            if not p.name.isdigit() or int(p.name) == os.getpid():
                 continue
             try:
                 cmd = (p / "cmdline").read_bytes().replace(b"\0", b" ").decode(errors="replace")
+                groups = (p / "cgroup").read_text() if ids else ""
             except OSError:
                 continue
-            if mark + " " in cmd + " " or f"{mark}/" in cmd:
+            if mark + " " in cmd + " " or f"{mark}/" in cmd or any(i in groups for i in ids):
                 try:
                     os.kill(int(p.name), signal.SIGKILL)
+                    killed.append(p)
                 except OSError:
                     pass
+        # Wait for them to be gone: until then they hold the PC's network namespace.
+        deadline = time.time() + 5
+        while killed and time.time() < deadline:
+            killed = [p for p in killed if p.exists() and _state(p) not in ("Z", "X")]
+            time.sleep(0.05)
         self.sock(node).unlink(missing_ok=True)
+
+    def _container_ids(self, node) -> list[str]:
+        try:
+            return [d.name for d in (self.data_root(node) / "containers").iterdir() if len(d.name) == 64]
+        except OSError:
+            return []
 
     def forget(self, node) -> None:
         """A PC was deleted: its engine's disk goes too."""
