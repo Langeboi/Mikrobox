@@ -74,7 +74,9 @@ class ClientServices:
         return self.s.run_dir / f"n{node.id}.svc-{service}.pid"
 
     def script_path(self) -> Path:
-        return self.s.run_dir / "udhcpc.sh"
+        # udhcpc runs this file itself, so it can't live on /run, which is often
+        # mounted noexec (Ubuntu, Debian).
+        return self.s.data_dir / "bin" / "udhcpc.sh"
 
     def resolv_path(self, node: Node) -> Path:
         return self.s.netns_etc / self.rt.netns(node.id) / "resolv.conf"

@@ -777,6 +777,49 @@ def test_presence_lists_other_people(client):
     assert client.post("/api/presence", json={"client": "tab-aaaa", "lab": 1}).json()["others"] == []
 
 
+def test_pc_console_follows_the_browser_terminal_size():
+    """Long commands wrap where the browser shows them, and text is UTF-8 (a pasted "–")."""
+    import asyncio
+    from mikrobox.console import ShellHub
+
+    class Here(ShellHub):  # the shell runs here instead of inside a PC
+        def argv(self):
+            return self.shell()
+
+    class FakeWs:
+        def __init__(self):
+            self.inbox, self.out = asyncio.Queue(), b""
+
+        async def receive(self):
+            return await self.inbox.get()
+
+        async def send_bytes(self, data):
+            self.out += data
+
+        async def send_text(self, text):
+            pass
+
+    async def go():
+        hub = Here("c:1", {}, "unused", "PC1")
+        await hub.open()
+        hub.task = asyncio.create_task(hub.run())
+        ws = FakeWs()
+        attached = asyncio.create_task(hub.attach(ws, "tester"))
+        for text in ("\x01" + '{"size": [132, 40]}', "\x01", "stty size; echo $LANG; echo \u2013-x | wc -m\n"):
+            ws.inbox.put_nowait({"type": "websocket.receive", "text": text})
+        for _ in range(100):
+            if b"40 132" in ws.out and b"C.UTF-8" in ws.out and b"\r\n4\r\n" in ws.out:
+                break
+            await asyncio.sleep(0.05)
+        ws.inbox.put_nowait({"type": "websocket.disconnect"})
+        await attached
+        return ws.out
+
+    out = asyncio.run(go())
+    assert b"40 132" in out  # the size reached the shell; Ctrl+A alone stayed a keystroke
+    assert b"C.UTF-8" in out and b"\r\n4\r\n" in out  # "–-x" plus newline: 4 characters, not 6
+
+
 def test_console_is_shared_between_viewers(client, monkeypatch):
     """Two people on one router console see the same output, and both can type."""
     import socket, threading
@@ -1767,12 +1810,14 @@ def test_docker_switch_and_engine_command(client):
     assert got["engine"]["on"] and got["engine"]["state"] == "stopped"
     client.rt.sh.history.clear()
     client.post(f"{url}/start")
-    launch = next(c for c in client.rt.sh.history if c[0].endswith("docker-launch.sh"))
+    # The launcher goes to sh as text: /run may be noexec, so nothing there is run as a file.
+    launch = next(c for c in client.rt.sh.history if c[:2] == ["sh", "-c"] and "exec dockerd" in c[2])
     ns = f"mbc{pc['id']}"
-    assert launch[1] == str(client.rt.s.netns_dir / ns) and launch[2].endswith(f"{ns}/resolv.conf")
-    assert ["--data-root", str(client.tmp / "data" / "docker" / f"n{pc['id']}")] == launch[4:6]
+    assert launch[3] == "docker-launch"
+    assert launch[4] == str(client.rt.s.netns_dir / ns) and launch[5].endswith(f"{ns}/resolv.conf")
+    assert ["--data-root", str(client.tmp / "data" / "docker" / f"n{pc['id']}")] == launch[7:9]
     assert "-H" in launch and launch[launch.index("-H") + 1] == f"unix://{client.tmp / 'run' / 'docker' / f'n{pc[chr(105) + chr(100)]}.sock'}"
-    script = (client.tmp / "run" / "docker" / "docker-launch.sh").read_text()
+    script = launch[2]
     assert "mount -t sysfs sysfs /sys" in script and "mount --move" in script and "exec dockerd" in script
     # Saved containers survive in the lab and come back in exports.
     assert client.post(f"{url}/containers", json={"name": "web", "image": "nginx:alpine",
@@ -1880,6 +1925,29 @@ def test_pull_proxy_only_connects_to_https(tmp_path):
         assert c.recv(100).startswith(b"HTTP/1.1 403")
     finally:
         proxy.close()
+
+
+def test_nothing_is_run_from_the_noexec_run_folder(client, monkeypatch):
+    # /run is mounted noexec on Ubuntu and Debian. The DHCP client's script lives with the
+    # data, and if the Docker engine can't be launched the PC starts anyway and says why.
+    import dataclasses
+    from mikrobox import docker as dk
+    assert client.rt.clients.script_path() == client.tmp / "data" / "bin" / "udhcpc.sh"
+    lab = make_lab(client)
+    pc = add_node(client, lab, kind="client", name="PC2")
+    url = f"/api/labs/{lab}/nodes/{pc['id']}"
+    client.post(f"{url}/docker", json={"on": True})
+    client.post(f"{url}/containers", json={"name": "uptime", "image": "louislam/uptime-kuma:1"})
+    monkeypatch.setattr(client.rt.docker, "s", dataclasses.replace(client.rt.docker.s, dry_run=False))
+    monkeypatch.setattr(client.rt.docker, "_open_proxy", lambda node: None)
+    def refuse(*a, **k):
+        raise PermissionError(13, "Permission denied")
+    monkeypatch.setattr(dk.subprocess, "Popen", refuse)
+    node = client.rt.store.state.lab(lab).node(pc["id"])
+    client.rt.docker.start(client.rt.store.state.lab(lab), node)
+    monkeypatch.setattr(client.rt, "node_running", lambda n: True)
+    eng = client.get(f"{url}/containers").json()["engine"]
+    assert eng["state"] == "failed" and eng["message"] == "The Docker engine did not start: Permission denied."
 
 
 def test_pull_proxy_close_lets_go_of_every_socket():

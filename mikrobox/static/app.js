@@ -2061,7 +2061,14 @@ function openConsole(node) {
     term.open(pane);
     const ws = new WebSocket(wsUrl(`${labPath()}/nodes/${node.id}/console`));
     ws.binaryType = "arraybuffer";
-    ws.onopen = () => ws.send("\r");
+    // Tell the PC's shell how big the terminal is, so long lines wrap where they show.
+    const sendSize = () => { if (ws.readyState === 1) ws.send("\x01" + JSON.stringify({ size: [term.cols, term.rows] })); };
+    term.onResize(sendSize);
+    ws.onopen = () => {
+      try { fit.fit(); } catch (e) { /* not visible yet */ }
+      sendSize();
+      ws.send("\r");
+    };
     ws.onmessage = (e) => {
       if (typeof e.data === "string" && e.data.charCodeAt(0) === 1) {
         // The console is shared: the server says who else has it open.
