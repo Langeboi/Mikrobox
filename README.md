@@ -222,6 +222,10 @@ Add `?seconds=30` for a capture that ends by itself; the workspace's Capture lin
   uses about 100 MB of memory while its client runs.
 - Web links are plain TCP ports: anyone who can reach the VM can use a link made for
   anyone. "Only this computer" goes by IP address.
+- Browsers don't keep cookies apart by port, so a lab page opened through a link is sent
+  Mikrobox's sign-in cookie too. Two things make that harmless: Mikrobox refuses changes
+  and websockets that come from any page but its own, and a sign-in only works from the
+  address it was made from (so you sign in again if your computer's address changes).
 - If Docker runs on the VM itself, it may set the firewall to drop forwarded traffic,
   which stops the Cloud's NAT; allow `mbcloud` in Docker's `DOCKER-USER` chain.
 
