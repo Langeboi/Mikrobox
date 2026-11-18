@@ -1335,7 +1335,7 @@ function nodeInspector(n) {
       h("h2", {}, "Settings"),
       field("name", "Hostname", "text"),
       n.role === "switch" && layerPicker(n.layer, (layer) => act(() => api("PATCH", path, { layer }))),
-      !isChr && choicePicker("Type", [["pc", "PC", "To test from", "client"], ["server", "Server", "Services, Docker, NICs", "server"]],
+      n.kind === "client" && choicePicker("Type", [["pc", "PC", "To test from", "client"], ["server", "Server", "Services, Docker, NICs", "server"]],
         n.role, (role) => act(() => api("PATCH", path, { role })), n.running),
       isChr
         ? h("div", { class: "grid3" },
