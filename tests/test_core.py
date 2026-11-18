@@ -208,6 +208,76 @@ def test_paste_copies_devices_with_their_links(client):
     assert "pasted 3 devices, 2 links and 1 shape with configuration" in acts
 
 
+def test_pcs_and_servers(client):
+    from mikrobox.models import Node
+    # Clients from before PCs and servers: those running services or Docker, or with more
+    # than one NIC, become servers; the rest are PCs.
+    old = {"id": 1, "kind": "client", "role": "router", "name": "X", "ports": 1}
+    assert Node.model_validate(old).role == "pc"
+    assert Node.model_validate({**old, "services": ["web"]}).role == "server"
+    assert Node.model_validate({**old, "docker": True}).role == "server"
+    assert Node.model_validate({**old, "ports": 2}).role == "server"
+
+    lab = make_lab(client)
+    url = f"/api/labs/{lab}/nodes"
+    pc = add_node(client, lab, kind="client", name="PC1", address="10.0.0.2/24")
+    assert pc["role"] == "pc" and pc["ports"] == 1
+    assert client.patch(f"{url}/{pc['id']}", json={"services": ["web"]}).status_code == 400  # servers only
+    assert client.post(f"{url}/{pc['id']}/docker", json={"on": True}).status_code == 400
+    assert client.patch(f"{url}/{pc['id']}", json={"ports": 2}).status_code == 400
+    assert client.post(url, json={"kind": "client", "role": "switch", "name": "nope"}).status_code == 400
+    assert client.post(url, json={"kind": "chr", "role": "server", "name": "nope"}).status_code == 400
+    got = client.patch(f"{url}/{pc['id']}", json={"role": "server"}).json()
+    assert got["role"] == "server"
+    assert client.patch(f"{url}/{pc['id']}", json={"services": ["web"]}).status_code == 200
+    assert client.patch(f"{url}/{pc['id']}", json={"role": "pc"}).status_code == 400  # still running a web server
+    acts = [e["text"] for e in client.get("/api/activity", params={"lab": lab}).json()]
+    assert "made PC1 a server" in acts and "added the PC PC1" in acts
+
+    srv = add_node(client, lab, kind="client", role="server", name="SRV1", address="10.0.0.10/24", gateway="10.0.0.1")
+    assert srv["ports"] == 2 and srv["bond"] is None
+    assert client.post(url, json={"kind": "client", "role": "server", "name": "S2", "ports": 1, "bond": "lacp"}).status_code == 400
+    assert client.post(url, json={"kind": "client", "role": "server", "name": "S3", "ports": 5}).status_code == 400  # four at most
+    assert client.patch(f"{url}/{srv['id']}", json={"bond": "lacp", "nic_addresses": ["10.9.0.1/24"]}).status_code == 400
+
+
+def test_server_bonds_and_second_nics(client):
+    lab = make_lab(client)
+    url = f"/api/labs/{lab}/nodes"
+    srv = add_node(client, lab, kind="client", role="server", name="SRV1", address="10.0.0.10/24",
+                   gateway="10.0.0.1", bond="lacp", services=["dhcp"])
+    client.rt.sh.history.clear()
+    assert client.post(f"{url}/{srv['id']}/start").status_code == 200
+    cmds = [" ".join(c) for c in client.rt.sh.history]
+    ns = f"mbc{srv['id']}"
+    assert (f"ip -n {ns} link add bond0 type bond mode 802.3ad miimon 100 lacp_rate fast "
+            "xmit_hash_policy layer3+4") in cmds
+    assert f"ip -n {ns} link set eth0 master bond0" in cmds and f"ip -n {ns} link set eth1 master bond0" in cmds
+    assert f"ip -n {ns} addr add 10.0.0.10/24 dev bond0" in cmds
+    node = client.rt.store.state.lab(lab).node(srv["id"])
+    dnsmasq = next(argv for name, argv, _ in client.rt.clients.commands(client.rt.store.state.lab(lab), node) if name == "dnsmasq")
+    assert "--interface=bond0" in dnsmasq
+    # A Cloud link puts its address on the bond, not on one NIC of it.
+    client.rt.sh.history.clear()
+    client.rt.net.exists = lambda iface: True  # the NIC is up (dry-run has no real interfaces)
+    client.post(f"/api/labs/{lab}/links", json={"a": {"node": srv["id"], "port": 2}})
+    assert any(c[-2:] == ["dev", "bond0"] and "replace" in c for c in client.rt.sh.history)
+    client.post(f"{url}/{srv['id']}/stop")
+
+    # Active-backup, and a server without a bond whose second NIC has its own address.
+    assert client.patch(f"{url}/{srv['id']}", json={"bond": "active-backup"}).json()["bond"] == "active-backup"
+    two = add_node(client, lab, kind="client", role="server", name="SRV2", address="10.0.0.11/24",
+                   addressing="dhcp", nic_addresses=["", "10.20.0.11/24"], ports=3)
+    assert two["nic_addresses"] == [None, "10.20.0.11/24"]
+    client.rt.sh.history.clear()
+    client.post(f"{url}/{two['id']}/start")
+    cmds = [" ".join(c) for c in client.rt.sh.history]
+    assert f"ip -n mbc{two['id']} addr add 10.20.0.11/24 dev eth2" in cmds and not any("bond0" in c for c in cmds)
+    node = client.rt.store.state.lab(lab).node(two["id"])
+    udhcpc = next(argv for name, argv, _ in client.rt.clients.commands(client.rt.store.state.lab(lab), node) if name == "udhcpc")
+    assert udhcpc[udhcpc.index("-i") + 1] == "eth0"
+
+
 def test_links_and_management_address(client):
     lab = make_lab(client)
     r1 = add_node(client, lab, name="R1")
@@ -1126,7 +1196,7 @@ def test_documentation_export(client):
     md = z.read("first.md").decode()
     assert "![Topology](topology.png)" in md
     assert "| R1 | Router (CHR) | 5 | 1 | 288 | 10.99.1.1 | Stopped |" in md
-    assert "| SW1 | Switch (CHR) | 24 |" in md and "| PC1 | Client | 1 | 1 | 128 | 10.0.0.2/24 | Stopped |" in md
+    assert "| SW1 | Switch (CHR) | 24 |" in md and "| PC1 | Linux PC | 1 | 1 | 128 | 10.0.0.2/24 | Stopped |" in md
     assert "| R1 | ether1 | Cloud | |" in md and "| R1 | ether2 | PC1 | eth0 |" in md
     assert "- **Site A**: R1, PC1" in md
     assert "> Line one\n> Line two" in md
@@ -1256,7 +1326,7 @@ def test_activity_log_records_who_did_what(client):
     entries = [e for e in every if e["lab"] == lab]
     texts = [e["text"] for e in entries]
     assert texts == [
-        "created the lab first", "added the router R1", "added the switch R2", "added the client PC1",
+        "created the lab first", "added the router R1", "added the switch R2", "added the PC PC1",
         "linked R1 ether2 to R2 ether1", "linked R1 ether1 to the Cloud",
         "renamed R1 to EDGE1", "changed EDGE1's ports",
         "started PC1", "stopped PC1", "added an area", 'deleted an area "Site A"',
@@ -1300,7 +1370,7 @@ def test_template_and_nuke_are_logged_once(client):
 
 def test_client_with_dhcp_and_services(client):
     lab = make_lab(client)
-    pc = add_node(client, lab, kind="client", name="PC1", addressing="dhcp", services=["web", "iperf", "web"])
+    pc = add_node(client, lab, kind="client", role="server", name="PC1", addressing="dhcp", services=["web", "iperf", "web"])
     assert pc["addressing"] == "dhcp" and pc["services"] == ["iperf", "web"]
     client.rt.sh.history.clear()
     assert client.post(f"/api/labs/{lab}/nodes/{pc['id']}/start").status_code == 200
@@ -1319,14 +1389,14 @@ def test_client_dhcp_and_dns_server(client):
     lab = make_lab(client)
     r1 = add_node(client, lab, name="R1")
     client.post(f"/api/labs/{lab}/links", json={"a": {"node": r1["id"], "port": 1}})
-    add_node(client, lab, kind="client", name="PC2", address="192.168.10.20/24")
+    add_node(client, lab, kind="client", role="server", name="PC2", address="192.168.10.20/24")
     url = f"/api/labs/{lab}/nodes"
-    bad = client.post(url, json={"kind": "client", "name": "S0", "addressing": "dhcp", "services": ["dhcp"]})
+    bad = client.post(url, json={"kind": "client", "role": "server", "name": "S0", "addressing": "dhcp", "services": ["dhcp"]})
     assert bad.status_code == 400 and "fixed address" in bad.json()["detail"]
-    assert client.post(url, json={"kind": "client", "name": "S1", "address": "10.0.0.1/30",
+    assert client.post(url, json={"kind": "client", "role": "server", "name": "S1", "address": "10.0.0.1/30",
                                   "services": ["dhcp"]}).status_code == 400  # no room for a pool
     assert client.post(url, json={"name": "R9", "services": ["web"]}).status_code == 400  # clients only
-    srv = add_node(client, lab, kind="client", name="SRV", address="192.168.10.2/24", gateway="192.168.10.1",
+    srv = add_node(client, lab, kind="client", role="server", name="SRV", address="192.168.10.2/24", gateway="192.168.10.1",
                    dns="9.9.9.9", services=["dhcp", "dns"])
     client.rt.sh.history.clear()
     client.post(f"/api/labs/{lab}/nodes/{srv['id']}/start")
@@ -1386,7 +1456,7 @@ def test_client_services_are_stopped(client, tmp_path):
     import subprocess, sys, time as _time
 
     lab = make_lab(client)
-    pc = add_node(client, lab, kind="client", name="PC1", services=["iperf"])
+    pc = add_node(client, lab, kind="client", role="server", name="PC1", services=["iperf"])
     node = client.rt.store.state.lab(lab).node(pc["id"])
     proc = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)", "iperf3"])
     client.rt.s.run_dir.mkdir(parents=True, exist_ok=True)
@@ -1673,7 +1743,7 @@ def engines(client, monkeypatch):
 
 def test_docker_switch_and_engine_command(client):
     lab = make_lab(client)
-    pc = add_node(client, lab, kind="client", name="PC1")
+    pc = add_node(client, lab, kind="client", role="server", name="PC1")
     r1 = add_node(client, lab, name="R1")
     url = f"/api/labs/{lab}/nodes/{pc['id']}"
     assert client.post(f"/api/labs/{lab}/nodes/{r1['id']}/docker", json={"on": True}).status_code == 400
@@ -1702,7 +1772,7 @@ def test_docker_switch_and_engine_command(client):
 
 def test_container_rules(client):
     lab = make_lab(client)
-    pc = add_node(client, lab, kind="client", name="PC1")
+    pc = add_node(client, lab, kind="client", role="server", name="PC1")
     url = f"/api/labs/{lab}/nodes/{pc['id']}"
     client.post(f"{url}/docker", json={"on": True})
     bad = [
@@ -1728,7 +1798,7 @@ def test_containers_on_a_running_engine(client, engines):
     from mikrobox.docker import demux, run_command, split_ref
 
     lab = make_lab(client)
-    pc = add_node(client, lab, kind="client", name="PC1")
+    pc = add_node(client, lab, kind="client", role="server", name="PC1")
     url = f"/api/labs/{lab}/nodes/{pc['id']}"
     client.post(f"{url}/docker", json={"on": True})
     eng = engines(pc["id"])
@@ -1766,8 +1836,8 @@ def test_images_are_copied_between_pcs(client, engines):
     import time as _t
 
     lab = make_lab(client)
-    pc1 = add_node(client, lab, kind="client", name="PC1")
-    pc2 = add_node(client, lab, kind="client", name="PC2")
+    pc1 = add_node(client, lab, kind="client", role="server", name="PC1")
+    pc2 = add_node(client, lab, kind="client", role="server", name="PC2")
     for pc in (pc1, pc2):
         client.post(f"/api/labs/{lab}/nodes/{pc['id']}/docker", json={"on": True})
     engines(pc1["id"], images={"grafana/grafana"})
@@ -1806,7 +1876,7 @@ def test_nothing_is_run_from_the_noexec_run_folder(client, monkeypatch):
     from mikrobox import docker as dk
     assert client.rt.clients.script_path() == client.tmp / "data" / "bin" / "udhcpc.sh"
     lab = make_lab(client)
-    pc = add_node(client, lab, kind="client", name="PC2")
+    pc = add_node(client, lab, kind="client", role="server", name="PC2")
     url = f"/api/labs/{lab}/nodes/{pc['id']}"
     client.post(f"{url}/docker", json={"on": True})
     client.post(f"{url}/containers", json={"name": "uptime", "image": "louislam/uptime-kuma:1"})
@@ -1866,7 +1936,7 @@ def test_links_fall_back_when_the_kernel_lacks_matchall(tmp_path):
 
 def test_docker_in_console_and_on_delete(client, monkeypatch):
     lab = make_lab(client)
-    pc = add_node(client, lab, kind="client", name="PC1")
+    pc = add_node(client, lab, kind="client", role="server", name="PC1")
     client.post(f"/api/labs/{lab}/nodes/{pc['id']}/docker", json={"on": True})
     data = client.tmp / "data" / "docker" / f"n{pc['id']}"
     data.mkdir(parents=True)
@@ -1925,7 +1995,7 @@ def lab_pc(client, monkeypatch):
     """A running PC whose 'inside' is this machine, so links reach the test pages."""
     import socket as _s
     lab = make_lab(client)
-    pc = add_node(client, lab, kind="client", name="PC1")
+    pc = add_node(client, lab, kind="client", role="server", name="PC1")
     running = {pc["id"]}
     monkeypatch.setattr(client.rt, "node_running", lambda n: n.id in running)
     links = client.app.state.weblinks

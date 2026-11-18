@@ -33,7 +33,7 @@ def markdown(lab: Lab, rt, backups, has_image: bool) -> str:
             "| Name | Type | Ports | vCPUs | RAM (MB) | Address | State |",
             "|---|---|---|---|---|---|---|"]
     for n in lab.nodes:
-        kind = ("Client" if n.kind == NodeKind.client else
+        kind = (("Linux server" if n.role == "server" else "Linux PC") if n.kind == NodeKind.client else
                 ("Layer 3 switch (CHR)" if n.layer == 3 else "Switch (CHR)") if n.role == "switch" else "Router (CHR)")
         address = rt.mgmt_ip(lab, n) or (n.address if n.kind == NodeKind.client else None) or ""
         state = "Running" if rt.node_running(n) else "Stopped"

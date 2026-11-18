@@ -114,7 +114,7 @@ class Net:
 
     def create_client(
         self, ns: str, ifaces: list[str], address: str | None, gateway: str | None,
-        dns: str | None = None,
+        dns: str | None = None, bond: str | None = None, extra: list | None = None,
     ) -> None:
         self.sh.run(["ip", "netns", "add", ns])
         # `ip netns exec` shows this file to the client as its /etc/resolv.conf.
@@ -140,8 +140,23 @@ class Net:
             self._quiet(host_if)
             self.sh.run(["ip", "link", "set", host_if, "up"])
             self.sh.run(["ip", "-n", ns, "link", "set", f"eth{i}", "up"])
+        primary = "eth0"
+        if bond and len(ifaces) > 1:
+            # A server's NICs in one bond. LACP talks to the other side (a RouterOS bond
+            # in 802.3ad mode); active-backup needs nothing from it.
+            mode = (["mode", "802.3ad", "miimon", "100", "lacp_rate", "fast", "xmit_hash_policy", "layer3+4"]
+                    if bond == "lacp" else ["mode", "active-backup", "miimon", "100"])
+            self.sh.run(["ip", "-n", ns, "link", "add", "bond0", "type", "bond", *mode])
+            for i in range(len(ifaces)):
+                self.sh.run(["ip", "-n", ns, "link", "set", f"eth{i}", "down"])
+                self.sh.run(["ip", "-n", ns, "link", "set", f"eth{i}", "master", "bond0"])
+            self.sh.run(["ip", "-n", ns, "link", "set", "bond0", "up"])
+            primary = "bond0"
         if address:
-            self.sh.run(["ip", "-n", ns, "addr", "add", address, "dev", "eth0"])
+            self.sh.run(["ip", "-n", ns, "addr", "add", address, "dev", primary])
+        for i, extra_addr in enumerate(extra or [], start=1):
+            if extra_addr and i < len(ifaces) and primary == "eth0":
+                self.sh.run(["ip", "-n", ns, "addr", "add", extra_addr, "dev", f"eth{i}"])
         if gateway:
             self.sh.run(["ip", "-n", ns, "route", "add", "default", "via", gateway])
 
@@ -149,10 +164,8 @@ class Net:
         self.sh.run(["ip", "netns", "del", ns], check=False)
         shutil.rmtree(self.s.netns_etc / ns, ignore_errors=True)
 
-    def client_addr(self, ns: str, port: int, cidr: str) -> None:
-        self.sh.run(
-            ["ip", "-n", ns, "addr", "replace", cidr, "dev", f"eth{port - 1}"]
-        )
+    def client_addr(self, ns: str, dev: str, cidr: str) -> None:
+        self.sh.run(["ip", "-n", ns, "addr", "replace", cidr, "dev", dev])
 
     # -- links -----------------------------------------------------------
 

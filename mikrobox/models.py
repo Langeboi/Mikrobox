@@ -7,7 +7,7 @@ import re
 from enum import Enum
 from typing import Literal, Optional
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 NAME_PATTERN = r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,62}$"
 
@@ -57,8 +57,10 @@ class ContainerSpec(BaseModel):
 class Node(BaseModel):
     id: int
     kind: NodeKind
-    # How a CHR is presented. A switch is still a full CHR, just drawn and sized as one.
-    role: Literal["router", "switch"] = "router"
+    # What it is. A CHR is a router or a switch (a switch is still a full CHR, just drawn
+    # and sized as one). A Linux client is a PC (one NIC, the troubleshooting tools) or a
+    # server (up to four NICs and bonding, services, Docker).
+    role: Literal["router", "switch", "pc", "server"] = "router"
     layer: Literal[2, 3] = 2  # switches: layer 2, or layer 3 (routes between its VLANs)
     name: str = Field(pattern=NAME_PATTERN)
     ports: int = Field(ge=1)
@@ -70,11 +72,46 @@ class Node(BaseModel):
     dns: Optional[str] = None  # one to three resolver addresses, comma separated
     addressing: Literal["static", "dhcp"] = "static"  # clients: fixed address, or ask DHCP
     services: list[Literal["web", "iperf", "dhcp", "dns"]] = Field(default_factory=list)  # clients only
-    docker: bool = False  # clients only: run a Docker engine on this PC
+    docker: bool = False  # servers only: run a Docker engine on it
     containers: list[ContainerSpec] = Field(default_factory=list, max_length=32)  # saved with the lab
+    # Servers with two or more NICs: all of them in bond0, which then has the address.
+    bond: Optional[Literal["lacp", "active-backup"]] = None
+    # Servers, without a bond: fixed addresses for eth1, eth2 and eth3 (blank for none).
+    nic_addresses: list[Optional[str]] = Field(default_factory=list, max_length=3)
     # Position on the topology canvas.
     x: float = 0
     y: float = 0
+
+    @model_validator(mode="before")
+    @classmethod
+    def _client_role(cls, data):
+        # Clients used to have no role of their own (stored as "router"). Those that ran
+        # services or Docker, or had more than one NIC, were servers in all but name.
+        if isinstance(data, dict) and str(getattr(data.get("kind"), "value", data.get("kind"))) == "client" \
+                and data.get("role") in (None, "router"):
+            server = bool(data.get("services") or data.get("docker") or data.get("containers")) or (data.get("ports") or 1) > 1
+            data = {**data, "role": "server" if server else "pc"}
+        return data
+
+    @field_validator("nic_addresses")
+    @classmethod
+    def _check_nic_addresses(cls, v: list) -> list:
+        out = []
+        for a in v:
+            a = (a or "").strip() or None
+            if a is not None:
+                ipaddress.ip_interface(a)
+                if "/" not in a:
+                    raise ValueError("NIC addresses need a prefix length, e.g. 10.20.0.5/24")
+            out.append(a)
+        while out and out[-1] is None:
+            out.pop()
+        return out
+
+    @property
+    def primary_iface(self) -> str:
+        """Where a client's address, DHCP and services live."""
+        return "bond0" if self.bond else "eth0"
 
     @field_validator("address")
     @classmethod

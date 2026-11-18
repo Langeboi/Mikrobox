@@ -24,9 +24,16 @@ apt-get install -y --no-install-recommends \
   traceroute iputils-ping bash python3 python3-venv unzip curl ca-certificates \
   iperf3 dnsutils nmap mtr-tiny netcat-openbsd busybox iputils-arping tshark
 
+echo "==> Bonding for servers"
+# Servers bond their NICs inside their own namespace. max_bonds=0 stops the module from
+# making a bond0 on the VM itself when it loads.
+echo "options bonding max_bonds=0" > /etc/modprobe.d/mikrobox-bonding.conf
+echo bonding > /etc/modules-load.d/mikrobox-bonding.conf
+modprobe bonding max_bonds=0 2>/dev/null || echo "    Could not load the bonding module; servers can't bond their NICs." >&2
+
 if [ "${WITH_DOCKER:-1}" != 0 ]; then
-  echo "==> Installing Docker for Linux PCs"
-  # Each PC that has Docker turned on runs its own engine inside the PC; the VM
+  echo "==> Installing Docker for Linux servers"
+  # Each server that has Docker turned on runs its own engine inside it; the VM
   # itself does not need one. Keep the packages from starting one: Docker on the
   # VM would set the firewall to drop forwarded traffic, which the Cloud needs.
   HOLD=""
