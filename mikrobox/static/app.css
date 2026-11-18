@@ -546,3 +546,31 @@ a.button.primary { background: var(--accent); border-color: var(--accent); color
 
 .seg.layer button:disabled { opacity: .6; cursor: default; }
 .grid2.nics { grid-template-columns: 76px minmax(0, 1fr); }
+
+/* ---- VLANs on a PC or server ---- */
+.vlan-rows { display: flex; flex-direction: column; gap: 6px; }
+.vlan-row { display: grid; grid-template-columns: 78px 70px minmax(0, 1fr) 30px; gap: 6px; align-items: center; }
+.vlan-row.one-nic { grid-template-columns: 76px minmax(0, 1fr) 30px; }
+.vlan-row .icon-btn { width: 30px; height: 32px; min-height: 32px; border-color: transparent; background: none; color: var(--muted); font-size: 16px; }
+.vlan-rows:empty { display: none; }
+
+/* ---- check this server ---- */
+.check-sum { margin: -4px 0 6px; padding: 10px 12px; border-radius: 10px; font-weight: 600; }
+.check-sum.ok { background: color-mix(in srgb, var(--ok) 12%, var(--surface)); color: var(--ok); }
+.check-sum.warn { background: color-mix(in srgb, #d98a00 14%, var(--surface)); color: #9a5400; }
+.check-sum.fail { background: color-mix(in srgb, var(--danger) 12%, var(--surface)); color: var(--danger); }
+:root[data-theme="dark"] .check-sum.warn { color: #f0b264; }
+.check-group { margin: 14px 0 0; }
+.check-group h3 { margin: 0 0 6px; font-size: 12.5px; font-weight: 600; color: var(--muted); text-transform: none; }
+.check { display: flex; gap: 10px; align-items: flex-start; padding: 8px 0; border-top: 1px solid var(--line); }
+.check:first-of-type { border-top: 0; }
+.check-mark { flex: none; width: 22px; height: 22px; border-radius: 50%; display: inline-flex; align-items: center; justify-content: center;
+  font-size: 12px; font-weight: 700; color: #fff; background: #98a2b0; margin-top: 1px; }
+.check.ok .check-mark { background: var(--ok); }
+.check.warn .check-mark { background: #d98a00; }
+.check.fail .check-mark { background: var(--danger); }
+.check-text { display: flex; flex-direction: column; gap: 3px; min-width: 0; font-size: 13.5px; }
+.check-text > span { color: var(--muted); line-height: 1.45; overflow-wrap: anywhere; }
+.check-text .fix { color: var(--text); }
+.check-text .copy { margin-top: 4px; }
+.check-group > button { margin: 6px 0 4px; }

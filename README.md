@@ -114,6 +114,11 @@ Windows-only H3C Cloud Lab, so neither is included.
 - A Cloud that gives linked devices internet and makes them reachable from your PC,
   either through the VM (NAT) or directly on your own network (bridged).
 - A browser workspace with a topology canvas (pan, zoom, snap), device settings and docked consoles.
+- Check this server (Settings, or the Tools menu): what Mikrobox needs from the VM, each
+  checked and with a fix when it is missing: KVM, the CHR image, memory, disk, programs,
+  the Cloud, IP forwarding, whether links, bonds and VLANs can be made, Docker, and the
+  firewall for web links. Its Docker test starts an engine the way a server does,
+  downloads hello-world from Docker Hub and runs it.
 - Editing: select several things with Shift+click or by Shift+dragging a box (Ctrl+A for
   all), drag them together, align or space them out. Copy and paste (Ctrl+C, Ctrl+V, or
   Ctrl+D to duplicate) brings the links between the copied devices along, pastes at the
@@ -132,7 +137,9 @@ Windows-only H3C Cloud Lab, so neither is included.
   console. A server has one to four NICs, which can be bonded (LACP or active-backup) into
   bond0, and runs services and Docker. Either takes a fixed address, gateway and DNS
   servers, or asks DHCP for all three; a server's other NICs can have addresses of their
-  own. A PC can be turned into a server and back in its settings. Clients from before this
+  own. Both can have tagged 802.1Q VLAN interfaces (up to eight) on their NICs or the bond,
+  each with its own address, for a trunk port; a server's DNS answers on them too, its
+  DHCP stays on the main interface. A PC can be turned into a server and back in its settings. Clients from before this
   split became servers if they ran services or Docker or had more than one NIC.
 - Server services, switched on per server: a web server on port 80, an iperf3 server, a
   DHCP server (hands out .100-.199 of its subnet) and a DNS server that answers for every
@@ -339,8 +346,8 @@ Add `?seconds=30` for a capture that ends by itself; the workspace's Capture lin
   Mikrobox's sign-in cookie too. Two things make that harmless: Mikrobox refuses changes
   and websockets that come from any page but its own, and a sign-in only works from the
   address it was made from (so you sign in again if your computer's address changes).
-- Server bonding was tested by the commands it runs, not live: the test machine has no
-  bonding module. The installer loads it with `max_bonds=0`, so the VM gets no bond0 of its
+- Server bonding and VLANs were tested by the commands they run, not live: the test
+  machine has neither kernel module. Check this server shows whether your VM has them. The installer loads it with `max_bonds=0`, so the VM gets no bond0 of its
   own. A server bonded with LACP needs a RouterOS bond in 802.3ad mode on the other side.
 - If Docker runs on the VM itself, it may set the firewall to drop forwarded traffic,
   which stops the Cloud's NAT; allow `mbcloud` in Docker's `DOCKER-USER` chain.

@@ -55,6 +55,27 @@ class ContainerSpec(BaseModel):
         return v
 
 
+class Vlan(BaseModel):
+    """A tagged 802.1Q interface on a PC's or server's NIC (or bond), e.g. eth0.10."""
+    id: int = Field(ge=1, le=4094)
+    nic: str = Field(default="eth0", pattern=r"^(eth[0-3]|bond0)$")
+    address: Optional[str] = None
+
+    @field_validator("address")
+    @classmethod
+    def _check_address(cls, v: Optional[str]) -> Optional[str]:
+        v = (v or "").strip() or None
+        if v is not None:
+            ipaddress.ip_interface(v)
+            if "/" not in v:
+                raise ValueError("VLAN addresses need a prefix length, e.g. 10.10.0.5/24")
+        return v
+
+    @property
+    def iface(self) -> str:
+        return f"{self.nic}.{self.id}"
+
+
 class Node(BaseModel):
     id: int
     kind: NodeKind
@@ -79,6 +100,8 @@ class Node(BaseModel):
     bond: Optional[Literal["lacp", "active-backup"]] = None
     # Servers, without a bond: fixed addresses for eth1, eth2 and eth3 (blank for none).
     nic_addresses: list[Optional[str]] = Field(default_factory=list, max_length=3)
+    # PCs and servers: tagged VLAN interfaces on their NICs (or the bond).
+    vlans: list[Vlan] = Field(default_factory=list, max_length=8)
     # Position on the topology canvas.
     x: float = 0
     y: float = 0

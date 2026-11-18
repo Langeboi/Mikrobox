@@ -112,6 +112,9 @@ class ClientServices:
         argv = ["dnsmasq", "--keep-in-foreground", "--conf-file=/dev/null", f"--interface={node.primary_iface}",
                 "--bind-interfaces", f"--pid-file={run / f'n{node.id}.dnsmasq-own.pid'}"]
         if "dns" in node.services:
+            # DNS answers on its VLANs too; DHCP stays on the main interface (no range there).
+            argv += [f"--interface={v.iface}" for v in node.vlans if v.address]
+        if "dns" in node.services:
             upstream = [d for d in (node.dns.split(", ") if node.dns else host_nameservers()) if d != own]
             argv += ["--port=53", "--no-resolv", "--no-hosts", "--domain=lab", "--expand-hosts",
                      "--local=/lab/", f"--addn-hosts={run / f'n{node.id}.hosts'}"]

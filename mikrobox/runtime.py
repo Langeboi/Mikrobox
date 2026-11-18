@@ -273,12 +273,17 @@ class Runtime:
                         node.dns if static else None,
                         bond=node.bond if node.role == "server" else None,
                         extra=node.nic_addresses if node.role == "server" else None,
+                        vlans=node.vlans,
                     )
                 except CommandError as e:
                     self.net.delete_client(self.netns(node.id))
-                    if node.bond and "bond" in str(e).lower():
+                    text = str(e).lower()
+                    if node.bond and "type bond" in text:
                         raise Conflict("This VM can't make bonds: the bonding kernel module is missing. "
                                        "Run the installer again, or sudo modprobe bonding max_bonds=0.")
+                    if node.vlans and "type vlan" in text:
+                        raise Conflict("This VM can't make VLAN interfaces: the 8021q kernel module is missing. "
+                                       "Run the installer again, or sudo modprobe 8021q.")
                     raise
                 self.clients.start(lab, node)
                 self.docker.start(lab, node)

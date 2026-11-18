@@ -37,7 +37,7 @@ from .packets import decode as decode_packet
 from .images import MAX_UPLOAD, ImageError, Importer
 from .platforms import PLATFORMS, is_vm, platform
 from .models import (
-    NAME_PATTERN, Annotation, ContainerSpec, Endpoint, Lab, Link, Node, NodeKind, default_chr_ram, free_id,
+    NAME_PATTERN, Annotation, ContainerSpec, Endpoint, Lab, Link, Node, NodeKind, Vlan, default_chr_ram, free_id,
 )
 from .docker import EngineError
 from .weblinks import LinkError, WebLinks, parse_url, plain_ip
@@ -45,6 +45,7 @@ from .runtime import Conflict, Invalid, NotFound, Runtime
 from .shell import CommandError
 from .store import Store
 from .trash import Trash, free_name
+from .selfcheck import SelfCheck
 
 STATIC = Path(__file__).parent / "static"
 ANNO_WORDS = {"rect": "an area", "ellipse": "an area", "text": "a text label", "note": "a note"}
@@ -66,6 +67,7 @@ class NodeCreate(BaseModel):
     layer: Literal[2, 3] = 2
     bond: Optional[Literal["lacp", "active-backup"]] = None
     nic_addresses: list[Optional[str]] = Field(default_factory=list, max_length=3)
+    vlans: list[Vlan] = Field(default_factory=list, max_length=8)
     name: str = Field(pattern=NAME_PATTERN)
     ports: Optional[int] = Field(default=None, ge=1)
     cpus: Optional[int] = Field(default=None, ge=1, le=8)
@@ -99,6 +101,7 @@ class NodeUpdate(BaseModel):
     role: Optional[Literal["pc", "server"]] = None  # clients only
     bond: Optional[Literal["lacp", "active-backup"]] = None  # servers; null for no bond
     nic_addresses: Optional[list[Optional[str]]] = Field(default=None, max_length=3)
+    vlans: Optional[list[Vlan]] = Field(default=None, max_length=8)
     ports: Optional[int] = Field(default=None, ge=1)
     cpus: Optional[int] = Field(default=None, ge=1, le=8)
     ram_mb: Optional[int] = Field(default=None, ge=128, le=16384)
@@ -271,6 +274,7 @@ class PasteNode(BaseModel):
     role: Literal["router", "switch", "pc", "server"] = "router"
     bond: Optional[Literal["lacp", "active-backup"]] = None
     nic_addresses: list[Optional[str]] = Field(default_factory=list, max_length=3)
+    vlans: list[Vlan] = Field(default_factory=list, max_length=8)
     layer: Literal[2, 3] = 2
     name: str = Field(pattern=NAME_PATTERN)
     ports: int = Field(ge=1)
@@ -317,6 +321,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     weblinks = WebLinks(rt, settings.web_ports, on_change=lambda: events.publish({"t": "web"}))
     trash = Trash(settings.data_dir / "trash")
     trash.purge()
+    selfcheck = SelfCheck(rt, settings.web_ports)
     store.on_save = lambda: events.publish({"t": "labs"})
     backups.activity, backups.events = activity, events
 
@@ -432,7 +437,18 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 raise Invalid("Docker runs on Linux servers only.")
             if node.bond or node.nic_addresses:
                 raise Invalid("Bonding and NIC addresses are for Linux servers.")
+            if node.vlans:
+                raise Invalid("VLANs here are for PCs and servers; on routers and switches, set them up in RouterOS.")
             return
+        seen = set()
+        for v in node.vlans:
+            if node.bond and v.nic != "bond0":
+                raise Invalid(f"{node.name}'s NICs are bonded: put VLAN {v.id} on bond0.")
+            if not node.bond and (v.nic == "bond0" or int(v.nic[3:]) >= node.ports):
+                raise Invalid(f"VLAN {v.id} is on {v.nic}, which {node.name} doesn't have.")
+            if (v.nic, v.id) in seen:
+                raise Invalid(f"VLAN {v.id} is on {v.nic} twice.")
+            seen.add((v.nic, v.id))
         if node.role == "pc":
             # A PC is for testing from: one NIC and the tools. Servers do the rest.
             if node.services or node.docker or node.containers:
@@ -657,6 +673,16 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     def set_ksm(body: KsmSetting):
         """Switch memory sharing between devices on or off."""
         return rt.ksm.set(body.enabled)
+
+    @app.get("/api/system/check")
+    async def system_check():
+        """What Mikrobox needs from this VM, checked, with fixes (see selfcheck.py)."""
+        return {"version": __version__, "checks": await run_in_threadpool(selfcheck.run)}
+
+    @app.post("/api/system/check/docker")
+    async def system_check_docker():
+        """Start a Docker engine the way a server does, pull hello-world and run it."""
+        return await run_in_threadpool(selfcheck.docker_test)
 
     @app.get("/", include_in_schema=False)
     def index_page():
@@ -895,7 +921,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             node = Node(
                 id=free_id({n.id for n in store.state.all_nodes()}),
                 kind=body.kind, role=role, layer=body.layer, name=body.name, ports=ports, cpus=cpus,
-                bond=body.bond, nic_addresses=body.nic_addresses,
+                bond=body.bond, nic_addresses=body.nic_addresses, vlans=body.vlans,
                 ram_mb=ram, address=body.address, gateway=body.gateway, dns=body.dns,
                 addressing=body.addressing, services=sorted(set(body.services)),
                 x=body.x, y=body.y,
@@ -912,7 +938,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             lab = get_lab(lab_id)
             node = get_node(lab, node_id)
             changes = body.model_dump(exclude_unset=True)
-            for key in ("x", "y", "name", "ports", "cpus", "ram_mb", "layer", "role", "nic_addresses"):
+            for key in ("x", "y", "name", "ports", "cpus", "ram_mb", "layer", "role", "nic_addresses", "vlans"):
                 if changes.get(key, 0) is None:
                     del changes[key]
             if "layer" in changes and node.role != "switch":
@@ -952,7 +978,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             if settings_changed:
                 words = {"ports": "ports", "cpus": "vCPUs", "ram_mb": "RAM", "address": "address",
                          "gateway": "gateway", "dns": "DNS", "addressing": "addressing", "services": "services",
-                         "bond": "bonding", "nic_addresses": "NIC addresses"}
+                         "bond": "bonding", "nic_addresses": "NIC addresses", "vlans": "VLANs"}
                 activity.record(f"changed {updated.name}'s {', '.join(words.get(k, k) for k in settings_changed)}", lab)
             return node_view(lab, updated)
 
@@ -1127,10 +1153,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 data = spec.model_dump(exclude={"ref", "source"})
                 if spec.kind != NodeKind.client:
                     data.update(address=None, gateway=None, dns=None, addressing="static", services=[],
-                                docker=False, containers=[], bond=None, nic_addresses=[])
+                                docker=False, containers=[], bond=None, nic_addresses=[], vlans=[])
                 elif same_lab:
                     # Two clients with one address would only confuse; DHCP and DNS servers need one.
                     data["nic_addresses"] = []
+                    data["vlans"] = [{**v, "address": None} for v in data["vlans"]]
                     if data["addressing"] == "static" and data["address"]:
                         data.update(address=None, services=[x for x in data["services"] if x not in ("dhcp", "dns")])
                 if spec.role != "switch":
