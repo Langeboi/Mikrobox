@@ -495,7 +495,7 @@ a.button.primary { background: var(--accent); border-color: var(--accent); color
 .pv.logs .logs-out { flex: 1; min-height: 0; margin: 0; padding: 10px 12px; overflow: auto; font: 12.5px/1.5 ui-monospace, "SF Mono", Consolas, monospace; white-space: pre-wrap; overflow-wrap: anywhere; background: var(--surface); color: var(--text); }
 
 
-/* ---- the viewer tab (test build) ---- */
+/* ---- the viewer tab ---- */
 .open-pair { display: inline-flex; gap: 4px; }
 .open-pair .open-btn:last-child { padding: 0 6px; }
 .pv.viewer { display: flex; flex-direction: column; min-height: 0; }

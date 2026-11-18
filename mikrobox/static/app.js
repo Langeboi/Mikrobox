@@ -2302,7 +2302,7 @@ function openContainerLogs(n, name) {
 
 function openWebDialog(pre = {}) {
   const pcs = state.lab.nodes.filter((x) => x.kind === "client" && x.running);
-  if (!pcs.length) { toast("Start a Linux client first: pages are opened from one."); return; }
+  if (!pcs.length) { toast("Start a PC or server first: pages are opened from one."); return; }
   const from = h("select", { id: "w-from" }, pcs.map((x) => h("option", { value: x.id }, `${x.name}${clientAddress(x) ? " · " + clientAddress(x).split("/")[0] : ""}`)));
   if (pre.node && pcs.some((x) => x.id === pre.node)) from.value = String(pre.node);
   const targets = h("fieldset", { class: "targets" }, h("legend", {}, "What to open"));
@@ -2397,7 +2397,7 @@ function openWebDialog(pre = {}) {
   how();
 }
 
-// ---------------------------------------------------------------- the viewer tab (test build)
+// ---------------------------------------------------------------- the viewer tab
 //
 // A lab web page in a tab of the bottom panel. It goes through a "view" link (weblinks.py),
 // which makes the page fit for a frame; HTTPS pages are fetched without checking their
