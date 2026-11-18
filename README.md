@@ -61,6 +61,10 @@ available through the API (interactive docs at `/docs`).
   any address (a router's WebFig, say). HTTPS passes through untouched, so you see the
   page's own certificate. Links can be for your computer only or for anyone, are listed
   under Tools › Web access, and close when their client stops or after 8 hours unused.
+- Viewer tabs: the same pages in a tab of the bottom panel instead, with an
+  address bar, reload and a button to pop it out. The viewer fetches HTTPS pages without
+  checking their certificate (the tab says so) and lifts the headers that stop pages from
+  being shown in a frame, so router pages and dashboards that refuse frames still open.
 - A live packet view in the browser (Tools menu, or Packets on any running port), with
   capture filters, alongside pcap download for Wireshark. Clicking a packet shows the
   full protocol tree from tshark and its bytes: pointing at a field highlights its bytes,

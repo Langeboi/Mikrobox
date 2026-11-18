@@ -544,3 +544,22 @@ a.button.primary { background: var(--accent); border-color: var(--accent); color
 .check-text .fix { color: var(--text); }
 .check-text .copy { margin-top: 4px; }
 .check-group > button { margin: 6px 0 4px; }
+/* ---- the viewer tab ---- */
+.open-pair { display: inline-flex; gap: 4px; }
+.open-pair .open-btn:last-child { padding: 0 6px; }
+.pv.viewer { display: flex; flex-direction: column; min-height: 0; }
+.vw-bar { display: flex; align-items: center; gap: 6px; padding: 6px 10px; border-bottom: 1px solid var(--line); background: var(--surface); }
+.vw-bar .icon-btn { width: 32px; height: 32px; min-height: 32px; border-color: transparent; background: none; color: var(--muted); }
+.vw-bar .icon-btn:hover { background: var(--surface-2); color: var(--text); }
+.vw-addr { flex: 1; min-width: 160px; height: 32px; min-height: 32px; font-size: 13px; border-radius: 16px; padding: 0 14px; background: var(--surface-2); }
+.vw-scheme { flex: none; padding: 3px 9px; border-radius: 6px; font-size: 11.5px; font-weight: 600; background: var(--surface-2); color: var(--muted); cursor: help; }
+.vw-scheme.https { background: color-mix(in srgb, #d98a00 14%, var(--surface)); color: #9a5400; }
+:root[data-theme="dark"] .vw-scheme.https { color: #f0b264; }
+.vw-from { flex: none; font-size: 12.5px; color: var(--muted); }
+.vw-body { position: relative; flex: 1; min-height: 0; background: #fff; }
+.vw-frame { display: block; width: 100%; height: 100%; border: 0; background: #fff; }
+.vw-overlay { position: absolute; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 8px; background: var(--bg); color: var(--text); text-align: center; padding: 20px; }
+.vw-overlay[hidden] { display: none; }
+.vw-overlay span { color: var(--muted); font-size: 13.5px; }
+.vw-overlay button { margin-top: 6px; }
+@media (max-width: 640px) { .vw-from { display: none; } }

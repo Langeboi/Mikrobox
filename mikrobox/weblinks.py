@@ -8,6 +8,11 @@ pass straight through: HTTP stays HTTP, HTTPS stays HTTPS with the page's own ce
 
 A link answers only the computer that made it unless asked otherwise. Links close when
 their PC stops, after IDLE_HOURS without use, or when Mikrobox restarts.
+
+A "view" link is for the viewer tab inside Mikrobox instead: it speaks plain HTTP to your
+browser and HTTP or HTTPS (certificate not checked) to the page, one request per
+connection, and adjusts each request and answer so the page works in a frame (see
+_serve_view). It always answers only the computer that opened it.
 """
 
 from __future__ import annotations
@@ -48,13 +53,31 @@ class Link:
     used: float = field(default_factory=time.time)
     server: asyncio.base_events.Server | None = None
     conns: set = field(default_factory=set)
+    mode: str = "link"  # or "view", for the viewer tab
+    name: str = ""      # the host name the page expects (Host header, TLS name)
+    page: str = ""      # view links: the last page the frame went to, for its address bar
+
+    @property
+    def target(self) -> str:
+        """Where the page is, as the PC would write it: https://10.0.0.1:8443"""
+        return f"{self.scheme}://{self.authority}"
+
+    @property
+    def authority(self) -> str:
+        name = self.name or self.host
+        shown = f"[{name}]" if ":" in name else name
+        default = (self.scheme, self.port) in (("http", 80), ("https", 443))
+        return shown if default else f"{shown}:{self.port}"
 
     def view(self, host: str) -> dict:
         shown = f"[{host}]" if ":" in host else host
+        scheme = "http" if self.mode == "view" else self.scheme
         return {
             "id": self.id, "lab": self.lab, "node": self.node, "node_name": self.node_name,
-            "title": self.title, "detail": self.detail, "scheme": self.scheme,
-            "url": f"{self.scheme}://{shown}:{self.listen}{self.path}", "port": self.listen,
+            "title": self.title, "detail": self.detail, "scheme": self.scheme, "mode": self.mode,
+            "url": f"{scheme}://{shown}:{self.listen}{self.path}", "port": self.listen,
+            "base": f"{scheme}://{shown}:{self.listen}", "target": self.target, "path": self.path,
+            "page": self.page or self.path,
             "who": "me" if self.allow else "anyone", "allow": self.allow, "by": self.by,
             "created": self.created, "used": self.used,
         }
@@ -132,15 +155,22 @@ class WebLinks:
     # -- links ----------------------------------------------------------------
 
     async def open(self, *, lab, node, title: str, detail: str, host: str, port: int, scheme: str | None,
-                   path: str, allow: str | None, by: str) -> Link:
+                   path: str, allow: str | None, by: str, mode: str = "link", name: str = "") -> Link:
         if scheme is None:
             scheme = await self.detect(node.id, host, port)
+        if mode == "view":
+            # One viewer link per page and person is enough: reuse it.
+            for l in self.links.values():
+                if (l.mode, l.node, l.host, l.port, l.scheme, l.allow, l.name) == (mode, node.id, host, port, scheme, allow, name or host):
+                    l.path, l.used = path or "/", time.time()
+                    return l
         used = {l.listen for l in self.links.values()}
         for listen in range(self.first, self.last + 1):
             if listen in used:
                 continue
             link = Link(id=self.next_id, lab=lab.id, node=node.id, node_name=node.name, title=title, detail=detail,
-                        host=host, port=port, scheme=scheme, path=path or "/", listen=listen, allow=allow, by=by)
+                        host=host, port=port, scheme=scheme, path=path or "/", listen=listen, allow=allow, by=by,
+                        mode=mode, name=name or host)
             try:
                 link.server = await asyncio.start_server(lambda r, w, l=link: self._serve(l, r, w), "0.0.0.0", listen,
                                                          reuse_address=True)
@@ -158,6 +188,14 @@ class WebLinks:
             writer.close()
             return
         link.used = time.time()
+        if link.mode == "view":
+            link.conns.add(writer)
+            try:
+                await self._serve_view(link, reader, writer)
+            finally:
+                link.conns.discard(writer)
+                writer.close()
+            return
         link.conns.add(writer)
         upstream = None
         try:
@@ -174,6 +212,83 @@ class WebLinks:
                         w.close()
                     except Exception:
                         pass
+
+    # -- the viewer -----------------------------------------------------------
+
+    async def _serve_view(self, link: Link, reader, writer) -> None:
+        """One request from the viewer frame, passed to the page and its answer back.
+
+        On the way in: Host, Origin and Referer name the page's own address, and
+        Mikrobox's session cookie stays here. On the way out: headers that forbid
+        framing go, redirects to the page's address come back to this link, and
+        cookies lose Secure (this side is plain HTTP) and Domain.
+        """
+        try:
+            head = await asyncio.wait_for(reader.readuntil(b"\r\n\r\n"), 30)
+        except (asyncio.IncompleteReadError, asyncio.LimitOverrunError, asyncio.TimeoutError, OSError):
+            return
+        lines = head.decode("latin-1").split("\r\n")
+        parts = lines[0].split(" ")
+        if len(parts) != 3 or not parts[2].startswith("HTTP/"):
+            return
+        headers = [tuple(x.split(":", 1)) for x in lines[1:] if ":" in x]
+        headers = [(k.strip(), v.strip()) for k, v in headers]
+        get = lambda name: next((v for k, v in headers if k.lower() == name), "")
+        here = "http://" + (get("host") or f"localhost:{link.listen}")
+        there = link.target
+        upgrade = "upgrade" in get("connection").lower() and bool(get("upgrade"))
+        if parts[0] == "GET" and get("sec-fetch-dest") in ("iframe", "document"):
+            link.page = parts[1]  # the frame went there: the tab's address bar follows
+        out = [f"{parts[0]} {parts[1]} HTTP/1.1", f"Host: {link.authority}"]
+        for k, v in headers:
+            low = k.lower()
+            if low in ("host", "connection", "keep-alive", "proxy-connection", "upgrade"):
+                continue
+            if low == "origin" and v == here:
+                v = there
+            elif low == "referer" and v.startswith(here):
+                v = there + v[len(here):]
+            elif low == "cookie":
+                v = "; ".join(c for c in v.split("; ") if not c.strip().startswith("mikrobox_session"))
+                if not v:
+                    continue
+            out.append(f"{k}: {v}")
+        out += ["Connection: Upgrade", f"Upgrade: {get('upgrade')}"] if upgrade else ["Connection: close"]
+
+        try:
+            sock = await self.connect(link.node, link.host, link.port)
+            tls = None
+            if link.scheme == "https":
+                tls = ssl.create_default_context()
+                tls.check_hostname = False
+                tls.verify_mode = ssl.CERT_NONE
+            try:
+                ipaddress.ip_address(link.name)
+                sni = None
+            except ValueError:
+                sni = link.name
+            # With a socket of our own, asyncio wants a name for TLS; "" sends none (an address).
+            r2, w2 = await asyncio.wait_for(asyncio.open_connection(sock=sock, ssl=tls, server_hostname=(sni or "") if tls else None), 10)
+        except (OSError, asyncio.TimeoutError, ssl.SSLError):
+            body = f"Mikrobox could not reach {there} from {link.node_name}.".encode()
+            writer.write(b"HTTP/1.1 502 Bad Gateway\r\nContent-Type: text/plain; charset=utf-8\r\n"
+                         b"Content-Length: %d\r\nConnection: close\r\n\r\n%s" % (len(body), body))
+            await writer.drain()
+            return
+        try:
+            w2.write(("\r\n".join(out) + "\r\n\r\n").encode("latin-1"))
+            sending = asyncio.ensure_future(self._pipe(reader, w2, link))
+            try:
+                answer = await asyncio.wait_for(r2.readuntil(b"\r\n\r\n"), 120)
+            except (asyncio.IncompleteReadError, asyncio.LimitOverrunError, asyncio.TimeoutError, OSError):
+                sending.cancel()
+                return
+            writer.write(rewrite_answer(answer, here, there, link.authority).encode("latin-1"))
+            await writer.drain()
+            await self._pipe(r2, writer, link)
+            sending.cancel()
+        finally:
+            w2.close()
 
     @staticmethod
     async def _pipe(r, w, link: Link) -> None:
@@ -222,6 +337,52 @@ class WebLinks:
             limit = time.time() - IDLE_HOURS * 3600
             for l in [l for l in self.links.values() if l.used < limit and not l.conns]:
                 self.close(l.id)
+
+
+_DROP = {"x-frame-options", "strict-transport-security", "connection", "keep-alive", "public-key-pins"}
+
+
+def rewrite_answer(head: bytes, here: str, there: str, authority: str) -> str:
+    """A response head from the page, made fit for the viewer frame (see _serve_view)."""
+    lines = head.decode("latin-1").split("\r\n")
+    status, out = lines[0], [lines[0]]
+    upgraded = status.split(" ")[1:2] == ["101"]
+    scheme = there.split("://")[0]
+    # Every way the page may write its own address: with and without the default port.
+    bare = authority.rsplit(":", 1)[0] if authority.endswith((":80", ":443")) else authority
+    origins = {there, f"{scheme}://{bare}", f"{scheme}://{bare}:{443 if scheme == 'https' else 80}"}
+    for line in lines[1:]:
+        if ":" not in line:
+            continue
+        k, v = line.split(":", 1)
+        k, v, low = k.strip(), v.strip(), k.strip().lower()
+        if low in _DROP and not (upgraded and low == "connection"):
+            continue
+        if low in ("content-security-policy", "content-security-policy-report-only"):
+            v = "; ".join(d.strip() for d in v.split(";")
+                          if d.strip() and d.split()[0].lower() not in ("frame-ancestors", "upgrade-insecure-requests"))
+            if not v:
+                continue
+        elif low == "location":
+            for o in sorted(origins, key=len, reverse=True):
+                if v == o or v.startswith(o + "/") or v.startswith(o + "?"):
+                    v = here + v[len(o):]
+                    break
+        elif low == "set-cookie":
+            attrs = [a.strip() for a in v.split(";")]
+            keep = [attrs[0]]
+            for a in attrs[1:]:
+                name = a.split("=")[0].strip().lower()
+                if name in ("secure", "domain", "partitioned"):
+                    continue
+                if name == "samesite" and a.split("=", 1)[-1].strip().lower() == "none":
+                    a = "SameSite=Lax"
+                keep.append(a)
+            v = "; ".join(keep)
+        out.append(f"{k}: {v}")
+    if not upgraded:
+        out.append("Connection: close")
+    return "\r\n".join(out) + "\r\n\r\n"
 
 
 def parse_url(text: str) -> tuple[str, str, int, str]:

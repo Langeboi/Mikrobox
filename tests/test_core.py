@@ -2213,6 +2213,143 @@ def test_a_sign_in_works_only_from_where_it_was_made(tmp_path):
     assert auth.session_user(old, "10.99.1.5") == "mla"
 
 
+@pytest.fixture
+def app_pages(tmp_path):
+    """A web app that says what it was sent and answers the way framing-averse apps do."""
+    import http.server, json as _j, ssl, subprocess, threading as _th
+
+    class App(http.server.BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"  # keeps connections open unless told otherwise
+
+        def log_message(self, *a):
+            pass
+
+        def _answer(self, body: bytes, status=200, extra=()):
+            self.send_response(status)
+            self.send_header("X-Frame-Options", "DENY")
+            self.send_header("Content-Security-Policy", "default-src 'self'; frame-ancestors 'none'; upgrade-insecure-requests")
+            self.send_header("Strict-Transport-Security", "max-age=63072000")
+            for k, v in extra:
+                self.send_header(k, v)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def do_GET(self):
+            me = f"{'https' if isinstance(self.connection, ssl.SSLSocket) else 'http'}://{self.headers['Host']}"
+            if self.path == "/login":
+                return self._answer(b"", 302, [("Location", me + "/home?x=1"),
+                                               ("Set-Cookie", "app=1; Path=/; Domain=lab.example; Secure; HttpOnly; SameSite=None")])
+            if self.path == "/ws":
+                self.send_response(101)
+                self.send_header("Upgrade", "echo")
+                self.send_header("Connection", "Upgrade")
+                self.end_headers()
+                self.wfile.flush()
+                while True:
+                    data = self.connection.recv(100)
+                    if not data:
+                        return
+                    self.connection.sendall(data.upper())
+            seen = {k: self.headers[k] for k in ("Host", "Origin", "Referer", "Cookie", "Connection") if self.headers[k]}
+            self._answer(_j.dumps({"path": self.path, "headers": seen}).encode(), extra=[("Content-Type", "application/json")])
+
+        def do_POST(self):
+            body = self.rfile.read(int(self.headers["Content-Length"]))
+            self._answer(b"got " + body)
+
+    plain = http.server.ThreadingHTTPServer(("127.0.0.1", 0), App)
+    secure = http.server.ThreadingHTTPServer(("127.0.0.1", 0), App)
+    subprocess.run(["openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "1", "-subj", "/CN=lab",
+                    "-keyout", str(tmp_path / "k.pem"), "-out", str(tmp_path / "c.pem")], check=True, capture_output=True)
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    ctx.load_cert_chain(tmp_path / "c.pem", tmp_path / "k.pem")
+    # Handshakes happen in each connection's own thread, so a probe that never
+    # finishes one can't block the server (or its shutdown).
+    secure.socket = ctx.wrap_socket(secure.socket, server_side=True, do_handshake_on_connect=False)
+    for srv in (plain, secure):
+        srv.daemon_threads = True
+        _th.Thread(target=srv.serve_forever, daemon=True).start()
+    yield {"http": plain.server_address[1], "https": secure.server_address[1]}
+    for srv in (plain, secure):
+        srv.shutdown()
+
+
+def _raw(port, request: bytes) -> bytes:
+    import socket as _s
+    c = _s.create_connection(("127.0.0.1", port), timeout=5)
+    c.sendall(request)
+    out = b""
+    while True:
+        data = c.recv(65536)
+        if not data:
+            return out
+        out += data
+
+
+def test_viewer_link_makes_pages_frameable(client, app_pages, lab_pc):
+    import json as _j
+    lab, pc, _ = lab_pc
+    for scheme in ("http", "https"):
+        port = app_pages[scheme]
+        r = client.post("/api/web", json={"lab": lab, "node": pc["id"], "url": f"{scheme}://127.0.0.1:{port}/", "mode": "view", "who": "anyone"})
+        view = r.json()
+        assert view["mode"] == "view" and view["who"] == "me" and view["allow"] == "testclient"  # always for you only
+        assert view["url"].startswith("http://testserver:") and view["target"] == f"{scheme}://127.0.0.1:{port}"
+        client.app.state.weblinks.links[view["id"]].allow = "127.0.0.1"  # the test connects from here
+        here = f"http://127.0.0.1:{view['port']}"
+        # The request arrives as if made to the page itself, without Mikrobox's session.
+        answer = _raw(view["port"], (f"GET /api?q=1 HTTP/1.1\r\nHost: 127.0.0.1:{view['port']}\r\nOrigin: {here}\r\n"
+                                     f"Referer: {here}/page\r\nCookie: mikrobox_session=secret; app=1\r\nConnection: keep-alive\r\n\r\n").encode())
+        assert b"\r\n\r\n" in answer, (scheme, answer)
+        head, body = answer.split(b"\r\n\r\n", 1)
+        seen = _j.loads(body)
+        assert seen["path"] == "/api?q=1"
+        assert seen["headers"] == {"Host": f"127.0.0.1:{port}", "Origin": f"{scheme}://127.0.0.1:{port}",
+                                   "Referer": f"{scheme}://127.0.0.1:{port}/page", "Cookie": "app=1", "Connection": "close"}
+        head = head.decode()
+        assert "X-Frame-Options" not in head and "Strict-Transport-Security" not in head
+        assert "Content-Security-Policy: default-src 'self'\r\n" in head and "Connection: close" in head
+        # Redirects to the page's own address come back to the viewer; cookies drop Secure and Domain.
+        head = _raw(view["port"], f"GET /login HTTP/1.1\r\nHost: 127.0.0.1:{view['port']}\r\n\r\n".encode()).decode()
+        assert f"Location: {here}/home?x=1\r\n" in head
+        assert "Set-Cookie: app=1; Path=/; HttpOnly; SameSite=Lax\r\n" in head
+        # Where the frame goes, the tab's address bar follows (sub-resources don't count).
+        _raw(view["port"], f"GET /home?x=1 HTTP/1.1\r\nHost: x\r\nSec-Fetch-Dest: iframe\r\n\r\n".encode())
+        _raw(view["port"], f"GET /app.js HTTP/1.1\r\nHost: x\r\nSec-Fetch-Dest: script\r\n\r\n".encode())
+        assert next(l for l in client.get("/api/web").json() if l["id"] == view["id"])["page"] == "/home?x=1"
+        # A form post's body goes through.
+        answer = _raw(view["port"], f"POST /form HTTP/1.1\r\nHost: 127.0.0.1:{view['port']}\r\nContent-Length: 5\r\n\r\nhello".encode())
+        assert answer.endswith(b"got hello")
+    # Asking again for the same page reuses the viewer link.
+    client.app.state.weblinks.links[view["id"]].allow = "testclient"
+    again = client.post("/api/web", json={"lab": lab, "node": pc["id"], "url": f"https://127.0.0.1:{app_pages['https']}/x", "mode": "view"}).json()
+    assert again["id"] == view["id"] and again["path"] == "/x"
+    acts = [e["text"] for e in client.get("/api/activity", params={"lab": lab}).json()]
+    assert acts.count(f"viewed https://127.0.0.1:{app_pages['https']} in Mikrobox from PC1") == 1
+
+
+def test_viewer_passes_websockets_and_reports_unreachable_pages(client, app_pages, lab_pc):
+    import socket as _s
+    lab, pc, _ = lab_pc
+    view = client.post("/api/web", json={"lab": lab, "node": pc["id"], "url": f"127.0.0.1:{app_pages['http']}", "mode": "view"}).json()
+    client.app.state.weblinks.links[view["id"]].allow = "127.0.0.1"
+    c = _s.create_connection(("127.0.0.1", view["port"]), timeout=5)
+    c.sendall(f"GET /ws HTTP/1.1\r\nHost: x\r\nConnection: Upgrade\r\nUpgrade: echo\r\n\r\n".encode())
+    head = b""
+    while b"\r\n\r\n" not in head:
+        head += c.recv(1000)
+    assert head.startswith(b"HTTP/1.1 101") and b"Connection: Upgrade" in head
+    c.sendall(b"ping")
+    assert c.recv(100) == b"PING"
+    c.close()
+    # The page went away: the viewer says so instead of hanging.
+    link = client.app.state.weblinks.links[view["id"]]
+    link.port = 1
+    answer = _raw(view["port"], b"GET / HTTP/1.1\r\nHost: x\r\n\r\n").decode()
+    assert answer.startswith("HTTP/1.1 502") and "could not reach http://127.0.0.1:1 from PC1" in answer
+
+
 def test_link_addresses_and_ports(client, lab_pc, monkeypatch):
     from mikrobox.weblinks import LinkError, parse_url
     assert parse_url("10.0.0.1") == ("http", "10.0.0.1", 80, "/")

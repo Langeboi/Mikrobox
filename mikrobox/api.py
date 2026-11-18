@@ -90,6 +90,7 @@ class WebLinkCreate(BaseModel):
     port: Optional[int] = None
     url: Optional[str] = Field(default=None, max_length=2000)  # ...or any address the PC can reach
     who: Literal["me", "anyone"] = "me"
+    mode: Literal["link", "view"] = "link"  # view: for the viewer tab, always for you only
 
 
 class NodeUpdate(BaseModel):
@@ -1426,6 +1427,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             if not ports or not row["running"]:
                 raise Conflict(f"{body.container} is not running with a published TCP port.")
             host, port, scheme, path = "127.0.0.1", ports[0]["host"], None, "/"
+            name = host
             title = f"{body.container} · {row['image'].split('/')[-1].split(':')[0]}"
             detail = f"Container on {node.name}, port {port}"
         elif body.url:
@@ -1436,11 +1438,15 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             detail = f"From {node.name}"
         else:
             raise Invalid("Say what to open: a container, or an address.")
-        allow = None if body.who == "anyone" else plain_ip(request.client.host if request.client else None)
+        viewer = body.mode == "view"
+        allow = None if body.who == "anyone" and not viewer else plain_ip(request.client.host if request.client else None)
         user = (request.scope.get("state") or {}).get("user") or ""
+        known = {l.id for l in weblinks.links.values()}
         link = await weblinks.open(lab=lab, node=node, title=title, detail=detail, host=host, port=port,
-                                   scheme=scheme, path=path, allow=allow, by=user)
-        activity.record(f"opened a link to {title} from {node.name}" + (" for anyone" if not allow else ""), lab)
+                                   scheme=scheme, path=path, allow=allow, by=user, mode=body.mode, name=name)
+        if link.id not in known:
+            activity.record((f"viewed {title} in Mikrobox from {node.name}" if viewer else
+                             f"opened a link to {title} from {node.name}" + (" for anyone" if not allow else "")), lab)
         return link.view(request.url.hostname or "localhost")
 
     @app.delete("/api/web/{link_id}", status_code=204)
