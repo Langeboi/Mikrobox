@@ -1443,7 +1443,7 @@ const dockerCache = new Map();  // node id -> { data, at, loading }
 
 function dockerData(n) {
   const c = dockerCache.get(n.id);
-  if (!c || Date.now() - c.at > 2500) refreshDocker(n);
+  if (!c || Date.now() - c.at > 2500 || c.running !== n.running) refreshDocker(n);
   return c && c.data;
 }
 
@@ -1452,8 +1452,10 @@ async function refreshDocker(n) {
   if (c.loading) return;
   c.loading = true;
   dockerCache.set(n.id, c);
+  const running = n.running;
   try {
     c.data = await api("GET", `${labPath()}/nodes/${n.id}/containers`);
+    c.running = running;
   } catch (e) { /* shown next time */ }
   c.at = Date.now();
   c.loading = false;
@@ -1461,7 +1463,7 @@ async function refreshDocker(n) {
 }
 
 function setDockerData(n, data) {
-  dockerCache.set(n.id, { data, at: Date.now() });
+  dockerCache.set(n.id, { data, at: Date.now(), running: n.running });
   renderInspector(true);
 }
 
@@ -1481,6 +1483,8 @@ const ICON_PATHS = {
   cube: "M12 3l8 4.5v9L12 21l-8-4.5v-9z M12 12l8-4.5 M12 12v9 M12 12L4 7.5",
   copy: "M9 9h11v11H9z M5 15H4V4h11v1",
   check: "M5 12.5l4.5 4.5L19 7.5",
+  reload: "M19 12a7 7 0 1 1-2.05-4.95 M19 4v4h-4",
+  tall: "M12 4v16 M8 8l4-4 4 4 M8 16l4 4 4-4",
 };
 const svgIcon = (name, size = 15) => s("svg", { width: size, height: size, viewBox: "0 0 24 24", "aria-hidden": "true", class: "ico" }, s("path", { d: ICON_PATHS[name] }));
 
@@ -1502,7 +1506,7 @@ function dockerSection(n) {
 
   let label = "Off";
   if (n.docker) {
-    const st = eng ? eng.state : (n.running ? "starting" : "stopped");
+    const st = n.running ? (eng ? eng.state : "starting") : "stopped";
     const run = rows.filter((r) => r.running).length;
     label = st === "running" ? `Docker ${eng.version || ""} · ${run} of ${rows.length} running`.replace("  ", " ")
       : st === "starting" ? "Starting…" : st === "failed" ? "Did not start" : n.running ? "On" : `On · starts with ${n.name}`;
@@ -1553,8 +1557,11 @@ function dockerSection(n) {
         h("span", { class: "spacer" }),
         ...r.ports.map((p) => h("span", { class: "chip mono", title: `${n.name} port ${p.host} leads to port ${p.container} in the container` },
           `${p.host} → ${p.container}${p.proto === "udp" ? "/udp" : ""}`)),
-        r.running && n.running && tcp.length > 0 && h("button", { type: "button", class: "open-btn", title: "Open in your browser",
-          onclick: () => openWebDialog({ node: n.id, container: r.name }) }, "Open", svgIcon("out", 12))));
+        r.running && n.running && tcp.length > 0 && h("span", { class: "open-pair" },
+          h("button", { type: "button", class: "open-btn", title: `View in a Mikrobox tab`,
+            onclick: () => act(() => openViewer({ node: n.id, container: r.name, port: tcp[0].host })) }, "View"),
+          h("button", { type: "button", class: "open-btn", title: "Open in your browser (makes a link)", "aria-label": `Open ${r.name} in your browser`,
+            onclick: () => openWebDialog({ node: n.id, container: r.name, mode: "link" }) }, svgIcon("out", 12)))));
   });
 
   return h("section", { class: "docker" }, head,
@@ -1740,20 +1747,33 @@ function openWebDialog(pre = {}) {
   };
   const me = h("input", { id: "w-me", type: "radio", name: "w-who", checked: true });
   const anyone = h("input", { id: "w-any", type: "radio", name: "w-who" });
+  const inTab = h("input", { id: "w-tab", type: "radio", name: "w-how", checked: pre.mode !== "link" });
+  const inBrowser = h("input", { id: "w-browser", type: "radio", name: "w-how", checked: pre.mode === "link" });
+  const who = h("fieldset", { class: "who-can" }, h("legend", {}, "Who can use the link"),
+    h("div", { class: "field check" }, me, h("label", { for: "w-me" }, "Only this computer")),
+    h("div", { class: "field check" }, anyone, h("label", { for: "w-any" }, "Anyone who can reach Mikrobox")));
+  const how = () => {
+    who.hidden = inTab.checked;
+    $("#modal-ok").textContent = inTab.checked ? "Open tab" : "Make link";
+    result.hidden = true;
+    $("#modal-ok").hidden = false;
+  };
+  for (const r of [inTab, inBrowser]) r.addEventListener("change", how);
   const form = h("div", { class: "web-form" },
     h("p", { class: "lead" }, "Reach a web page inside the lab from this computer, over HTTP or HTTPS."),
     h("div", { class: "field" }, h("label", { for: "w-from" }, "From"), from,
       h("span", { class: "hint" }, "The page is fetched the way that PC sees it, through the lab's own links.")),
     targets,
-    h("fieldset", { class: "who-can" }, h("legend", {}, "Who can use the link"),
-      h("div", { class: "field check" }, me, h("label", { for: "w-me" }, "Only this computer")),
-      h("div", { class: "field check" }, anyone, h("label", { for: "w-any" }, "Anyone who can reach Mikrobox"))),
+    h("fieldset", { class: "who-can" }, h("legend", {}, "Open it"),
+      h("div", { class: "field check" }, inTab, h("label", { for: "w-tab" }, "In a Mikrobox tab, next to the consoles")),
+      h("div", { class: "field check" }, inBrowser, h("label", { for: "w-browser" }, "In your browser, with a link you can share"))),
+    who,
     result,
     h("p", { class: "hint" }, "Links stay listed under Tools › Web access, and close when their PC stops."));
   from.addEventListener("change", () => { pick = "url"; fill(); });
   for (const r of [me, anyone]) r.addEventListener("change", () => { result.hidden = true; $("#modal-ok").hidden = false; });
 
-  openModal("Open in your browser", [{ node: form }], "Make link", async () => {
+  openModal("Open a web page in the lab", [{ node: form }], "Open tab", async () => {
     const node = Number(from.value);
     const chosen = [...targets.querySelectorAll("input[type=radio]")].find((r) => r.checked);
     const body = { lab: state.lab.id, node, who: anyone.checked ? "anyone" : "me" };
@@ -1763,6 +1783,10 @@ function openWebDialog(pre = {}) {
     } else {
       body.container = chosen.option.container;
       body.port = chosen.option.port;
+    }
+    if (inTab.checked) {
+      await openViewer(body);
+      return false;  // done: the tab is open
     }
     const link = await api("POST", "/web", body);
     const https = link.scheme === "https";
@@ -1783,6 +1807,112 @@ function openWebDialog(pre = {}) {
     return true;  // keep the dialog open to show the link
   });
   fill();
+  how();
+}
+
+// ---------------------------------------------------------------- the viewer tab (test build)
+//
+// A lab web page in a tab of the bottom panel. It goes through a "view" link (weblinks.py),
+// which makes the page fit for a frame; HTTPS pages are fetched without checking their
+// certificate, which the tab says.
+
+const viewers = new Map();  // dock key -> { link, frame, addr, overlay }
+
+async function openViewer(target) {
+  const link = await api("POST", "/web", { ...target, lab: state.lab.id, mode: "view", who: "me" });
+  const key = `v:${link.node}:${link.id}`;
+  const v = viewers.get(key);
+  if (v) {
+    v.link = link;
+    v.go(link.path);
+  } else {
+    buildViewer(key, link, target);
+  }
+  if (readStore("dockHeight", null) === null) setDockHeight(Math.max(380, window.innerHeight * 0.5));
+  dockShow(key);
+}
+
+function buildViewer(key, link, target) {
+  const frame = h("iframe", { class: "vw-frame", title: link.title, referrerpolicy: "no-referrer-when-downgrade",
+    sandbox: "allow-scripts allow-same-origin allow-forms allow-popups allow-popups-to-escape-sandbox allow-modals allow-downloads" });
+  const addr = h("input", { type: "text", class: "vw-addr mono", spellcheck: "false", autocomplete: "off",
+    "aria-label": `Address, as ${link.node_name} sees it` });
+  const overlay = h("div", { class: "vw-overlay", hidden: true });
+  const secure = link.scheme === "https";
+  const v = { link, frame, addr, overlay, target: { node: target.node, container: target.container, port: target.port, url: target.url } };
+  v.go = (path) => {
+    overlay.hidden = true;
+    addr.value = v.link.target + path;
+    frame.src = v.last = v.link.base + path;
+  };
+  const navigate = () => act(async () => {
+    const text = addr.value.trim();
+    const full = /^https?:\/\//i.test(text) ? text : `http://${text}`;
+    let u;
+    try { u = new URL(full); } catch (e) { throw new Error("Enter an address like http://10.0.0.1/ or https://10.0.0.1:8443/."); }
+    const here = new URL(v.link.target);
+    if (u.protocol === here.protocol && u.host === here.host) {
+      v.go(u.pathname + u.search + u.hash);
+    } else {
+      await openViewer({ node: v.link.node, url: full });
+    }
+  });
+  addr.addEventListener("keydown", (e) => { if (e.key === "Enter") navigate(); });
+  const bar = h("div", { class: "vw-bar" },
+    h("button", { type: "button", class: "icon-btn", title: "Reload", "aria-label": "Reload", onclick: () => { if (overlay.hidden) frame.src = v.last; } }, svgIcon("reload")),
+    h("span", { class: `vw-scheme ${secure ? "https" : "http"}`, title: secure
+      ? `${link.node_name} reaches this page over HTTPS. Mikrobox does not check its certificate, so a self-signed one works here without a warning.`
+      : "Plain HTTP" }, secure ? "HTTPS · certificate not checked" : "HTTP"),
+    addr,
+    h("span", { class: "vw-from" }, `from ${link.node_name}`),
+    h("button", { type: "button", class: "icon-btn", title: "Open in a browser tab", "aria-label": "Open in a browser tab",
+      onclick: () => window.open(v.last, "_blank", "noopener") }, svgIcon("out")),
+    h("button", { type: "button", class: "icon-btn", title: "Make the panel taller", "aria-label": "Make the panel taller",
+      onclick: () => setDockHeight(window.innerHeight * 0.8) }, svgIcon("tall")));
+  const pane = h("div", { class: "pv viewer" }, bar, h("div", { class: "vw-body" }, frame, overlay));
+  $("#terms").append(pane);
+  viewers.set(key, v);
+  dock.set(key, { name: link.title, tip: `${link.target} from ${link.node_name}`, pane, onShow: null, close: () => {
+    viewers.delete(key);
+    // The link stays while another tab shows the same page.
+    if (![...viewers.values()].some((o) => o.link.id === v.link.id)) api("DELETE", `/web/${v.link.id}`).catch(() => {});
+  } });
+  v.go(link.path);
+}
+
+// The frame's own page can't be read from here (another origin), but its link sees where it
+// goes: the address bar and Reload follow that.
+setInterval(async () => {
+  const v = viewers.get(state.activeDock);
+  if (!v || document.hidden || !v.overlay.hidden || document.activeElement === v.addr) return;
+  let link;
+  try { link = (await api("GET", `/web?lab=${v.link.lab}`)).find((l) => l.id === v.link.id); } catch (e) { return; }
+  if (!link || document.activeElement === v.addr) return;
+  v.addr.value = link.target + link.page;
+  v.last = link.base + link.page;
+}, 1500);
+
+// A viewer's link closes when its PC stops: say so in the tab, with a way back.
+async function checkViewers() {
+  if (!viewers.size || !state.lab) return;
+  let open, nodes;
+  try {
+    open = new Set((await api("GET", "/web")).map((l) => l.id));
+    nodes = (await api("GET", labPath())).nodes;
+  } catch (e) { return; }
+  for (const [key, v] of viewers) {
+    if (open.has(v.link.id) || !v.overlay.hidden) continue;
+    const n = nodes.find((x) => x.id === v.link.node);
+    v.frame.removeAttribute("src");
+    v.overlay.replaceChildren(
+      h("strong", {}, n && !n.running ? `${v.link.node_name} stopped` : "This page was closed"),
+      h("span", {}, `Mikrobox reaches ${v.link.target} through ${v.link.node_name}.`),
+      h("button", { type: "button", class: "primary", onclick: () => act(async () => {
+        await openViewer(v.target);  // a new link, so a new tab
+        dockClose(key);
+      }) }, "Open again"));
+    v.overlay.hidden = false;
+  }
 }
 
 function copyText(text) {
@@ -1836,7 +1966,7 @@ async function loadWeb() {
       h("td", {}, h("div", { class: "url-cell" }, h("code", { class: "mono" }, l.url),
         h("button", { type: "button", class: "icon-btn", title: "Copy", "aria-label": `Copy the link to ${l.title}`, onclick: () => copyText(l.url) }, svgIcon("copy")),
         h("a", { class: "icon-btn", href: l.url, target: "_blank", rel: "noopener", title: "Open", "aria-label": `Open ${l.title}` }, svgIcon("out")))),
-      h("td", { class: l.who === "anyone" ? "anyone" : "" }, l.who === "anyone" ? "Anyone who can reach Mikrobox" : `Only ${l.allow}`),
+      h("td", { class: l.who === "anyone" ? "anyone" : "" }, l.mode === "view" ? `Viewer tab, only ${l.allow}` : l.who === "anyone" ? "Anyone who can reach Mikrobox" : `Only ${l.allow}`),
       h("td", {}, l.by || "someone"),
       h("td", { class: "sub" }, ago(l.used)),
       h("td", { class: "end" }, h("button", { type: "button", class: "small", "aria-label": `Close the link to ${l.title}`,
@@ -1886,7 +2016,7 @@ function dockClose(key) {
   renderDock();
 }
 
-const isNodeTab = (key, nodeId) => key === `c:${nodeId}` || [`p:${nodeId}:`, `t:${nodeId}:`, `l:${nodeId}:`].some((p) => key.startsWith(p));
+const isNodeTab = (key, nodeId) => key === `c:${nodeId}` || [`p:${nodeId}:`, `t:${nodeId}:`, `l:${nodeId}:`, `v:${nodeId}:`].some((p) => key.startsWith(p));
 
 function closeNodeTabs(nodeId) {
   for (const key of [...dock.keys()]) if (isNodeTab(key, nodeId)) dockClose(key);
@@ -2467,6 +2597,7 @@ const ACTIONS = {
   "tool-packets": () => packetDialog(),
   "tool-activity": () => openActivity(),
   "tool-web": () => openWebAccess(),
+  "tool-view": () => openWebDialog(),
   "tool-nuke": () => nukeDialog(),
   "tool-test": () => reachDialog(),
   "tool-docs": async () => {
@@ -2901,7 +3032,7 @@ function connectEvents() {
     try { msg = JSON.parse(e.data); } catch (err) { return; }
     if (msg.t === "hello") { eventDelay = 1000; scheduleRefresh(0); return; }
     if (msg.t === "activity") { onActivity(msg.entry); return; }
-    if (msg.t === "web") { if (dock.has("web")) loadWeb(); return; }
+    if (msg.t === "web") { if (dock.has("web")) loadWeb(); checkViewers(); return; }
     scheduleRefresh();
   };
   ws.onclose = () => {
