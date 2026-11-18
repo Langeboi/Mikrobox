@@ -54,8 +54,8 @@ def test_host_setup_creates_management_bridge(client):
 def test_node_defaults_and_validation(client):
     lab = make_lab(client)
     r1 = add_node(client, lab, name="R1-core")
-    assert r1["kind"] == "chr" and r1["ports"] == 8
-    assert r1["ram_mb"] == 256 + 8 * 7
+    assert r1["kind"] == "chr" and r1["ports"] == 5 and r1["layer"] == 2
+    assert r1["ram_mb"] == 256 + 8 * 4  # 8 MB per port past the first
     pc = add_node(client, lab, kind="client", name="PC1", address="192.168.10.2/24",
                   gateway="192.168.10.1")
     assert pc["ports"] == 1
@@ -67,6 +67,145 @@ def test_node_defaults_and_validation(client):
     assert client.post(f"/api/labs/{lab}/nodes",
                        json={"kind": "client", "name": "PC2",
                              "address": "192.168.10.2"}).status_code == 400
+
+
+def test_layer_3_switches(client):
+    lab = make_lab(client)
+    sw = add_node(client, lab, name="SW1", role="switch")
+    assert sw["layer"] == 2 and sw["ports"] == 24  # layer 2 unless asked
+    core = add_node(client, lab, name="CORE1", role="switch", layer=3)
+    assert core["layer"] == 3
+    assert client.post(f"/api/labs/{lab}/nodes", json={"name": "R9", "layer": 3}).status_code == 400  # routers have none
+    r1 = add_node(client, lab, name="R1")
+    assert client.patch(f"/api/labs/{lab}/nodes/{r1['id']}", json={"layer": 3}).status_code == 400
+    # Only how it is drawn, so it can change while the switch runs.
+    client.rt.node_running = lambda n: True
+    got = client.patch(f"/api/labs/{lab}/nodes/{sw['id']}", json={"layer": 3})
+    assert got.status_code == 200 and got.json()["layer"] == 3
+    assert client.patch(f"/api/labs/{lab}/nodes/{sw['id']}", json={"ports": 8}).status_code == 409
+    acts = [e["text"] for e in client.get("/api/activity", params={"lab": lab}).json()]
+    assert "added the layer 3 switch CORE1" in acts and "made SW1 a layer 3 switch" in acts
+    tpl = client.post("/api/templates/collapsed-core", json={"name": "cc"}).json()
+    cores = [n for n in tpl["nodes"] if n["name"].startswith("CORE")]
+    assert [(n["role"], n["layer"]) for n in cores] == [("switch", 3), ("switch", 3)]
+
+
+def test_free_names_follow_their_series():
+    from mikrobox.trash import free_name
+    assert free_name("R3", {"R1"}) == "R3"
+    assert free_name("R1", {"R1", "R2"}) == "R3"
+    assert free_name("A1-R1", {"A1-R1"}) == "A1-R2"
+    assert free_name("EDGE", {"EDGE"}) == "EDGE2"
+    assert free_name("R10", {"R1", "R10", "R11"}) == "R12"  # copies continue from the original
+
+
+def test_move_several_at_once(client):
+    lab = make_lab(client)
+    r1, r2 = add_node(client, lab, name="R1"), add_node(client, lab, name="R2")
+    note = client.post(f"/api/labs/{lab}/annotations", json={"kind": "note", "x": 0, "y": 0, "w": 100, "h": 60}).json()
+    assert client.post(f"/api/labs/{lab}/move", json={
+        "nodes": [{"id": r1["id"], "x": 100, "y": 200}, {"id": r2["id"], "x": 300, "y": 200}, {"id": 999, "x": 1, "y": 1}],
+        "annotations": [{"id": note["id"], "x": 40, "y": 60}], "cloud": {"id": 0, "x": 20, "y": 20}}).status_code == 200
+    got = client.get(f"/api/labs/{lab}").json()
+    assert [(n["x"], n["y"]) for n in got["nodes"]] == [(100, 200), (300, 200)]
+    assert (got["annotations"][0]["x"], got["annotations"][0]["y"]) == (40, 60) and (got["mgmt_x"], got["mgmt_y"]) == (20, 20)
+
+
+def test_delete_goes_to_the_trash_and_undo_brings_it_back(client):
+    lab = make_lab(client)
+    r1, r2 = add_node(client, lab, name="R1"), add_node(client, lab, name="R2")
+    url = f"/api/labs/{lab}"
+    l12 = client.post(f"{url}/links", json={"a": {"node": r1["id"], "port": 2}, "b": {"node": r2["id"], "port": 1}}).json()
+    cloud = client.post(f"{url}/links", json={"a": {"node": r1["id"], "port": 1}}).json()
+    note = client.post(f"{url}/annotations", json={"kind": "note", "x": 0, "y": 0, "w": 100, "h": 60, "text": "plan"}).json()
+    node = client.rt.store.state.lab(lab).node(r1["id"])
+    disk = client.rt.disk_path(node)
+    disk.parent.mkdir(parents=True, exist_ok=True)
+    disk.write_bytes(b"R1's configuration")
+    revs = client.tmp / "data" / "backups" / f"n{r1['id']}"
+    revs.mkdir(parents=True)
+    (revs / "rev1.rsc").write_text("/system identity set name=R1")
+    client.put(f"{url}/nodes/{r1['id']}/backup", json={"included": True})
+
+    r = client.post(f"{url}/trash", json={"nodes": [r1["id"]], "annotations": [note["id"]]})
+    assert r.status_code == 200 and r.json()["links"] == 2  # its links go with it
+    token = r.json()["token"]
+    got = client.get(url).json()
+    assert [n["name"] for n in got["nodes"]] == ["R2"] and not got["links"] and not got["annotations"]
+    assert not disk.exists() and not revs.exists()  # kept aside, not in use
+    acts = [e["text"] for e in client.get("/api/activity", params={"lab": lab}).json()]
+    assert "deleted 1 device, 2 links and 1 shape" in acts
+
+    back = client.post(f"{url}/restore", json={"token": token})
+    assert back.status_code == 200 and back.json()["nodes"] == {str(r1["id"]): r1["id"]}
+    got = client.get(url).json()
+    assert sorted(n["name"] for n in got["nodes"]) == ["R1", "R2"]
+    assert sorted(l["id"] for l in got["links"]) == sorted([l12["id"], cloud["id"]])
+    assert got["annotations"][0]["text"] == "plan"
+    assert disk.read_bytes() == b"R1's configuration" and (revs / "rev1.rsc").exists()
+    assert next(n for n in got["nodes"] if n["name"] == "R1")["backup"]["included"]
+    assert client.post(f"{url}/restore", json={"token": token}).status_code == 404  # once only
+
+    # Deleted, then a new device takes the id and the name: the old one comes back beside it.
+    token = client.post(f"{url}/trash", json={"nodes": [r1["id"]]}).json()["token"]
+    newer = add_node(client, lab, name="R1")
+    assert newer["id"] == r1["id"]
+    client.post(f"{url}/links", json={"a": {"node": r2["id"], "port": 1}, "b": {"node": newer["id"], "port": 1}})
+    back = client.post(f"{url}/restore", json={"token": token}).json()
+    moved = back["nodes"][str(r1["id"])]
+    assert moved != r1["id"] and back["skipped_links"] == 1  # R2's port is taken now; the Cloud link is fine
+    got = client.get(url).json()
+    old = next(n for n in got["nodes"] if n["id"] == moved)
+    assert old["name"] == "R3"
+    assert client.rt.disk_path(client.rt.store.state.lab(lab).node(moved)).read_bytes() == b"R1's configuration"
+    assert not client.rt.disk_path(client.rt.store.state.lab(lab).node(newer["id"])).exists()
+    assert client.post(f"{url}/trash", json={"links": [12345]}).status_code == 404
+
+
+def test_paste_copies_devices_with_their_links(client):
+    lab = make_lab(client)
+    url = f"/api/labs/{lab}"
+    r1 = add_node(client, lab, name="R1")
+    pc = add_node(client, lab, kind="client", name="PC1", address="10.0.0.2/24", gateway="10.0.0.1")
+    disk = client.rt.disk_path(client.rt.store.state.lab(lab).node(r1["id"]))
+    disk.parent.mkdir(parents=True, exist_ok=True)
+    disk.write_bytes(b"config")
+    body = {"source_lab": lab, "nodes": [
+        {"ref": 1, "source": r1["id"], "kind": "chr", "name": "R1", "ports": 5, "x": 400, "y": 100},
+        {"ref": 2, "source": pc["id"], "kind": "client", "name": "PC1", "ports": 1, "address": "10.0.0.2/24",
+         "gateway": "10.0.0.1", "services": ["web", "dhcp"], "x": 400, "y": 240},
+        {"ref": 3, "kind": "chr", "role": "switch", "layer": 3, "name": "CORE", "ports": 8, "x": 600, "y": 100},
+    ], "links": [{"a": {"ref": 1, "port": 2}, "b": {"ref": 2, "port": 1}}, {"a": {"ref": 1, "port": 3}, "b": {"ref": 3, "port": 1}}],
+        "annotations": [{"kind": "text", "x": 380, "y": 40, "w": 120, "h": 30, "text": "copy"}]}
+    r = client.post(f"{url}/paste", json=body)
+    assert r.status_code == 201, r.text
+    out = r.json()
+    assert [n["name"] for n in out["nodes"]] == ["R2", "PC2", "CORE"] and len(out["links"]) == 2
+    got = client.get(url).json()
+    new = {n["name"]: n for n in got["nodes"]}
+    assert new["PC2"]["address"] is None and new["PC2"]["services"] == ["web"]  # same lab: no second 10.0.0.2
+    assert new["CORE"]["layer"] == 3 and new["R2"]["ports"] == 5
+    ends = sorted((l["a"]["node"], l["a"]["port"], l["b"]["node"], l["b"]["port"]) for l in got["links"])
+    assert ends == sorted([(new["R2"]["id"], 2, new["PC2"]["id"], 1), (new["R2"]["id"], 3, new["CORE"]["id"], 1)])
+    assert not client.rt.disk_path(client.rt.store.state.lab(lab).node(new["R2"]["id"])).exists()  # settings only
+
+    # Into another lab, with configuration: addresses stay, a stopped router's disk is copied.
+    other = client.post("/api/labs", json={"name": "second"}).json()["id"]
+    r = client.post(f"/api/labs/{other}/paste", json={**body, "with_config": True}).json()
+    copied = {n["name"]: n["id"] for n in r["nodes"]}
+    assert list(copied) == ["R1", "PC1", "CORE"] and r["config_skipped"] == []
+    assert client.rt.disk_path(client.rt.store.state.lab(other).node(copied["R1"])).read_bytes() == b"config"
+    running = client.rt.node_running
+    client.rt.node_running = lambda n: n.id == r1["id"]  # a running router's disk is in use: skipped
+    assert client.post(f"/api/labs/{other}/paste", json={**body, "with_config": True}).json()["config_skipped"] == ["R2"]
+    client.rt.node_running = running
+    assert client.get(f"/api/labs/{other}").json()["nodes"][1]["address"] == "10.0.0.2/24"
+    bad = {"nodes": body["nodes"][:1], "links": [{"a": {"ref": 1, "port": 2}, "b": {"ref": 9, "port": 1}}]}
+    assert client.post(f"{url}/paste", json=bad).status_code == 400
+    twice = {"nodes": body["nodes"][:1], "links": [{"a": {"ref": 1, "port": 2}, "b": {"ref": 1, "port": 2}}]}
+    assert client.post(f"{url}/paste", json=twice).status_code == 400
+    acts = [e["text"] for e in client.get("/api/activity", params={"lab": other}).json()]
+    assert "pasted 3 devices, 2 links and 1 shape with configuration" in acts
 
 
 def test_links_and_management_address(client):
@@ -531,7 +670,7 @@ def test_templates_build_valid_labs(client):
     assert client.post("/api/templates/spine-leaf", json={"name": "dc1"}).json()["name"] == "dc1"
     assert client.post("/api/templates/nope", json={}).status_code == 404
     core = next(l for l in client.get("/api/labs").json() if l["name"] == "collapsed-core")
-    assert sum(1 for n in core["nodes"] if n["role"] == "switch") == 3
+    assert sum(1 for n in core["nodes"] if n["role"] == "switch" and n["layer"] == 2) == 3  # plus two layer 3 cores
     assert any(l["b"] is None for l in core["links"])
 
 
@@ -986,7 +1125,7 @@ def test_documentation_export(client):
     assert z.read("topology.png") == png and b"set name=R1" in z.read("configs/R1.txt")
     md = z.read("first.md").decode()
     assert "![Topology](topology.png)" in md
-    assert "| R1 | Router (CHR) | 8 | 1 | 312 | 10.99.1.1 | Stopped |" in md
+    assert "| R1 | Router (CHR) | 5 | 1 | 288 | 10.99.1.1 | Stopped |" in md
     assert "| SW1 | Switch (CHR) | 24 |" in md and "| PC1 | Client | 1 | 1 | 128 | 10.0.0.2/24 | Stopped |" in md
     assert "| R1 | ether1 | Cloud | |" in md and "| R1 | ether2 | PC1 | eth0 |" in md
     assert "- **Site A**: R1, PC1" in md

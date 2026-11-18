@@ -28,6 +28,22 @@
       <button type="button" data-act="lab-delete" data-needs-lab class="danger">Delete lab</button>
     </div>
   </div>
+  <div class="menu" id="edit-menu">
+    <button type="button" class="menu-btn" aria-haspopup="true">Edit</button>
+    <div class="menu-list" hidden>
+      <button type="button" data-act="edit-undo" data-needs-lab>Undo<kbd data-k="Z"></kbd></button>
+      <button type="button" data-act="edit-redo" data-needs-lab>Redo<kbd data-k="Shift+Z"></kbd></button>
+      <hr>
+      <button type="button" data-act="edit-cut" data-needs-lab>Cut<kbd data-k="X"></kbd></button>
+      <button type="button" data-act="edit-copy" data-needs-lab>Copy<kbd data-k="C"></kbd></button>
+      <button type="button" data-act="edit-paste" data-needs-lab>Paste<kbd data-k="V"></kbd></button>
+      <button type="button" data-act="edit-paste-config" data-needs-lab>Paste with router configurations<kbd data-k="Shift+V"></kbd></button>
+      <button type="button" data-act="edit-duplicate" data-needs-lab>Duplicate<kbd data-k="D"></kbd></button>
+      <hr>
+      <button type="button" data-act="edit-all" data-needs-lab>Select all<kbd data-k="A"></kbd></button>
+      <button type="button" data-act="edit-delete" data-needs-lab class="danger">Delete<kbd data-plain="Delete"></kbd></button>
+    </div>
+  </div>
   <div class="menu">
     <button type="button" class="menu-btn" aria-haspopup="true">Configs</button>
     <div class="menu-list" hidden>
@@ -81,6 +97,9 @@
     <nav id="tools" aria-label="Tools"></nav>
     <div id="hint" role="status"></div>
     <div id="zoom" aria-label="Zoom">
+      <button type="button" id="undo-btn" class="hist" aria-label="Undo" disabled></button>
+      <button type="button" id="redo-btn" class="hist" aria-label="Redo" disabled></button>
+      <span class="zsep" aria-hidden="true"></span>
       <button type="button" id="zoom-out" aria-label="Zoom out">−</button>
       <button type="button" id="zoom-reset" title="Reset zoom">100%</button>
       <button type="button" id="zoom-in" aria-label="Zoom in">+</button>

@@ -138,7 +138,7 @@ main { flex: 1; min-height: 0; display: flex; flex-direction: column; }
 .row > button { flex: 1; }
 .row.end > button { flex: 0 0 auto; }
 .field { display: flex; flex-direction: column; gap: 4px; margin-bottom: 10px; }
-.field label { font-size: 12px; color: var(--muted); }
+.field label, .field > .label { font-size: 12px; color: var(--muted); }
 .field.check { flex-direction: row; align-items: center; gap: 10px; }
 .field.check label { font-size: 14px; color: var(--text); }
 .field.check.svc { align-items: flex-start; margin-bottom: 8px; }
@@ -483,3 +483,33 @@ a.button.primary { background: var(--accent); border-color: var(--accent); color
 .url-cell .icon-btn { width: 28px; height: 28px; min-height: 28px; border-color: transparent; background: none; color: var(--muted); display: inline-flex; }
 .url-cell a.icon-btn { color: var(--accent-fg); }
 .pv.logs .logs-out { flex: 1; min-height: 0; margin: 0; padding: 10px 12px; overflow: auto; font: 12.5px/1.5 ui-monospace, "SF Mono", Consolas, monospace; white-space: pre-wrap; overflow-wrap: anywhere; background: var(--surface); color: var(--text); }
+
+
+/* ---- layer 2 or 3, for a switch ---- */
+.seg.layer { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+.seg.layer button { height: auto; min-height: 50px; padding: 7px 10px; display: flex; align-items: center; gap: 10px; text-align: left; border-radius: 10px; }
+.seg.layer button .icon { width: 26px; height: 26px; flex: none; fill: none; stroke: currentColor; stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; color: var(--muted); }
+.seg.layer button span { display: flex; flex-direction: column; gap: 1px; min-width: 0; }
+.seg.layer button strong { font-size: 13.5px; font-weight: 600; }
+.seg.layer button small { font-size: 11.5px; color: var(--muted); line-height: 1.25; }
+.seg.layer button[aria-pressed="true"] { border: 2px solid var(--accent-fg); background: var(--accent-soft); padding: 6px 9px; }
+.seg.layer button[aria-pressed="true"] .icon { color: var(--accent-fg); }
+
+
+/* ---- editing: several selected, undo, the Edit menu ---- */
+#world .marquee { fill: color-mix(in srgb, var(--accent) 10%, transparent); stroke: var(--accent-fg); stroke-width: 1.2; stroke-dasharray: 5 4; vector-effect: non-scaling-stroke; pointer-events: none; }
+.menu-list kbd { margin-left: auto; padding-left: 24px; font: 12px ui-monospace, "SF Mono", Consolas, monospace; color: var(--muted); }
+.menu-list button:has(kbd) { display: flex; align-items: center; }
+#zoom .hist { min-width: 34px; padding: 0 8px; display: inline-flex; align-items: center; justify-content: center; color: var(--text); }
+#zoom .hist:disabled { color: var(--muted); opacity: .45; }
+#zoom .zsep { width: 1px; margin: 6px 4px; background: var(--line); }
+.align-row { display: grid; grid-template-columns: repeat(8, 1fr); gap: 3px; margin-bottom: 4px; }
+.align-row .icon-btn:nth-child(4), .align-row .icon-btn:nth-child(7) { margin-left: 5px; }
+#edit-menu .menu-list { min-width: 330px; }
+#edit-menu .menu-list button { white-space: nowrap; }
+.align-row .icon-btn { width: 100%; min-width: 0; height: 34px; min-height: 34px; padding: 0; display: inline-flex; align-items: center; justify-content: center; }
+#inspector .row button .ico { margin-right: 4px; vertical-align: -3px; }
+.group-hint { margin: 0 0 4px; }
+#toast { display: flex; align-items: center; gap: 14px; }
+#toast .toast-act { height: 28px; min-height: 28px; padding: 0 12px; border-radius: 8px; border: 1px solid rgba(255, 255, 255, .35); background: transparent; color: #fff; font-weight: 600; }
+#toast .toast-act:hover { background: rgba(255, 255, 255, .12); }

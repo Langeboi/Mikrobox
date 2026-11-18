@@ -42,6 +42,7 @@ from .weblinks import LinkError, WebLinks, parse_url, plain_ip
 from .runtime import Conflict, Invalid, NotFound, Runtime
 from .shell import CommandError
 from .store import Store
+from .trash import Trash, free_name
 
 STATIC = Path(__file__).parent / "static"
 ANNO_WORDS = {"rect": "an area", "ellipse": "an area", "text": "a text label", "note": "a note"}
@@ -60,6 +61,7 @@ class LabUpdate(BaseModel):
 class NodeCreate(BaseModel):
     kind: NodeKind = NodeKind.chr
     role: Literal["router", "switch"] = "router"
+    layer: Literal[2, 3] = 2
     name: str = Field(pattern=NAME_PATTERN)
     ports: Optional[int] = Field(default=None, ge=1)
     cpus: int = Field(default=1, ge=1, le=8)
@@ -88,6 +90,7 @@ class WebLinkCreate(BaseModel):
 
 class NodeUpdate(BaseModel):
     name: Optional[str] = Field(default=None, pattern=NAME_PATTERN)
+    layer: Optional[Literal[2, 3]] = None  # switches only; it changes how it is drawn
     ports: Optional[int] = Field(default=None, ge=1)
     cpus: Optional[int] = Field(default=None, ge=1, le=8)
     ram_mb: Optional[int] = Field(default=None, ge=128, le=16384)
@@ -215,6 +218,69 @@ class TemplateUse(BaseModel):
     name: Optional[str] = Field(default=None, pattern=NAME_PATTERN)
 
 
+# -- editing: several things at once, and undo ------------------------------
+
+class Pos(BaseModel):
+    id: int
+    x: float
+    y: float
+
+
+class Move(BaseModel):
+    nodes: list[Pos] = Field(default_factory=list, max_length=2000)
+    annotations: list[Pos] = Field(default_factory=list, max_length=2000)
+    cloud: Optional[Pos] = None  # id is ignored
+
+
+class Items(BaseModel):
+    nodes: list[int] = Field(default_factory=list, max_length=2000)
+    links: list[int] = Field(default_factory=list, max_length=4000)
+    annotations: list[int] = Field(default_factory=list, max_length=2000)
+
+
+class Undelete(BaseModel):
+    token: str = Field(pattern=r"^[A-Za-z0-9_-]{8,40}$")
+
+
+class PasteEnd(BaseModel):
+    ref: int
+    port: int = Field(ge=1)
+
+
+class PasteLink(BaseModel):
+    a: PasteEnd
+    b: PasteEnd
+
+
+class PasteNode(BaseModel):
+    ref: int                      # the client's own key, for links and the answer
+    source: Optional[int] = None  # the device copied, whose configuration can come along
+    kind: NodeKind = NodeKind.chr
+    role: Literal["router", "switch"] = "router"
+    layer: Literal[2, 3] = 2
+    name: str = Field(pattern=NAME_PATTERN)
+    ports: int = Field(ge=1)
+    cpus: int = Field(default=1, ge=1, le=8)
+    ram_mb: Optional[int] = Field(default=None, ge=128, le=16384)
+    address: Optional[str] = None
+    gateway: Optional[str] = None
+    dns: Optional[str] = None
+    addressing: Literal["static", "dhcp"] = "static"
+    services: list[Literal["web", "iperf", "dhcp", "dns"]] = Field(default_factory=list)
+    docker: bool = False
+    containers: list[ContainerSpec] = Field(default_factory=list, max_length=32)
+    x: float = 0
+    y: float = 0
+
+
+class Paste(BaseModel):
+    nodes: list[PasteNode] = Field(default_factory=list, max_length=128)
+    links: list[PasteLink] = Field(default_factory=list, max_length=1024)
+    annotations: list[AnnotationCreate] = Field(default_factory=list, max_length=500)
+    source_lab: Optional[int] = None  # where it was copied from
+    with_config: bool = False         # copy routers' disks too (stopped ones)
+
+
 class NodeDuplicate(BaseModel):
     name: str = Field(pattern=NAME_PATTERN)
     copy_config: bool = False
@@ -235,6 +301,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     events = Events()
     activity = Activity(settings.data_dir / "activity.jsonl", events)
     weblinks = WebLinks(rt, settings.web_ports, on_change=lambda: events.publish({"t": "web"}))
+    trash = Trash(settings.data_dir / "trash")
+    trash.purge()
     store.on_save = lambda: events.publish({"t": "labs"})
     backups.activity, backups.events = activity, events
 
@@ -245,7 +313,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     def what(node: Node) -> str:
         if node.kind == NodeKind.client:
             return "client"
-        return "switch" if node.role == "switch" else "router"
+        if node.role == "switch":
+            return "layer 3 switch" if node.layer == 3 else "switch"
+        return "router"
 
     def link_text(lab: Lab, link: Link) -> str:
         a = lab.node(link.a.node)
@@ -703,7 +773,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             is_chr = body.kind == NodeKind.chr
             if body.role == "switch" and not is_chr:
                 raise Invalid("Only a CHR can be a switch.")
-            ports = body.ports or ((24 if body.role == "switch" else 8) if is_chr else 1)
+            if body.layer == 3 and body.role != "switch":
+                raise Invalid("Only switches have a layer.")
+            ports = body.ports or ((24 if body.role == "switch" else 5) if is_chr else 1)
             check_ports(body.kind, ports)
             if is_chr and (body.address or body.gateway or body.dns):
                 raise Invalid("address, gateway and dns apply to client nodes only.")
@@ -712,7 +784,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             ram = body.ram_mb or (default_chr_ram(body.cpus, ports) if is_chr else 128)
             node = Node(
                 id=free_id({n.id for n in store.state.all_nodes()}),
-                kind=body.kind, role=body.role, name=body.name, ports=ports, cpus=body.cpus,
+                kind=body.kind, role=body.role, layer=body.layer, name=body.name, ports=ports, cpus=body.cpus,
                 ram_mb=ram, address=body.address, gateway=body.gateway, dns=body.dns,
                 addressing=body.addressing, services=sorted(set(body.services)),
                 x=body.x, y=body.y,
@@ -729,10 +801,13 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             lab = get_lab(lab_id)
             node = get_node(lab, node_id)
             changes = body.model_dump(exclude_unset=True)
-            for key in ("x", "y", "name", "ports", "cpus", "ram_mb"):
+            for key in ("x", "y", "name", "ports", "cpus", "ram_mb", "layer"):
                 if changes.get(key, 0) is None:
                     del changes[key]
-            if rt.node_running(node) and set(changes) - {"x", "y"}:
+            if "layer" in changes and node.role != "switch":
+                raise Invalid("Only switches have a layer.")
+            # Moving it and its layer (only how it is drawn) can change while it runs.
+            if rt.node_running(node) and set(changes) - {"x", "y", "layer"}:
                 raise Conflict(f"Stop {node.name} before changing it.")
             if "name" in changes:
                 check_name(lab, changes["name"], skip=node.id)
@@ -751,10 +826,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             lab.nodes[lab.nodes.index(node)] = updated
             store.save()
             rt.sync_dhcp()
-            settings_changed = sorted(k for k in changes if k not in ("x", "y", "name")
+            settings_changed = sorted(k for k in changes if k not in ("x", "y", "name", "layer")
                                       and getattr(node, k) != getattr(updated, k))
             if updated.name != node.name:
                 activity.record(f"renamed {node.name} to {updated.name}", lab)
+            if updated.layer != node.layer:
+                activity.record(f"made {updated.name} a layer {updated.layer} switch", lab)
             if settings_changed:
                 words = {"ports": "ports", "cpus": "vCPUs", "ram_mb": "RAM", "address": "address",
                          "gateway": "gateway", "dns": "DNS", "addressing": "addressing", "services": "services"}
@@ -775,6 +852,220 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             store.save()
             rt.sync_dhcp()
             activity.record(f"deleted the {what(node)} {node.name}", lab, kind="danger")
+
+    # -- editing several things at once ------------------------------------
+    #
+    # The interface's multi-select, copy and paste, and undo use these. A delete puts
+    # everything in the trash for a day (disks included), so undo can bring a router
+    # back with its configuration.
+
+    def amount(nodes: list, links: list, annos: list) -> str:
+        if len(nodes) == 1 and not annos and all(l.touches(nodes[0].id) for l in links):
+            return f"the {what(nodes[0])} {nodes[0].name}"
+        if not nodes and len(links) == 1 and not annos:
+            return "a link"
+        if not nodes and not links and len(annos) == 1:
+            return ANNO_WORDS[annos[0].kind]
+        parts = [f"{len(xs)} {word}{'' if len(xs) == 1 else 's'}"
+                 for xs, word in ((nodes, "device"), (links, "link"), (annos, "shape")) if xs]
+        return ", ".join(parts[:-1]) + (" and " if len(parts) > 1 else "") + parts[-1] if parts else "nothing"
+
+    @app.post("/api/labs/{lab_id}/move")
+    def move_items(lab_id: int, body: Move):
+        """New positions for several devices and shapes at once (a group drag, align)."""
+        with rt.lock:
+            lab = get_lab(lab_id)
+            for p in body.nodes:
+                n = lab.node(p.id)
+                if n is not None:
+                    n.x, n.y = p.x, p.y
+            for p in body.annotations:
+                a = next((a for a in lab.annotations if a.id == p.id), None)
+                if a is not None:
+                    a.x, a.y = p.x, p.y
+            if body.cloud is not None:
+                lab.mgmt_x, lab.mgmt_y = body.cloud.x, body.cloud.y
+            store.save()
+            return {"ok": True}
+
+    @app.post("/api/labs/{lab_id}/trash")
+    def trash_items(lab_id: int, body: Items):
+        """Delete devices (with their links), links and shapes, keeping them for undo."""
+        with rt.lock:
+            lab = get_lab(lab_id)
+            nodes = [get_node(lab, i) for i in dict.fromkeys(body.nodes)]
+            gone = {n.id for n in nodes}
+            want = set(body.links)
+            links = [l for l in lab.links if l.id in want or any(l.touches(i) for i in gone)]
+            annos = [a for a in lab.annotations if a.id in set(body.annotations)]
+            if not (nodes or links or annos):
+                raise NotFound("Nothing to delete: it is already gone.")
+            token, folder = trash.new()
+            record = {"lab": lab.id, "time": time.time(), "nodes": [],
+                      "links": [l.model_dump(mode="json") for l in links],
+                      "annotations": [a.model_dump(mode="json") for a in annos]}
+            for n in nodes:
+                included = backups.is_included(lab.id, n.id)
+                rt.stop_node(lab, n)
+                rt.stash_files(n, folder / f"n{n.id}")
+                backups.stash_node(n.id, folder / f"n{n.id}" / "backups")
+                backups.set_node(lab.id, n.id, False)
+                record["nodes"].append({"node": n.model_dump(mode="json"), "backup": included})
+            for l in links:
+                if not any(l.touches(i) for i in gone):
+                    rt.remove_link(l)  # devices that stay up lose just this cable
+            lab.links = [l for l in lab.links if l not in links]
+            lab.nodes = [n for n in lab.nodes if n.id not in gone]
+            lab.annotations = [a for a in lab.annotations if a not in annos]
+            trash.save(token, record)
+            store.save()
+            rt.sync_dhcp()
+            activity.record(f"deleted {amount(nodes, links, annos)}", lab, kind="danger")
+            trash.purge()
+            return {"token": token, "nodes": len(nodes), "links": len(links), "annotations": len(annos)}
+
+    @app.post("/api/labs/{lab_id}/restore")
+    def restore_items(lab_id: int, body: Undelete):
+        """Undo a delete: everything comes back, under its old ids and names where free."""
+        with rt.lock:
+            lab = get_lab(lab_id)
+            got = trash.load(body.token)
+            if got is None:
+                raise NotFound("That can no longer be undone: deleted things are kept for 24 hours.")
+            record, folder = got
+            if record["lab"] != lab.id:
+                raise Conflict("That was deleted from another lab.")
+            used = {n.id for n in store.state.all_nodes()}
+            names = {n.name for n in lab.nodes}
+            ids: dict[int, int] = {}
+            back_nodes = []
+            for item in record["nodes"]:
+                data = item["node"]
+                old = data["id"]
+                new = old if old not in used else free_id(used)
+                used.add(new)
+                node = Node.model_validate({**data, "id": new, "name": free_name(data["name"], names)})
+                names.add(node.name)
+                rt.delete_disk(node)  # nothing should be there, but never mix two devices' files
+                rt.unstash_files(node, folder / f"n{old}")
+                backups.unstash_node(new, folder / f"n{old}" / "backups")
+                if item.get("backup"):
+                    backups.set_node(lab.id, new, True)
+                lab.nodes.append(node)
+                ids[old] = new
+                back_nodes.append(node)
+            link_ids = {l.id for l in store.state.all_links()}
+            back_links, skipped = [], 0
+            for data in record["links"]:
+                ends = []
+                for e in (data["a"], data["b"]):
+                    ends.append(None if e is None else Endpoint(node=ids.get(e["node"], e["node"]), port=e["port"]))
+                try:
+                    for e in ends:
+                        if e is not None:
+                            rt.check_endpoint(lab, e)
+                except (NotFound, Invalid, Conflict):
+                    skipped += 1  # the other end is gone, or its port is taken now
+                    continue
+                lid = data["id"] if data["id"] not in link_ids else free_id(link_ids)
+                link_ids.add(lid)
+                link = Link(id=lid, a=ends[0], b=ends[1])
+                lab.links.append(link)
+                rt.apply_link(lab, link)
+                back_links.append(link)
+            anno_ids = {a.id for a in lab.annotations}
+            back_annos = []
+            for data in record["annotations"]:
+                aid = data["id"] if data["id"] not in anno_ids else free_id(anno_ids)
+                anno_ids.add(aid)
+                anno = Annotation.model_validate({**data, "id": aid})
+                lab.annotations.append(anno)
+                back_annos.append(anno)
+            store.save()
+            rt.sync_dhcp()
+            trash.drop(body.token)
+            activity.record(f"restored {amount(back_nodes, back_links, back_annos)}", lab)
+            return {"nodes": {str(k): v for k, v in ids.items()}, "links": [l.id for l in back_links],
+                    "annotations": [a.id for a in back_annos], "skipped_links": skipped}
+
+    @app.post("/api/labs/{lab_id}/paste", status_code=201)
+    def paste_items(lab_id: int, body: Paste):
+        """Copies of devices with the links between them, and shapes. Names that are taken
+        get the next free one in their series; settings come along, configuration only
+        when asked for (and only from stopped routers)."""
+        with rt.lock:
+            lab = get_lab(lab_id)
+            if len(lab.annotations) + len(body.annotations) > 500:
+                raise Conflict("A lab can have at most 500 shapes and notes.")
+            same_lab = body.source_lab == lab.id
+            names = {n.name for n in lab.nodes}
+            used = {n.id for n in store.state.all_nodes()}
+            made: list[tuple[PasteNode, Node]] = []
+            refs: dict[int, Node] = {}
+            for spec in body.nodes:
+                if spec.ref in refs:
+                    raise Invalid("Two devices in the paste share one ref.")
+                check_ports(spec.kind, spec.ports)
+                data = spec.model_dump(exclude={"ref", "source"})
+                if spec.kind != NodeKind.client:
+                    data.update(address=None, gateway=None, dns=None, addressing="static", services=[],
+                                docker=False, containers=[])
+                elif same_lab and data["addressing"] == "static" and data["address"]:
+                    # Two clients with one address would only confuse; servers need one.
+                    data.update(address=None, services=[x for x in data["services"] if x not in ("dhcp", "dns")])
+                if spec.role != "switch":
+                    data["layer"] = 2
+                if data["ram_mb"] is None:
+                    data["ram_mb"] = default_chr_ram(spec.cpus, spec.ports) if spec.kind == NodeKind.chr else 128
+                data["name"] = free_name(spec.name, names)
+                names.add(data["name"])
+                data["id"] = free_id(used)
+                used.add(data["id"])
+                node = Node.model_validate(data)
+                check_client(node)
+                made.append((spec, node))
+                refs[spec.ref] = node
+            taken: set[tuple[int, int]] = set()
+            for l in body.links:
+                a, b = refs.get(l.a.ref), refs.get(l.b.ref)
+                if a is None or b is None:
+                    raise Invalid("A link in the paste leads to a device that is not in it.")
+                for n, e in ((a, l.a), (b, l.b)):
+                    if e.port > n.ports or (n.id, e.port) in taken:
+                        raise Invalid(f"{n.name} port {e.port} does not exist or is linked twice.")
+                    taken.add((n.id, e.port))
+            no_config = []
+            for spec, node in made:
+                rt.delete_disk(node)  # a stale disk from an earlier device with this id
+                if body.with_config and spec.source is not None and node.kind == NodeKind.chr:
+                    src = next((n for n in store.state.all_nodes() if n.id == spec.source), None)
+                    if src is None or rt.node_running(src) or not rt.copy_disk(src, node):
+                        no_config.append(node.name)
+                lab.nodes.append(node)
+            link_ids = {l.id for l in store.state.all_links()}
+            new_links = []
+            for l in body.links:
+                lid = free_id(link_ids)
+                link_ids.add(lid)
+                link = Link(id=lid, a=Endpoint(node=refs[l.a.ref].id, port=l.a.port),
+                            b=Endpoint(node=refs[l.b.ref].id, port=l.b.port))
+                lab.links.append(link)
+                new_links.append(link)
+            anno_ids = {a.id for a in lab.annotations}
+            new_annos = []
+            for spec in body.annotations:
+                aid = free_id(anno_ids)
+                anno_ids.add(aid)
+                anno = Annotation(id=aid, **spec.model_dump())
+                lab.annotations.append(anno)
+                new_annos.append(anno)
+            store.save()
+            rt.sync_dhcp()
+            activity.record(f"pasted {amount([n for _, n in made], new_links, new_annos)}"
+                            + (" with configuration" if body.with_config and len(no_config) < len(made) else ""), lab)
+            return {"nodes": [{"ref": spec.ref, "id": node.id, "name": node.name} for spec, node in made],
+                    "links": [l.id for l in new_links], "annotations": [a.id for a in new_annos],
+                    "config_skipped": no_config}
 
     @app.post("/api/labs/{lab_id}/nodes/{node_id}/start")
     def start_node(lab_id: int, node_id: int):

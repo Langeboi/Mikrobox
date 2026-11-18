@@ -59,6 +59,7 @@ class Node(BaseModel):
     kind: NodeKind
     # How a CHR is presented. A switch is still a full CHR, just drawn and sized as one.
     role: Literal["router", "switch"] = "router"
+    layer: Literal[2, 3] = 2  # switches: layer 2, or layer 3 (routes between its VLANs)
     name: str = Field(pattern=NAME_PATTERN)
     ports: int = Field(ge=1)
     cpus: int = Field(default=1, ge=1, le=8)
