@@ -282,6 +282,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             return JSONResponse({"detail": str(e)}, status_code=code)
         app.add_exception_handler(exc, handler)
 
+    @app.exception_handler(Exception)
+    def unexpected(request, e: Exception):
+        # Still logged in full by the server; the page gets something to show and send on.
+        return JSONResponse({"detail": f"Something went wrong on the server ({type(e).__name__}: {e}). "
+                                       "The full error is in the server's log."}, status_code=500)
+
     @app.exception_handler(ValidationError)
     def invalid_model(request, e: ValidationError):
         detail = "; ".join(f"{'.'.join(map(str, x['loc']))}: {x['msg']}" for x in e.errors())

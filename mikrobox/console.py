@@ -16,6 +16,7 @@ import fcntl
 import json
 import os
 import pty
+import struct
 import subprocess
 import termios
 from pathlib import Path
@@ -48,6 +49,21 @@ class Hub:
 
     def close_backend(self) -> None:
         raise NotImplementedError
+
+    def resize(self, cols: int, rows: int) -> None:
+        """The terminal in the browser changed size. Only a shell's pty can use that."""
+
+    @staticmethod
+    def control(text: str | None) -> dict | None:
+        """A message from the browser, not keystrokes: CONTROL followed by JSON. Ctrl+A on
+        its own is also CONTROL, so only an object that parses counts."""
+        if not text or not text.startswith(CONTROL + "{"):
+            return None
+        try:
+            msg = json.loads(text[1:])
+        except ValueError:
+            return None
+        return msg if isinstance(msg, dict) else None
 
     async def run(self) -> None:
         try:
@@ -93,6 +109,14 @@ class Hub:
                 msg = await ws.receive()
                 if msg["type"] == "websocket.disconnect":
                     break
+                ctl = self.control(msg.get("text"))
+                if ctl is not None:
+                    size = ctl.get("size")
+                    if (isinstance(size, list) and len(size) == 2 and all(isinstance(x, int) for x in size)
+                            and not self.closed):
+                        # Shared consoles follow whoever resized last, like tmux.
+                        self.resize(max(2, min(size[0], 1000)), max(2, min(size[1], 500)))
+                    continue
                 data = msg.get("bytes") or (msg.get("text") or "").encode()
                 if data and not self.closed:
                     await self.write(data)
@@ -148,12 +172,20 @@ class ShellHub(Hub):
         self.netns, self.name = netns, name
         self.env = env or {}  # e.g. DOCKER_HOST for a PC with Docker
 
+    def shell(self) -> list[str]:
+        # UTF-8, or bash counts a character like "–" as three and the line it redraws
+        # no longer matches the screen.
+        return ["env", f"PS1={self.name}# ", "TERM=xterm-256color", "LANG=C.UTF-8",
+                *[f"{k}={v}" for k, v in self.env.items()], "bash", "--norc", "--noprofile", "-i"]
+
+    def argv(self) -> list[str]:
+        return ["ip", "netns", "exec", self.netns, *self.shell()]
+
     async def open(self) -> None:
         self.master, slave = pty.openpty()
+        self._set_size(slave, 120, 30)  # until the browser says how big it is
         self.proc = subprocess.Popen(
-            ["ip", "netns", "exec", self.netns, "env", f"PS1={self.name}# ", "TERM=xterm-256color",
-             *[f"{k}={v}" for k, v in self.env.items()], "bash", "--norc", "--noprofile", "-i"],
-            stdin=slave, stdout=slave, stderr=slave, close_fds=True, preexec_fn=_claim_tty,
+            self.argv(), stdin=slave, stdout=slave, stderr=slave, close_fds=True, preexec_fn=_claim_tty,
         )
         os.close(slave)
         self.loop = asyncio.get_running_loop()
@@ -174,6 +206,18 @@ class ShellHub(Hub):
 
     async def write(self, data: bytes) -> None:
         os.write(self.master, data)
+
+    @staticmethod
+    def _set_size(fd: int, cols: int, rows: int) -> None:
+        fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", rows, cols, 0, 0))
+
+    def resize(self, cols: int, rows: int) -> None:
+        # Without this bash wraps long lines at 80 columns while the browser wraps
+        # wherever its edge is, and editing a long command scrambles the screen.
+        try:
+            self._set_size(self.master, cols, rows)  # the shell gets SIGWINCH
+        except OSError:
+            pass
 
     def close_backend(self) -> None:
         try:

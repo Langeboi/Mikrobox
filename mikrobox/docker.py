@@ -297,7 +297,9 @@ class Docker:
     def command(self, node) -> list[str]:
         exec_root = self.root() / f"n{node.id}"
         return [
-            str(self.root() / "docker-launch.sh"), self.netns_path(node),
+            # Given to sh rather than written to a file and run: /run is often mounted
+            # noexec (Ubuntu, Debian), and nothing there may be executed.
+            "sh", "-c", LAUNCH, "docker-launch", self.netns_path(node),
             str(self.s.netns_etc / self.rt.netns(node.id) / "resolv.conf"), str(self.root() / f"n{node.id}.cg"),
             "--data-root", str(self.data_root(node)), "--exec-root", str(exec_root),
             "--pidfile", str(self.pidfile(node)), "-H", self.docker_host(node), "--log-level", "warn",
@@ -309,9 +311,7 @@ class Docker:
             return
         root = self.root()
         root.mkdir(parents=True, exist_ok=True)
-        script = root / "docker-launch.sh"
-        script.write_text(LAUNCH)
-        os.chmod(script, 0o755)
+        (root / "docker-launch.sh").unlink(missing_ok=True)  # left by older versions
         cmd = self.command(node)
         with self.lock:
             self.state[node.id] = "starting"
@@ -324,9 +324,17 @@ class Docker:
         env = {k: v for k, v in os.environ.items() if not k.lower().endswith("_proxy")}
         env.update(HTTPS_PROXY=f"http://127.0.0.1:{PULL_PORT}", HTTP_PROXY=f"http://127.0.0.1:{PULL_PORT}")
         log = (root / f"n{node.id}.log").open("ab")
-        subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT, env=env,
-                         start_new_session=True, close_fds=True)
-        log.close()
+        try:
+            subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT, env=env,
+                             start_new_session=True, close_fds=True)
+        except OSError as e:
+            # The PC still starts; its panel says what went wrong with Docker.
+            self._close_proxy(node)
+            with self.lock:
+                self.state[node.id] = f"The Docker engine did not start: {e.strerror or e}."
+            return
+        finally:
+            log.close()
         threading.Thread(target=self._settle, args=(lab.id, node.id), daemon=True).start()
 
     def resume(self, lab, node) -> None:
