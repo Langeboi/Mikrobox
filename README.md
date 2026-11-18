@@ -103,7 +103,7 @@ Windows-only H3C Cloud Lab, so neither is included.
 
 ## What works in this version
 
-- Labs made of CHR routers and lightweight Linux clients, stored in one JSON file.
+- Labs made of CHR routers and switches and lightweight Linux PCs and servers, stored in one JSON file.
 - Per router: name, number of ports (1-24, 5 by default), vCPUs and RAM.
 - A Switch device: a CHR with 24 ports and its own icon, for when you want one as a switch.
   Choose layer 2 (the default) or layer 3 when adding it, or later in its settings; a layer 3
@@ -127,17 +127,22 @@ Windows-only H3C Cloud Lab, so neither is included.
   factory reset, over SSH on the management network.
 - Templates: ready-made layouts for multi-area OSPF, a collapsed core, spine and leaf, an
   ISP with MPLS, and BGP multihoming. Topology and a suggested plan, not router configs.
-- Clients take a fixed address, gateway and DNS servers, or ask DHCP for all three. Their
-  consoles have ping, traceroute, mtr, dig, nmap, curl, iperf3, netcat and arping.
-- Client services, switched on per client: a web server on port 80, an iperf3 server, a
+- Linux clients come in two kinds, each with its own icon. A PC is for testing from: one
+  NIC, and ping, traceroute, mtr, dig, nmap, curl, iperf3, netcat and arping in its
+  console. A server has one to four NICs, which can be bonded (LACP or active-backup) into
+  bond0, and runs services and Docker. Either takes a fixed address, gateway and DNS
+  servers, or asks DHCP for all three; a server's other NICs can have addresses of their
+  own. A PC can be turned into a server and back in its settings. Clients from before this
+  split became servers if they ran services or Docker or had more than one NIC.
+- Server services, switched on per server: a web server on port 80, an iperf3 server, a
   DHCP server (hands out .100-.199 of its subnet) and a DNS server that answers for every
   device in the lab as `<name>.lab` and forwards everything else.
-- Docker on Linux clients, switched on per client: each gets its own Docker engine inside
-  the client, so containers sit on the lab network and publish ports on the client's
+- Docker on Linux servers, switched on per server: each gets its own Docker engine inside
+  the server, so containers sit on the lab network and publish ports on the server's
   address. Add containers from the device panel (nginx, Apache, whoami, Portainer,
   Grafana, Uptime Kuma, PostgreSQL or any image) or with `docker` in its console. Ones
-  added from the panel are saved with the lab and start with the client; images are
-  downloaded through the VM, and a client that has an image shares it with the others.
+  added from the panel are saved with the lab and start with the server; images are
+  downloaded through the VM, and a server that has an image shares it with the others.
 - Open in your browser: a link from your own browser to any web page inside the lab, over
   HTTP or HTTPS, fetched the way a chosen client sees it. Pick a container's port or type
   any address (a router's WebFig, say). HTTPS passes through untouched, so you see the
@@ -193,10 +198,10 @@ The installer downloads the current stable CHR image from MikroTik. Pin a versio
 
 To update later: `git pull && sudo ./scripts/install.sh`. Running routers keep running.
 Updating this way also installs the packages newer features need (tshark for the packet
-decode, iperf3, dig and friends for clients, Docker for clients); stopped clients pick them
-up on their next start.
+decode, iperf3, dig and friends for clients, Docker and bonding for servers); stopped
+clients pick them up on their next start.
 
-Docker is installed for clients but not started on the VM itself: each client with Docker
+Docker is installed for servers but not started on the VM itself: each server with Docker
 turned on runs its own engine. If Docker was already running on the VM, it is left as it
 was. Skip Docker with `sudo WITH_DOCKER=0 ./scripts/install.sh`.
 
@@ -334,6 +339,9 @@ Add `?seconds=30` for a capture that ends by itself; the workspace's Capture lin
   Mikrobox's sign-in cookie too. Two things make that harmless: Mikrobox refuses changes
   and websockets that come from any page but its own, and a sign-in only works from the
   address it was made from (so you sign in again if your computer's address changes).
+- Server bonding was tested by the commands it runs, not live: the test machine has no
+  bonding module. The installer loads it with `max_bonds=0`, so the VM gets no bond0 of its
+  own. A server bonded with LACP needs a RouterOS bond in 802.3ad mode on the other side.
 - If Docker runs on the VM itself, it may set the firewall to drop forwarded traffic,
   which stops the Cloud's NAT; allow `mbcloud` in Docker's `DOCKER-USER` chain.
 

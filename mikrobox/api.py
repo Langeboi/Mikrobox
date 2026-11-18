@@ -62,8 +62,10 @@ class LabUpdate(BaseModel):
 
 class NodeCreate(BaseModel):
     kind: NodeKind = NodeKind.chr  # the operating system
-    role: Optional[Literal["router", "switch"]] = None  # default: the first the OS supports
+    role: Optional[Literal["router", "switch", "pc", "server"]] = None  # default: the first the OS supports; a client is a pc
     layer: Literal[2, 3] = 2
+    bond: Optional[Literal["lacp", "active-backup"]] = None
+    nic_addresses: list[Optional[str]] = Field(default_factory=list, max_length=3)
     name: str = Field(pattern=NAME_PATTERN)
     ports: Optional[int] = Field(default=None, ge=1)
     cpus: Optional[int] = Field(default=None, ge=1, le=8)
@@ -94,6 +96,9 @@ class WebLinkCreate(BaseModel):
 class NodeUpdate(BaseModel):
     name: Optional[str] = Field(default=None, pattern=NAME_PATTERN)
     layer: Optional[Literal[2, 3]] = None  # switches only; it changes how it is drawn
+    role: Optional[Literal["pc", "server"]] = None  # clients only
+    bond: Optional[Literal["lacp", "active-backup"]] = None  # servers; null for no bond
+    nic_addresses: Optional[list[Optional[str]]] = Field(default=None, max_length=3)
     ports: Optional[int] = Field(default=None, ge=1)
     cpus: Optional[int] = Field(default=None, ge=1, le=8)
     ram_mb: Optional[int] = Field(default=None, ge=128, le=16384)
@@ -263,7 +268,9 @@ class PasteNode(BaseModel):
     ref: int                      # the client's own key, for links and the answer
     source: Optional[int] = None  # the device copied, whose configuration can come along
     kind: NodeKind = NodeKind.chr
-    role: Literal["router", "switch"] = "router"
+    role: Literal["router", "switch", "pc", "server"] = "router"
+    bond: Optional[Literal["lacp", "active-backup"]] = None
+    nic_addresses: list[Optional[str]] = Field(default_factory=list, max_length=3)
     layer: Literal[2, 3] = 2
     name: str = Field(pattern=NAME_PATTERN)
     ports: int = Field(ge=1)
@@ -319,7 +326,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     def what(node: Node) -> str:
         if node.kind == NodeKind.client:
-            return "client"
+            return "server" if node.role == "server" else "PC"
         if node.role == "switch":
             return "layer 3 switch" if node.layer == 3 else "switch"
         return "router"
@@ -422,8 +429,24 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             if node.addressing != "static" or node.services:
                 raise Invalid("addressing and services apply to clients only.")
             if node.docker or node.containers:
-                raise Invalid("Docker runs on Linux clients only.")
+                raise Invalid("Docker runs on Linux servers only.")
+            if node.bond or node.nic_addresses:
+                raise Invalid("Bonding and NIC addresses are for Linux servers.")
             return
+        if node.role == "pc":
+            # A PC is for testing from: one NIC and the tools. Servers do the rest.
+            if node.services or node.docker or node.containers:
+                raise Invalid(f"Only servers run services and Docker. Make {node.name} a server first.")
+            if node.ports != 1:
+                raise Invalid("A PC has one NIC. A server can have up to four.")
+            if node.bond or node.nic_addresses:
+                raise Invalid("Bonding and NIC addresses are for servers.")
+        if node.bond and node.ports < 2:
+            raise Invalid("A bond needs at least two NICs.")
+        if node.bond and node.nic_addresses:
+            raise Invalid("Bonded NICs share the bond's address. Leave the other NIC addresses empty.")
+        if len(node.nic_addresses) > node.ports - 1:
+            raise Invalid(f"{node.name} has {node.ports} NICs; there are addresses for more.")
         if ("dhcp" in node.services or "dns" in node.services) and (node.addressing != "static" or not node.address):
             raise Invalid("A DHCP or DNS server needs a fixed address. Set one, or switch those off.")
         if "dhcp" in node.services:
@@ -848,12 +871,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             if p is None:
                 if body.role == "switch":
                     raise Invalid("A client cannot be a switch.")
-                role = "router"
+                role = "server" if body.role == "server" else "pc"
             else:
                 role = body.role or p.roles[0]
                 if role not in p.roles:
                     raise Invalid(f"{p.label} can only be added as a {' or '.join(p.roles)}.")
-            ports = body.ports or (p.ports_for(role) if p else 1)
+            ports = body.ports or (p.ports_for(role) if p else 2 if role == "server" else 1)
             if body.layer == 3 and role != "switch":
                 raise Invalid("Only switches have a layer.")
             check_ports(body.kind, ports)
@@ -872,6 +895,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             node = Node(
                 id=free_id({n.id for n in store.state.all_nodes()}),
                 kind=body.kind, role=role, layer=body.layer, name=body.name, ports=ports, cpus=cpus,
+                bond=body.bond, nic_addresses=body.nic_addresses,
                 ram_mb=ram, address=body.address, gateway=body.gateway, dns=body.dns,
                 addressing=body.addressing, services=sorted(set(body.services)),
                 x=body.x, y=body.y,
@@ -888,11 +912,13 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             lab = get_lab(lab_id)
             node = get_node(lab, node_id)
             changes = body.model_dump(exclude_unset=True)
-            for key in ("x", "y", "name", "ports", "cpus", "ram_mb", "layer"):
+            for key in ("x", "y", "name", "ports", "cpus", "ram_mb", "layer", "role", "nic_addresses"):
                 if changes.get(key, 0) is None:
                     del changes[key]
             if "layer" in changes and node.role != "switch":
                 raise Invalid("Only switches have a layer.")
+            if "role" in changes and node.kind != NodeKind.client:
+                raise Invalid("Only clients are PCs or servers.")
             # Moving it and its layer (only how it is drawn) can change while it runs.
             if rt.node_running(node) and set(changes) - {"x", "y", "layer"}:
                 raise Conflict(f"Stop {node.name} before changing it.")
@@ -915,15 +941,18 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             lab.nodes[lab.nodes.index(node)] = updated
             store.save()
             rt.sync_dhcp()
-            settings_changed = sorted(k for k in changes if k not in ("x", "y", "name", "layer")
+            settings_changed = sorted(k for k in changes if k not in ("x", "y", "name", "layer", "role")
                                       and getattr(node, k) != getattr(updated, k))
             if updated.name != node.name:
                 activity.record(f"renamed {node.name} to {updated.name}", lab)
             if updated.layer != node.layer:
                 activity.record(f"made {updated.name} a layer {updated.layer} switch", lab)
+            if updated.role != node.role:
+                activity.record(f"made {updated.name} a {what(updated)}", lab)
             if settings_changed:
                 words = {"ports": "ports", "cpus": "vCPUs", "ram_mb": "RAM", "address": "address",
-                         "gateway": "gateway", "dns": "DNS", "addressing": "addressing", "services": "services"}
+                         "gateway": "gateway", "dns": "DNS", "addressing": "addressing", "services": "services",
+                         "bond": "bonding", "nic_addresses": "NIC addresses"}
                 activity.record(f"changed {updated.name}'s {', '.join(words.get(k, k) for k in settings_changed)}", lab)
             return node_view(lab, updated)
 
@@ -1098,10 +1127,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 data = spec.model_dump(exclude={"ref", "source"})
                 if spec.kind != NodeKind.client:
                     data.update(address=None, gateway=None, dns=None, addressing="static", services=[],
-                                docker=False, containers=[])
-                elif same_lab and data["addressing"] == "static" and data["address"]:
-                    # Two clients with one address would only confuse; servers need one.
-                    data.update(address=None, services=[x for x in data["services"] if x not in ("dhcp", "dns")])
+                                docker=False, containers=[], bond=None, nic_addresses=[])
+                elif same_lab:
+                    # Two clients with one address would only confuse; DHCP and DNS servers need one.
+                    data["nic_addresses"] = []
+                    if data["addressing"] == "static" and data["address"]:
+                        data.update(address=None, services=[x for x in data["services"] if x not in ("dhcp", "dns")])
                 if spec.role != "switch":
                     data["layer"] = 2
                 if data["ram_mb"] is None:
@@ -1336,8 +1367,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     def docker_pc(lab_id: int, node_id: int, running: bool = False):
         lab = get_lab(lab_id)
         node = get_node(lab, node_id)
-        if node.kind != NodeKind.client:
-            raise Invalid("Docker runs on Linux clients only.")
+        if node.kind != NodeKind.client or node.role != "server":
+            raise Invalid("Docker runs on Linux servers only.")
         if running:
             if not node.docker:
                 raise Conflict(f"Turn on Docker for {node.name} first.")

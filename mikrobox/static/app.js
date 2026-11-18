@@ -26,6 +26,7 @@ const ICONS = {
   link: "M9 15l6-6 M10 6l1-1a4 4 0 0 1 6 6l-1 1 M14 18l-1 1a4 4 0 0 1-6-6l1-1",
   chr: "M2 12a10 10 0 1 0 20 0a10 10 0 1 0-20 0 M6 12h12 M12 6v12 M6 12l2.6-2.6 M6 12l2.6 2.6 M18 12l-2.6-2.6 M18 12l-2.6 2.6 M12 6l-2.6 2.6 M12 6l2.6 2.6 M12 18l-2.6-2.6 M12 18l2.6-2.6",
   client: "M4 5h16v11H4z M9 20h6 M12 16v4",
+  server: "M4 4h16v7H4z M4 13h16v7H4z M7.5 7.5h.5 M7.5 16.5h.5 M12 7.5h4.5 M12 16.5h4.5",
   switch: "M3 8.5h18 M17 5l4 3.5-4 3.5 M21 15.5H3 M7 12l-4 3.5 4 3.5",
   // A layer 3 switch: the switch's arrows around the router's circle.
   l3switch: "M3 4.5h18 M17.5 1.8l3.5 2.7-3.5 2.7 M21 19.5H3 M6.5 16.8L3 19.5l3.5 2.7 M7.6 12a4.4 4.4 0 1 0 8.8 0a4.4 4.4 0 1 0-8.8 0 M9.6 12h4.8 M12 9.6v4.8",
@@ -38,7 +39,10 @@ const ICONS = {
   collapse: "M6 9l6 6 6-6",
   expand: "M6 15l6-6 6 6",
 };
-const glyphOf = (n) => (n.role === "switch" ? (n.layer === 3 ? "l3switch" : "switch") : n.kind);
+const glyphOf = (n) => (n.role === "switch" ? (n.layer === 3 ? "l3switch" : "switch") : n.role === "server" ? "server" : n.kind);
+const kindText = (n) => (n.kind === "client" ? (n.role === "server" ? "Linux server" : "Linux PC")
+  : n.role !== "switch" ? "CHR router" : n.layer === 3 ? "CHR layer 3 switch" : "CHR switch");
+const isServer = (n) => n.kind === "client" && n.role === "server";
 const CLOUD = "M-34 26a20 20 0 0 1-5-39a27 27 0 0 1 51-9a23 23 0 0 1 27 48z";
 const icon = (name) => s("svg", { class: "icon", viewBox: "0 0 24 24", "aria-hidden": "true" }, s("path", { d: ICONS[name] }));
 
@@ -48,7 +52,8 @@ const TOOLS = [
   null,
   { id: "chr", label: "Router", tip: "Add a router (MikroTik CHR)", add: true },
   { id: "switch", label: "Switch", tip: "Add a switch (MikroTik CHR or Aruba AOS-CX), layer 2 or 3", add: true },
-  { id: "client", label: "Client", tip: "Add a Linux client", add: true },
+  { id: "client", label: "PC", tip: "Add a Linux PC to test from: ping, traceroute, mtr, dig, curl, iperf3", add: true },
+  { id: "server", label: "Server", tip: "Add a Linux server: DNS, DHCP, web and iperf3 servers, Docker, up to four NICs with bonding", add: true },
   null,
   { id: "rect", label: "Area", tip: "Draw a rectangular area", draw: true },
   { id: "ellipse", label: "Ellipse", tip: "Draw an elliptical area", draw: true },
@@ -203,7 +208,7 @@ const portName = (node, port) => (node.kind === "chr" ? `ether${port}`
   : node.kind === "aoscx" ? (port === 1 ? "mgmt" : `1/1/${port - 1}`)
   : `eth${port - 1}`);
 const isVm = (node) => node.kind === "chr" || node.kind === "aoscx";
-const roleName = (node) => (node.kind === "client" ? "Client"
+const roleName = (node) => (node.kind === "client" ? (node.role === "server" ? "Server" : "PC")
   : node.role === "switch" ? (node.layer === 3 ? "Layer 3 switch" : "Switch") : "Router");
 
 // The glyph shows the role; a small badge names the OS when it is not MikroTik.
@@ -924,14 +929,23 @@ function nextName(prefix) {
 // Layer 2 or layer 3, for a switch. Only changes how it is drawn and described: either way
 // it is a full CHR, and routing between VLANs is set up in RouterOS.
 function layerPicker(value, onPick) {
-  const opts = [[2, "Layer 2", "Switches within VLANs"], [3, "Layer 3", "Also routes between them"]];
-  const btns = opts.map(([layer, label, tip]) => h("button", { type: "button", "aria-pressed": String(value === layer),
-    onclick: () => { for (const b of btns) b.setAttribute("aria-pressed", String(b === btns[layer - 2])); onPick(layer); } },
-    s("svg", { class: "icon", viewBox: "0 0 24 24", "aria-hidden": "true" }, s("path", { d: ICONS[layer === 3 ? "l3switch" : "switch"] })),
-    h("span", {}, h("strong", {}, label), h("small", {}, tip))));
-  return h("div", { class: "field" }, h("span", { class: "label", id: "layer-label" }, "Layer"),
-    h("div", { class: "seg layer", role: "group", "aria-labelledby": "layer-label" }, btns));
+  return choicePicker("Layer", [[2, "Layer 2", "Switches within VLANs", "switch"], [3, "Layer 3", "Also routes between them", "l3switch"]],
+    value, onPick);
 }
+
+// Two choices side by side, each with an icon and a line: [value, label, tip, icon].
+let pickerSeq = 0;
+function choicePicker(title, opts, value, onPick, disabled) {
+  const id = `pick-${++pickerSeq}`;
+  const btns = opts.map(([v, label, tip, ic]) => h("button", { type: "button", "aria-pressed": String(value === v), disabled: !!disabled,
+    onclick: () => { for (const b of btns) b.setAttribute("aria-pressed", String(b.dataset.v === String(v))); onPick(v); }, "data-v": String(v) },
+    s("svg", { class: "icon", viewBox: "0 0 24 24", "aria-hidden": "true" }, s("path", { d: ICONS[ic] })),
+    h("span", {}, h("strong", {}, label), h("small", {}, tip))));
+  return h("div", { class: "field" }, h("span", { class: "label", id }, title),
+    h("div", { class: "seg layer", role: "group", "aria-labelledby": id }, btns));
+}
+
+const BONDS = [["", "No bond"], ["lacp", "LACP (802.3ad)"], ["active-backup", "Active-backup"]];
 
 function freeSpot() {
   // First free slot on a grid, starting near the middle of what is on screen.
@@ -945,27 +959,52 @@ function freeSpot() {
 
 function addNodeDialog(tool) {
   const at = freeSpot();
-  if (tool === "client") {
-    openModal("Add client", [
-      { key: "name", label: "Hostname", value: nextName("PC") },
-      { key: "addressing", label: "Addressing", type: "select", value: "static",
-        options: [{ value: "static", label: "Fixed address" }, { value: "dhcp", label: "Ask DHCP for an address" }] },
-      { key: "address", label: "IP address (optional)", placeholder: "192.168.10.2/24" },
-      { key: "gateway", label: "Gateway (optional)", placeholder: "192.168.10.1" },
-      { key: "dns", label: "DNS servers (optional)", placeholder: "1.1.1.1, 9.9.9.9" },
-      { node: h("p", { class: "hint" }, "Web, iperf3, DHCP and DNS servers can be switched on in the client's settings.") },
-    ], "Add", async (v) => {
-      const body = { kind: "client", name: v.name, addressing: v.addressing, ...at };
-      if (v.addressing !== "dhcp") for (const k of ["address", "gateway", "dns"]) if (v[k]) body[k] = v[k];
-      const node = await api("POST", `${labPath()}/nodes`, body);
-      state.sel = { type: "node", id: node.id };
-      rememberCreated(`add ${node.name}`, { nodes: [node.id] });
-    });
-    const mode = $("#m-addressing");
-    mode.addEventListener("change", () => { for (const k of ["address", "gateway", "dns"]) $("#m-" + k).disabled = mode.value === "dhcp"; });
-    return;
-  }
+  if (tool === "client" || tool === "server") { addLinuxDialog(tool === "server", at); return; }
   addDeviceDialog(tool === "switch" ? "switch" : "router", at);
+}
+
+// A Linux PC to test from, or a server that runs services and Docker and can bond its NICs.
+function addLinuxDialog(isSrv, at) {
+  const addressing = { key: "addressing", label: "Addressing", type: "select", value: "static",
+    options: [{ value: "static", label: "Fixed address" }, { value: "dhcp", label: "Ask DHCP for an address" }] };
+  const fields = isSrv
+    ? [
+        { node: h("p", {}, "Runs DNS, DHCP, web and iperf3 servers and Docker, which you switch on in its settings. Its NICs can be bonded.") },
+        { key: "name", label: "Hostname", value: nextName("SRV") },
+        { key: "ports", label: "NICs (1-4)", type: "number", value: 2, min: 1, max: 4 },
+        { key: "bond", label: "Bonding", type: "select", value: "", options: BONDS.map(([value, label]) => ({ value, label })) },
+        addressing,
+        { key: "address", label: "IP address (needed for DHCP and DNS servers)", placeholder: "192.168.10.5/24" },
+        { key: "gateway", label: "Gateway (optional)", placeholder: "192.168.10.1" },
+        { key: "dns", label: "DNS servers (optional)", placeholder: "1.1.1.1, 9.9.9.9" },
+      ]
+    : [
+        { key: "name", label: "Hostname", value: nextName("PC") },
+        addressing,
+        { key: "address", label: "IP address (optional)", placeholder: "192.168.10.2/24" },
+        { key: "gateway", label: "Gateway (optional)", placeholder: "192.168.10.1" },
+        { key: "dns", label: "DNS servers (optional)", placeholder: "1.1.1.1, 9.9.9.9" },
+        { node: h("p", { class: "hint" }, "A PC to test from: ping, traceroute, mtr, dig, curl, nmap and iperf3 in its console. Use a server to run DNS, DHCP, web servers or Docker.") },
+      ];
+  openModal(isSrv ? "Add server" : "Add PC", fields, "Add", async (v) => {
+    const body = { kind: "client", role: isSrv ? "server" : "pc", name: v.name, addressing: v.addressing, ...at };
+    if (isSrv) {
+      body.ports = Number(v.ports) || 2;
+      if (v.bond && body.ports > 1) body.bond = v.bond;
+    }
+    if (v.addressing !== "dhcp") for (const k of ["address", "gateway", "dns"]) if (v[k]) body[k] = v[k];
+    const node = await api("POST", `${labPath()}/nodes`, body);
+    state.sel = { type: "node", id: node.id };
+    rememberCreated(`add ${node.name}`, { nodes: [node.id] });
+  });
+  const mode = $("#m-addressing");
+  mode.addEventListener("change", () => { for (const k of ["address", "gateway", "dns"]) $("#m-" + k).disabled = mode.value === "dhcp"; });
+  if (isSrv) {
+    const nics = $("#m-ports"), bond = $("#m-bond");
+    const sync = () => { bond.disabled = Number(nics.value) < 2; if (bond.disabled) bond.value = ""; };
+    nics.addEventListener("input", sync);
+    sync();
+  }
 }
 
 // A router or switch: pick the role from the toolbar, then the operating system here.
@@ -1354,8 +1393,14 @@ function nodeInspector(n) {
     return h("div", { class: "field" }, h("label", { for: id }, label), inputs[key]);
   };
   const svcBoxes = {};
+  const nicInputs = [];
   const save = () => act(async () => {
     const body = {};
+    if (nicInputs.length) {
+      const list = nicInputs.map((i) => i.value.trim() || null);
+      while (list.length && list[list.length - 1] === null) list.pop();
+      if (JSON.stringify(list) !== JSON.stringify(n.nic_addresses || [])) body.nic_addresses = list;
+    }
     const dhcp = inputs.addressing && inputs.addressing.value === "dhcp";
     for (const [k, input] of Object.entries(inputs)) {
       if (dhcp && (k === "address" || k === "gateway" || k === "dns")) continue;  // kept for switching back
@@ -1387,6 +1432,27 @@ function nodeInspector(n) {
     mode.addEventListener("change", sync);
     sync();
     return [h("div", { class: "field" }, h("label", { for: "i-addressing" }, "Addressing"), mode), lease, ...fixed];
+  };
+  // A server's NICs: how many, bonded or not, and addresses for the others when not.
+  const serverFields = () => {
+    if (!isServer(n)) return [];
+    const bond = h("select", { id: "i-bond", disabled: n.running || n.ports < 2 }, BONDS.map(([v, label]) => h("option", { value: v }, label)));
+    bond.value = n.bond || "";
+    inputs.bond = bond;
+    const out = [h("div", { class: "grid2 nics" }, field("ports", "NICs", "number", { min: 1, max: 4 }),
+      h("div", { class: "field" }, h("label", { for: "i-bond" }, "Bonding"), bond))];
+    if (n.bond) {
+      out.push(h("p", { class: "hint" }, `${Array.from({ length: n.ports }, (_, i) => `eth${i}`).join(" and ").replace(/ and (?=.* and )/g, ", ")} form bond0, which has the address above.`
+        + (n.bond === "lacp" ? " The other side needs a bond in 802.3ad mode too." : "")));
+    } else {
+      for (let i = 1; i < n.ports; i++) {
+        const input = h("input", { id: `i-nic${i}`, type: "text", value: (n.nic_addresses || [])[i - 1] || "", disabled: n.running,
+          placeholder: "none", autocomplete: "off" });
+        nicInputs.push(input);
+        out.push(h("div", { class: "field" }, h("label", { for: `i-nic${i}` }, `eth${i} address (optional)`), input));
+      }
+    }
+    return out;
   };
 
   const rows = [];
@@ -1420,18 +1486,20 @@ function nodeInspector(n) {
     h("div", { class: "status" + (n.running ? " running" : "") }, h("i", {}),
       (n.running ? "Running" : "Stopped") + " · " + (isVm(n)
         ? `${roleName(n)} · ${(platformInfo(n.kind) || {}).label || n.kind}${isCx ? " (experimental)" : ""}`
-        : "Linux client")),
+        : kindText(n))),
     isCx && n.running && h("p", {}, `It takes a few minutes to boot. Log in as ${cxInfo ? cxInfo.login : "admin"}.`),
     h("div", { class: "row" },
       n.running
         ? h("button", { type: "button", onclick: () => act(() => api("POST", path + "/stop")) }, "Stop")
         : h("button", { type: "button", class: "primary", onclick: () => act(() => api("POST", path + "/start")) }, "Start"),
       h("button", { type: "button", disabled: !n.running, onclick: () => openConsole(n) }, "Console")),
-    n.kind === "client" && dockerSection(n),
+    isServer(n) && dockerSection(n),
     h("section", {},
       h("h2", {}, "Settings"),
       field("name", "Hostname", "text"),
       n.role === "switch" && layerPicker(n.layer, (layer) => act(() => api("PATCH", path, { layer }))),
+      n.kind === "client" && choicePicker("Type", [["pc", "PC", "To test from", "client"], ["server", "Server", "Services, Docker, NICs", "server"]],
+        n.role, (role) => act(() => api("PATCH", path, { role })), n.running),
       isChr
         ? h("div", { class: "grid3" },
             field("ports", "Ports", "number", { min: 1, max: 24 }),
@@ -1442,11 +1510,11 @@ function nodeInspector(n) {
             field("ports", "Ports + mgmt", "number", { min: 2, max: cxInfo ? cxInfo.max_ports : 17 }),
             field("cpus", "vCPUs", "number", { min: 1, max: 8 }),
             field("ram_mb", "RAM (MB)", "number", { min: cxInfo ? cxInfo.min_ram_mb : 2048 }))
-        : clientFields(),
+        : [...clientFields(), ...serverFields()],
       n.running
         ? h("p", {}, "Stop the device to change its settings.")
         : h("button", { type: "button", onclick: save }, "Save changes")),
-    n.kind === "client" && h("section", {}, h("h2", {}, "Services"),
+    isServer(n) && h("section", {}, h("h2", {}, "Services"),
       SERVICES.map(([key, label, tip]) => {
         svcBoxes[key] = h("input", { id: "i-svc-" + key, type: "checkbox", checked: (n.services || []).includes(key),
           disabled: n.running, onchange: () => act(() => api("PATCH", path,
@@ -1454,8 +1522,9 @@ function nodeInspector(n) {
         return h("div", { class: "field check svc" }, svcBoxes[key],
           h("label", { for: "i-svc-" + key }, h("strong", {}, label), h("span", {}, tip)));
       }),
-      n.running && h("p", {}, "Stop the client to change what it runs.")),
-    h("section", {}, h("h2", {}, "Interfaces"), h("table", {}, h("tbody", {}, rows))),
+      n.running && h("p", {}, "Stop the server to change what it runs.")),
+    h("section", {}, h("h2", {}, "Interfaces"), h("table", {}, h("tbody", {}, rows)),
+      n.bond && h("p", { class: "hint" }, `Bonded as bond0, ${n.bond === "lacp" ? "LACP (802.3ad)" : "active-backup"}.`)),
     h("section", {}, h("h2", {}, "Access from your PC"), access),
     isChr && h("section", {}, h("h2", {}, "Configuration"),
       h("div", { class: "row" },
@@ -1696,7 +1765,8 @@ function buildClip(items) {
     lab: state.lab.id, pastes: 0,
     nodes: nodes.map((n) => ({ ref: n.id, source: n.id, kind: n.kind, role: n.role, layer: n.layer, name: n.name,
       ports: n.ports, cpus: n.cpus, ram_mb: n.ram_mb, address: n.address, gateway: n.gateway, dns: n.dns,
-      addressing: n.addressing, services: n.services, docker: n.docker, containers: n.containers, x: n.x, y: n.y })),
+      addressing: n.addressing, services: n.services, docker: n.docker, containers: n.containers,
+      bond: n.bond, nic_addresses: n.nic_addresses, x: n.x, y: n.y })),
     // Links between the copied devices come along; links to the Cloud or to others do not.
     links: state.lab.links.filter((l) => l.b && ids.has(l.a.node) && ids.has(l.b.node))
       .map((l) => ({ a: { ref: l.a.node, port: l.a.port }, b: { ref: l.b.node, port: l.b.port } })),

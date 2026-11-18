@@ -94,7 +94,7 @@ class ClientServices:
         out: list[tuple[str, list[str], dict]] = []
         run = self.s.run_dir
         if node.addressing == "dhcp":
-            out.append(("udhcpc", ["busybox", "udhcpc", "-f", "-i", "eth0", "-s", str(self.script_path()),
+            out.append(("udhcpc", ["busybox", "udhcpc", "-f", "-i", node.primary_iface, "-s", str(self.script_path()),
                                    "-x", f"hostname:{node.name}"],
                         {"MIKROBOX_RESOLV": str(self.resolv_path(node))}))
         if "web" in node.services:
@@ -109,7 +109,7 @@ class ClientServices:
     def _dnsmasq(self, lab: Lab, node: Node) -> list[str]:
         run = self.s.run_dir
         own = str(ipaddress.ip_interface(node.address).ip) if node.address else None
-        argv = ["dnsmasq", "--keep-in-foreground", "--conf-file=/dev/null", "--interface=eth0",
+        argv = ["dnsmasq", "--keep-in-foreground", "--conf-file=/dev/null", f"--interface={node.primary_iface}",
                 "--bind-interfaces", f"--pid-file={run / f'n{node.id}.dnsmasq-own.pid'}"]
         if "dns" in node.services:
             upstream = [d for d in (node.dns.split(", ") if node.dns else host_nameservers()) if d != own]
@@ -201,7 +201,7 @@ class ClientServices:
         try:
             import json
 
-            out = subprocess.run(["ip", "-n", self.rt.netns(node.id), "-j", "-4", "addr", "show", "dev", "eth0"],
+            out = subprocess.run(["ip", "-n", self.rt.netns(node.id), "-j", "-4", "addr", "show", "dev", node.primary_iface],
                                  capture_output=True, text=True, timeout=3).stdout
             info = json.loads(out or "[]")
             for a in (info[0].get("addr_info", []) if info else []):

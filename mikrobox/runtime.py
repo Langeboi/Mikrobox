@@ -264,13 +264,22 @@ class Runtime:
                 self.clients.stop(node)  # leftovers from a crash
                 self.net.delete_client(self.netns(node.id))
                 static = node.addressing == "static"
-                self.net.create_client(
-                    self.netns(node.id),
-                    [self.iface(node.id, p) for p in range(1, node.ports + 1)],
-                    node.address if static else None,
-                    node.gateway if static else None,
-                    node.dns if static else None,
-                )
+                try:
+                    self.net.create_client(
+                        self.netns(node.id),
+                        [self.iface(node.id, p) for p in range(1, node.ports + 1)],
+                        node.address if static else None,
+                        node.gateway if static else None,
+                        node.dns if static else None,
+                        bond=node.bond if node.role == "server" else None,
+                        extra=node.nic_addresses if node.role == "server" else None,
+                    )
+                except CommandError as e:
+                    self.net.delete_client(self.netns(node.id))
+                    if node.bond and "bond" in str(e).lower():
+                        raise Conflict("This VM can't make bonds: the bonding kernel module is missing. "
+                                       "Run the installer again, or sudo modprobe bonding max_bonds=0.")
+                    raise
                 self.clients.start(lab, node)
                 self.docker.start(lab, node)
             for link in lab.links:
@@ -358,9 +367,9 @@ class Runtime:
             node = lab.node(link.a.node)
             if node is not None and node.kind == NodeKind.client and not self.net.bridged():
                 prefix = self.s.mgmt_net.split("/")[1]
-                self.net.client_addr(
-                    self.netns(node.id), link.a.port, f"{self.mgmt_ip(lab, node)}/{prefix}"
-                )
+                # On a bonded server the address goes on the bond, not on one of its NICs.
+                dev = node.primary_iface if node.bond else f"eth{link.a.port - 1}"
+                self.net.client_addr(self.netns(node.id), dev, f"{self.mgmt_ip(lab, node)}/{prefix}")
             return
         b = self.iface(link.b.node, link.b.port)
         if self.net.exists(a) and self.net.exists(b):
