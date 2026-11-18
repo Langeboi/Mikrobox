@@ -27,6 +27,8 @@ const ICONS = {
   chr: "M2 12a10 10 0 1 0 20 0a10 10 0 1 0-20 0 M6 12h12 M12 6v12 M6 12l2.6-2.6 M6 12l2.6 2.6 M18 12l-2.6-2.6 M18 12l-2.6 2.6 M12 6l-2.6 2.6 M12 6l2.6 2.6 M12 18l-2.6-2.6 M12 18l2.6-2.6",
   client: "M4 5h16v11H4z M9 20h6 M12 16v4",
   switch: "M3 8.5h18 M17 5l4 3.5-4 3.5 M21 15.5H3 M7 12l-4 3.5 4 3.5",
+  // A layer 3 switch: the switch's arrows around the router's circle.
+  l3switch: "M3 4.5h18 M17.5 1.8l3.5 2.7-3.5 2.7 M21 19.5H3 M6.5 16.8L3 19.5l3.5 2.7 M7.6 12a4.4 4.4 0 1 0 8.8 0a4.4 4.4 0 1 0-8.8 0 M9.6 12h4.8 M12 9.6v4.8",
   rect: "M4 6h16v12H4z",
   ellipse: "M3 12a9 6.5 0 1 0 18 0a9 6.5 0 1 0-18 0",
   text: "M5 6h14 M12 6v13 M9 19h6",
@@ -36,6 +38,7 @@ const ICONS = {
   collapse: "M6 9l6 6 6-6",
   expand: "M6 15l6-6 6 6",
 };
+const glyphOf = (n) => (n.role === "switch" ? (n.layer === 3 ? "l3switch" : "switch") : n.kind);
 const CLOUD = "M-34 26a20 20 0 0 1-5-39a27 27 0 0 1 51-9a23 23 0 0 1 27 48z";
 const icon = (name) => s("svg", { class: "icon", viewBox: "0 0 24 24", "aria-hidden": "true" }, s("path", { d: ICONS[name] }));
 
@@ -44,7 +47,7 @@ const TOOLS = [
   { id: "link", label: "Link", tip: "Connect two ports. Shortcut: Ctrl+drag from one device to another" },
   null,
   { id: "chr", label: "Router", tip: "Add a router (MikroTik CHR)", add: true },
-  { id: "switch", label: "Switch", tip: "Add a switch (MikroTik CHR or Aruba AOS-CX)", add: true },
+  { id: "switch", label: "Switch", tip: "Add a switch (MikroTik CHR or Aruba AOS-CX), layer 2 or 3", add: true },
   { id: "client", label: "Client", tip: "Add a Linux client", add: true },
   null,
   { id: "rect", label: "Area", tip: "Draw a rectangular area", draw: true },
@@ -63,7 +66,7 @@ const FONT = {
 
 const state = {
   labs: [], lab: null, sys: null,
-  sel: null,        // {type: "node" | "link" | "mgmt" | "anno", id}
+  sel: null,        // {type: "node" | "link" | "mgmt" | "anno", id}, or {type: "group", items: [those]}
   tool: "select",
   linkFrom: null,
   activeDock: null,
@@ -74,7 +77,7 @@ let drag = null;
 
 // -------------------------------------------------------- preferences
 
-const PREF_DEFAULTS = { theme: "system", grid: true, snap: true, labels: true, defPorts: 8, defCpus: 1 };
+const PREF_DEFAULTS = { theme: "system", grid: true, snap: true, labels: true, defPorts: 5, defCpus: 1, v: 2 };
 function readStore(key, fallback) {
   try { const v = localStorage.getItem("mikrobox." + key); return v === null ? fallback : JSON.parse(v); }
   catch (e) { return fallback; }
@@ -82,7 +85,12 @@ function readStore(key, fallback) {
 function writeStore(key, value) {
   try { localStorage.setItem("mikrobox." + key, JSON.stringify(value)); } catch (e) { /* ignore */ }
 }
-const prefs = { ...PREF_DEFAULTS, ...readStore("prefs", {}) };
+const prefs = (() => {
+  const saved = readStore("prefs", {});
+  // Settings saved before version 2 stored 8 ports, the old default, whether chosen or not.
+  if (!saved.v && saved.defPorts === 8) delete saved.defPorts;
+  return { ...PREF_DEFAULTS, ...saved, v: 2 };
+})();
 
 function applyPrefs() {
   let theme = prefs.theme;
@@ -131,13 +139,16 @@ function saveBlob(blob, filename) {
   setTimeout(() => URL.revokeObjectURL(url), 5000);
 }
 
-function toast(msg, isError) {
+function toast(msg, isError, action) {
   const t = $("#toast");
-  t.textContent = msg;
+  t.replaceChildren(msg);
+  if (action) {
+    t.append(h("button", { type: "button", class: "toast-act", onclick: () => { t.hidden = true; action.fn(); } }, action.label));
+  }
   t.className = isError ? "error" : "";
   t.hidden = false;
   clearTimeout(toast.timer);
-  toast.timer = setTimeout(() => { t.hidden = true; }, isError ? 7000 : 2500);
+  toast.timer = setTimeout(() => { t.hidden = true; }, isError ? 7000 : action ? 6000 : 2500);
 }
 
 async function act(fn) {
@@ -174,10 +185,12 @@ async function refresh(force) {
     if (typing) typing.text = textEdit.text;
   }
   if (state.sel && state.lab) {
-    const { type, id } = state.sel;
-    if (type === "node" && !nodeById(id)) state.sel = null;
-    if (type === "link" && !state.lab.links.some((l) => l.id === id)) state.sel = null;
-    if (type === "anno" && !annoById(id)) state.sel = null;
+    const exists = ({ type, id }) => type === "mgmt" || (type === "node" ? !!nodeById(id)
+      : type === "link" ? state.lab.links.some((l) => l.id === id) : !!annoById(id));
+    if (state.sel.type === "group") {
+      const items = state.sel.items.filter(exists);
+      state.sel = items.length > 1 ? { type: "group", items } : items[0] || null;
+    } else if (!exists(state.sel)) state.sel = null;
   } else if (!state.lab) state.sel = null;
   render(force);
 }
@@ -190,7 +203,8 @@ const portName = (node, port) => (node.kind === "chr" ? `ether${port}`
   : node.kind === "aoscx" ? (port === 1 ? "mgmt" : `1/1/${port - 1}`)
   : `eth${port - 1}`);
 const isVm = (node) => node.kind === "chr" || node.kind === "aoscx";
-const roleName = (node) => (node.kind === "client" ? "Client" : node.role === "switch" ? "Switch" : "Router");
+const roleName = (node) => (node.kind === "client" ? "Client"
+  : node.role === "switch" ? (node.layer === 3 ? "Layer 3 switch" : "Switch") : "Router");
 
 // The glyph shows the role; a small badge names the OS when it is not MikroTik.
 function osBadge(n) {
@@ -375,6 +389,7 @@ function renderTop() {
       ? (state.linkFrom ? "Now click the device to connect it to." : "Click the first device, then the second. Link a port to the Cloud to give it internet and reach it from your PC.")
       : draw ? `Drag on the canvas to place the ${KIND_NAME[state.tool].toLowerCase()}, or just click.` : "";
   $("#zoom-reset").textContent = Math.round(view.k * 100) + "%";
+  renderHistory();
 }
 
 function annoElement(a, selected) {
@@ -422,10 +437,12 @@ function annoElement(a, selected) {
     g.append(fo);
   }
   if (selected) {
-    g.append(
-      s("rect", { class: "sel-box", x: a.x - 4, y: a.y - 4, width: a.w + 8, height: a.h + 8, rx: 6 }),
-      s("rect", { class: "handle", x: a.x + a.w - 3, y: a.y + a.h - 3, width: 12, height: 12, rx: 3,
-        onpointerdown: (e) => { e.preventDefault(); e.stopPropagation(); drag = { kind: "resize", id: a.id, moved: false }; } }));
+    g.append(s("rect", { class: "sel-box", x: a.x - 4, y: a.y - 4, width: a.w + 8, height: a.h + 8, rx: 6 }));
+    // Resizing is for one shape at a time.
+    if (sameRef(state.sel, { type: "anno", id: a.id })) {
+      g.append(s("rect", { class: "handle", x: a.x + a.w - 3, y: a.y + a.h - 3, width: 12, height: 12, rx: 3,
+        onpointerdown: (e) => { e.preventDefault(); e.stopPropagation(); drag = { kind: "resize", id: a.id, before: [a.w, a.h], moved: false }; } }));
+    }
   }
   return g;
 }
@@ -490,7 +507,8 @@ function renderCanvas() {
     : "Create a lab from the Lab menu to get started.";
   if (!lab) return;
 
-  const isSel = (type, id) => sameRef(state.sel, { type, id });
+  const live = drag && drag.kind === "marquee" && drag.moved ? marqueeHits() : [];
+  const isSel = (type, id) => isSelected({ type, id }) || live.some((r) => r.type === type && r.id === id);
 
   // Areas at the back, then links, then text and notes, then devices.
   for (const a of lab.annotations) {
@@ -526,7 +544,8 @@ function renderCanvas() {
       const down = (e) => {
         if (state.tool !== "select") return; // drawing or linking passes through
         e.stopPropagation();
-        select({ type: "link", id: l.id });
+        if (e.shiftKey) toggleSelect({ type: "link", id: l.id });
+        else select({ type: "link", id: l.id });
       };
       world.append(
         s("g", { class: "link" + (isSel("link", l.id) ? " sel" : "") + (up ? " up" : "") + (mo ? mo.cls : ""),
@@ -551,7 +570,7 @@ function renderCanvas() {
     world.append(s("line", { class: "rubber", x1: linking.x0, y1: linking.y0, x2: B.x, y2: B.y }));
   }
 
-  const cls = (ref, extra) => "node" + (extra || "") + (sameRef(state.sel, ref) ? " sel" : "") + (sameRef(state.linkFrom, ref) ? " from" : "")
+  const cls = (ref, extra) => "node" + (extra || "") + (isSel(ref.type, ref.id) ? " sel" : "") + (sameRef(state.linkFrom, ref) ? " from" : "")
     + (linking && sameRef(linking.target, ref) ? " target" : "");
   const handlers = (ref) => ({
     tabindex: 0,
@@ -579,7 +598,7 @@ function renderCanvas() {
         // Its own group, so an animation can scale the tile without touching where it sits.
         s("g", { class: "tile" },
           s("rect", { class: "box", x: -30, y: -30, width: 60, height: 60, rx: 14 }),
-          s("path", { class: "glyph", d: ICONS[n.kind === "client" ? "client" : n.role === "switch" ? "switch" : "chr"], transform: "translate(-19.2,-19.2) scale(1.6)", "vector-effect": "non-scaling-stroke" }),
+          s("path", { class: "glyph", d: ICONS[glyphOf(n)] || ICONS.chr, transform: "translate(-19.2,-19.2) scale(1.6)", "vector-effect": "non-scaling-stroke" }),
           osBadge(n),
           mo && mo.kind === "start" && [s("circle", { class: "ripple", cx: 26, cy: -26, r: 6.5 }),
                                         s("circle", { class: "ripple r2", cx: 26, cy: -26, r: 6.5 })],
@@ -596,6 +615,10 @@ function renderCanvas() {
     );
   }
 
+  if (drag && drag.kind === "marquee" && drag.moved) {
+    const b = drawBox();
+    world.append(s("rect", { class: "marquee", x: b.x, y: b.y, width: b.w, height: b.h, rx: 4 }));
+  }
   if (drag && drag.kind === "draw" && drag.moved) {
     const b = drawBox();
     world.append(drag.tool === "ellipse"
@@ -640,9 +663,11 @@ function nodeDown(e, ref) {
     return;
   }
   lastDown = { id: ref.type === "node" ? ref.id : null, t: now };
+  if (e.shiftKey && ref.type !== "mgmt") { toggleSelect(ref); return; }
+  if (startGroupDrag(e, ref)) return;
   const p = point(e);
   const at = ref.type === "mgmt" ? { x: state.lab.mgmt_x, y: state.lab.mgmt_y } : nodeById(ref.id);
-  drag = { kind: ref.type, id: ref.id, dx: p.x - at.x, dy: p.y - at.y, moved: false };
+  drag = { kind: ref.type, id: ref.id, dx: p.x - at.x, dy: p.y - at.y, before: positions([ref]), moved: false };
   select(ref);
 }
 
@@ -650,9 +675,12 @@ function annoDown(e, a) {
   if (state.tool !== "select") return; // drawing or linking passes through
   e.preventDefault();
   e.stopPropagation();
+  const ref = { type: "anno", id: a.id };
+  if (e.shiftKey) { toggleSelect(ref); return; }
+  if (startGroupDrag(e, ref)) return;
   const p = point(e);
-  drag = { kind: "anno", id: a.id, dx: p.x - a.x, dy: p.y - a.y, moved: false };
-  select({ type: "anno", id: a.id });
+  drag = { kind: "anno", id: a.id, dx: p.x - a.x, dy: p.y - a.y, before: positions([ref]), moved: false };
+  select(ref);
 }
 
 $("#canvas").addEventListener("pointerdown", (e) => {
@@ -663,6 +691,12 @@ $("#canvas").addEventListener("pointerdown", (e) => {
     return;
   }
   if (state.tool === "link") { state.linkFrom = null; render(true); return; }
+  if (e.shiftKey) {
+    // Shift and drag on empty canvas: select everything in the box (added to what is selected).
+    const p = point(e);
+    drag = { kind: "marquee", x0: p.x, y0: p.y, x1: p.x, y1: p.y, base: selItems().filter((r) => r.type !== "mgmt"), moved: false };
+    return;
+  }
   if (state.sel) select(null);
   drag = { kind: "pan", sx: e.clientX, sy: e.clientY, vx: view.x, vy: view.y, moved: false };
   $("#canvas").classList.add("panning");
@@ -675,9 +709,14 @@ window.addEventListener("pointermove", (e) => {
     view.y = drag.vy + e.clientY - drag.sy;
   } else {
     const p = point(e);
-    if (drag.kind === "draw") {
+    if (drag.kind === "draw" || drag.kind === "marquee") {
       drag.x1 = p.x; drag.y1 = p.y;
       if (Math.hypot(drag.x1 - drag.x0, drag.y1 - drag.y0) < 6) return;
+    } else if (drag.kind === "group") {
+      if (!drag.moved && Math.hypot(p.x - drag.sx, p.y - drag.sy) < 4) return;
+      // One offset for all, snapped as a whole so the group keeps its shape.
+      const d = (v) => (prefs.snap ? Math.round(v / 20) * 20 : Math.round(v));
+      applyPositions(drag.before, d(p.x - drag.sx), d(p.y - drag.sy));
     } else if (drag.kind === "mgmt") {
       state.lab.mgmt_x = snap(p.x - drag.dx); state.lab.mgmt_y = snap(p.y - drag.dy);
     } else if (drag.kind === "node") {
@@ -707,10 +746,24 @@ window.addEventListener("pointerup", () => {
   if (d.kind === "pan") { if (d.moved) saveView(); return; }
   if (d.kind === "draw") { finishDraw(d); return; }
   if (d.kind === "link") { finishLink(d); return; }
-  if (!d.moved) return;
-  if (d.kind === "mgmt") api("PATCH", labPath(), { mgmt_x: state.lab.mgmt_x, mgmt_y: state.lab.mgmt_y }).catch(fail);
-  else if (d.kind === "node") { const n = nodeById(d.id); api("PATCH", `${labPath()}/nodes/${n.id}`, { x: n.x, y: n.y }).catch(fail); }
-  else { const a = annoById(d.id); api("PATCH", `${labPath()}/annotations/${a.id}`, { x: a.x, y: a.y, w: a.w, h: a.h }).catch(fail); }
+  if (d.kind === "marquee") {
+    if (d.moved) { drag = d; const hits = marqueeHits(); drag = null; setSelection([...d.base, ...hits]); }
+    else render(true);
+    return;
+  }
+  if (!d.moved) {
+    if (d.kind === "group" && d.click) select(d.click);  // a plain click on one of a group picks it alone
+    return;
+  }
+  if (d.kind === "resize") {
+    const a = annoById(d.id), lp = labPath(), before = d.before, after = [a.w, a.h];
+    const size = ([w, h]) => api("PATCH", `${lp}/annotations/${a.id}`, { w, h });
+    size(after).catch(fail);
+    remember({ label: `resize ${annoName(a)}`, undo: () => size(before), redo: () => size(after) });
+    return;
+  }
+  const items = d.kind === "group" ? d.items : [{ type: d.kind, id: d.id }];
+  commitMove(`move ${describeRefs(items)}`, d.before, positions(items));
 });
 
 // Where a device or the Cloud sits, and which one is under a point on the canvas.
@@ -753,6 +806,7 @@ function finishDraw(d) {
   act(async () => {
     const a = await api("POST", `${labPath()}/annotations`, body);
     state.sel = { type: "anno", id: a.id };
+    rememberCreated(`add ${annoName(a)}`, { annotations: [a.id] });
   }).then(() => { const t = $("#i-text"); if (t) t.focus(); });
 }
 
@@ -789,7 +843,8 @@ function linkDialog(r1, r2) {
     async (v) => {
       const body = { a: { node: a.id, port: Number(v.pa) } };
       if (b) body.b = { node: b.id, port: Number(v.pb) };
-      await api("POST", `${labPath()}/links`, body);
+      const link = await api("POST", `${labPath()}/links`, body);
+      rememberCreated(b ? `link ${a.name} to ${b.name}` : `link ${a.name} to the Cloud`, { links: [link.id] });
       state.tool = "select";
       state.linkFrom = null;
     },
@@ -866,6 +921,18 @@ function nextName(prefix) {
   return prefix + i;
 }
 
+// Layer 2 or layer 3, for a switch. Only changes how it is drawn and described: either way
+// it is a full CHR, and routing between VLANs is set up in RouterOS.
+function layerPicker(value, onPick) {
+  const opts = [[2, "Layer 2", "Switches within VLANs"], [3, "Layer 3", "Also routes between them"]];
+  const btns = opts.map(([layer, label, tip]) => h("button", { type: "button", "aria-pressed": String(value === layer),
+    onclick: () => { for (const b of btns) b.setAttribute("aria-pressed", String(b === btns[layer - 2])); onPick(layer); } },
+    s("svg", { class: "icon", viewBox: "0 0 24 24", "aria-hidden": "true" }, s("path", { d: ICONS[layer === 3 ? "l3switch" : "switch"] })),
+    h("span", {}, h("strong", {}, label), h("small", {}, tip))));
+  return h("div", { class: "field" }, h("span", { class: "label", id: "layer-label" }, "Layer"),
+    h("div", { class: "seg layer", role: "group", "aria-labelledby": "layer-label" }, btns));
+}
+
 function freeSpot() {
   // First free slot on a grid, starting near the middle of what is on screen.
   const r = $("#canvas").getBoundingClientRect();
@@ -892,6 +959,7 @@ function addNodeDialog(tool) {
       if (v.addressing !== "dhcp") for (const k of ["address", "gateway", "dns"]) if (v[k]) body[k] = v[k];
       const node = await api("POST", `${labPath()}/nodes`, body);
       state.sel = { type: "node", id: node.id };
+      rememberCreated(`add ${node.name}`, { nodes: [node.id] });
     });
     const mode = $("#m-addressing");
     mode.addEventListener("change", () => { for (const k of ["address", "gateway", "dns"]) $("#m-" + k).disabled = mode.value === "dhcp"; });
@@ -917,7 +985,7 @@ function addDeviceDialog(role, at) {
   const cpus = h("input", { id: "m-cpus", type: "number", min: 1, max: 8 });
   const ramLabel = h("label", { for: "m-ram" });
   const ram = h("input", { id: "m-ram", type: "number" });
-  let named = false;
+  let named = false, layer = 2;
   name.addEventListener("input", () => { named = true; });
   const field = (label, input) => h("div", { class: "field" }, label, input);
   const chosen = () => choices.find((p) => p.kind === os.value);
@@ -957,20 +1025,23 @@ function addDeviceDialog(role, at) {
     { node: field(h("label", { for: "m-os" }, "Operating system"), os) },
     { node: note },
     { node: field(h("label", { for: "m-name" }, "Hostname"), name) },
+    role === "switch" && { node: layerPicker(2, (v) => { layer = v; }) },
     { node: field(portsLabel, ports) },
     { node: field(h("label", { for: "m-cpus" }, "vCPUs"), cpus) },
     { node: field(ramLabel, ram) },
-  ], "Add", async () => {
+  ].filter(Boolean), "Add", async () => {
     const p = chosen();
     if (!p.image && p.experimental) throw new Error(`Add the ${p.label} image first, with the link above.`);
     prefs[`os_${role}`] = p.kind;
     writeStore("prefs", prefs);
     const n = Number(ports.value) || (p.kind === "chr" ? prefs.defPorts : p.default_ports - 1);
     const body = { kind: p.kind, role, name: name.value.trim(), ...at, ports: p.kind === "chr" ? n : n + 1 };
+    if (role === "switch") body.layer = layer;
     if (cpus.value) body.cpus = Number(cpus.value);
     if (ram.value) body.ram_mb = Number(ram.value);
     const node = await api("POST", `${labPath()}/nodes`, body);
     state.sel = { type: "node", id: node.id };
+    rememberCreated(`add ${node.name}`, { nodes: [node.id] });
   });
   name.focus();
 }
@@ -1154,7 +1225,8 @@ function renderInspector(force) {
   if (box.hidden) { box.replaceChildren(); return; }
   // Sections that do not apply come back as false; leave them out rather than print them.
   const fill = (items) => box.replaceChildren(...items.filter((item) => item !== false && item != null));
-  if (sel.type === "mgmt") fill(mgmtInspector());
+  if (sel.type === "group") fill(groupInspector(sel.items));
+  else if (sel.type === "mgmt") fill(mgmtInspector());
   else if (sel.type === "link") fill(linkInspector(lab.links.find((l) => l.id === sel.id)));
   else if (sel.type === "anno") fill(annoInspector(annoById(sel.id)));
   else fill(nodeInspector(nodeById(sel.id)));
@@ -1359,6 +1431,7 @@ function nodeInspector(n) {
     h("section", {},
       h("h2", {}, "Settings"),
       field("name", "Hostname", "text"),
+      n.role === "switch" && layerPicker(n.layer, (layer) => act(() => api("PATCH", path, { layer }))),
       isChr
         ? h("div", { class: "grid3" },
             field("ports", "Ports", "number", { min: 1, max: 24 }),
@@ -1418,6 +1491,7 @@ function nodeInspector(n) {
 }
 
 function duplicateDialog(n) {
+  // (Ctrl+D duplicates whatever is selected, links between them included, without asking.)
   const isChr = isVm(n);
   const stem = n.name.replace(/\d+$/, "");
   const what = n.kind === "aoscx" || n.role === "switch" ? "switch" : n.kind === "chr" ? "router" : "client";
@@ -1430,7 +1504,339 @@ function duplicateDialog(n) {
   openModal(`Duplicate ${n.name}`, fields, "Duplicate", async (v) => {
     const node = await api("POST", `${labPath()}/nodes/${n.id}/duplicate`, { name: v.name, copy_config: !!v.copy_config });
     state.sel = { type: "node", id: node.id };
+    rememberCreated(`duplicate ${n.name}`, { nodes: [node.id] });
   });
+}
+
+// ---------------------------------------------------------------- editing
+//
+// Several things selected at once (Shift+click, Shift+drag a box, Ctrl+A), moved together,
+// aligned, copied and pasted with the links between them, and undo/redo for all of it.
+// The server does the heavy lifting: /move, /paste, and /trash with /restore, which keeps
+// deleted routers' disks for a day so an undo brings their configuration back.
+
+const selItems = () => (!state.sel ? [] : state.sel.type === "group" ? state.sel.items : [state.sel]);
+const isSelected = (ref) => selItems().some((r) => sameRef(r, ref));
+const refIds = (items, type) => items.filter((r) => r.type === type).map((r) => r.id);
+const annoName = (a) => KIND_NAME[a.kind].toLowerCase();
+
+function setSelection(items) {
+  const seen = new Set();
+  items = items.filter((r) => { const k = `${r.type}:${r.id}`; if (seen.has(k)) return false; seen.add(k); return true; });
+  select(items.length > 1 ? { type: "group", items } : items[0] || null);
+}
+
+function toggleSelect(ref) {
+  const items = selItems().filter((r) => r.type !== "mgmt");
+  const i = items.findIndex((r) => sameRef(r, ref));
+  if (i >= 0) items.splice(i, 1);
+  else items.push(ref);
+  setSelection(items);
+}
+
+function selectAll() {
+  setSelection([...state.lab.nodes.map((n) => ({ type: "node", id: n.id })),
+    ...state.lab.annotations.map((a) => ({ type: "anno", id: a.id }))]);
+}
+
+function countText(nodes, links, annos) {
+  const parts = [[nodes, "device"], [links, "link"], [annos, "shape"]].filter(([k]) => k)
+    .map(([k, word]) => `${k} ${word}${k === 1 ? "" : "s"}`);
+  return parts.length > 1 ? `${parts.slice(0, -1).join(", ")} and ${parts[parts.length - 1]}` : parts[0] || "nothing";
+}
+
+// What a selection is, in words for the history and messages: "R1", "3 devices and 2 links".
+function describeRefs(items) {
+  if (items.length === 1) {
+    const r = items[0];
+    if (r.type === "node") return (nodeById(r.id) || { name: "a device" }).name;
+    if (r.type === "anno") { const a = annoById(r.id); return a ? `the ${annoName(a)}` : "a shape"; }
+    if (r.type === "mgmt") return "the Cloud";
+    return "a link";
+  }
+  return countText(refIds(items, "node").length, refIds(items, "link").length, refIds(items, "anno").length);
+}
+
+// -- where things are, and moving them
+
+function positions(items) {
+  const out = { nodes: {}, annotations: {}, cloud: null };
+  for (const r of items) {
+    if (r.type === "node") { const n = nodeById(r.id); if (n) out.nodes[r.id] = [n.x, n.y]; }
+    else if (r.type === "anno") { const a = annoById(r.id); if (a) out.annotations[r.id] = [a.x, a.y]; }
+    else if (r.type === "mgmt") out.cloud = [state.lab.mgmt_x, state.lab.mgmt_y];
+  }
+  return out;
+}
+
+function applyPositions(pos, dx = 0, dy = 0) {
+  for (const [id, [x, y]] of Object.entries(pos.nodes)) { const n = nodeById(+id); if (n) { n.x = x + dx; n.y = y + dy; } }
+  for (const [id, [x, y]] of Object.entries(pos.annotations)) { const a = annoById(+id); if (a) { a.x = x + dx; a.y = y + dy; } }
+  if (pos.cloud) { state.lab.mgmt_x = pos.cloud[0] + dx; state.lab.mgmt_y = pos.cloud[1] + dy; }
+}
+
+function sendPositions(lp, pos) {
+  return api("POST", `${lp}/move`, {
+    nodes: Object.entries(pos.nodes).map(([id, [x, y]]) => ({ id: +id, x, y })),
+    annotations: Object.entries(pos.annotations).map(([id, [x, y]]) => ({ id: +id, x, y })),
+    cloud: pos.cloud ? { id: 0, x: pos.cloud[0], y: pos.cloud[1] } : null,
+  });
+}
+
+function commitMove(label, before, after) {
+  if (JSON.stringify(before) === JSON.stringify(after)) return;
+  const lp = labPath();
+  sendPositions(lp, after).catch((e) => toast(e.message, true));
+  remember({ label, undo: () => sendPositions(lp, before), redo: () => sendPositions(lp, after) });
+}
+
+// Pressing on something that is part of the selection moves the whole selection.
+function startGroupDrag(e, ref) {
+  if (!state.sel || state.sel.type !== "group" || !isSelected(ref)) return false;
+  const p = point(e);
+  const items = state.sel.items.filter((r) => r.type === "node" || r.type === "anno");
+  drag = { kind: "group", sx: p.x, sy: p.y, items, before: positions(items), click: ref, moved: false };
+  return true;
+}
+
+// What a Shift+drag box takes: devices whose middle is in it, shapes wholly in it.
+function marqueeHits() {
+  const b = drawBox(), lab = state.lab;
+  const inside = (x, y) => x >= b.x && x <= b.x + b.w && y >= b.y && y <= b.y + b.h;
+  return [...lab.nodes.filter((n) => inside(n.x, n.y)).map((n) => ({ type: "node", id: n.id })),
+    ...lab.annotations.filter((a) => inside(a.x, a.y) && inside(a.x + a.w, a.y + a.h)).map((a) => ({ type: "anno", id: a.id }))];
+}
+
+// -- undo and redo, one history per lab, for this browser tab
+
+const histories = new Map();
+let historyBusy = false;
+
+function hist() {
+  const id = state.lab ? state.lab.id : 0;
+  if (!histories.has(id)) histories.set(id, { done: [], undone: [] });
+  return histories.get(id);
+}
+
+function remember(entry) {
+  const hs = hist();
+  hs.done.push(entry);
+  if (hs.done.length > 100) hs.done.shift();
+  hs.undone.length = 0;
+  renderHistory();
+}
+
+async function stepHistory(back) {
+  if (!state.lab || historyBusy) return;
+  const hs = hist(), from = back ? hs.done : hs.undone, to = back ? hs.undone : hs.done;
+  const e = from.pop();
+  if (!e) { toast(back ? "Nothing to undo." : "Nothing to redo."); return; }
+  historyBusy = true;
+  try {
+    await (back ? e.undo() : e.redo());
+    to.push(e);
+    toast(`${back ? "Undone" : "Redone"}: ${e.label}.`);
+  } catch (err) {
+    toast(`Could not ${back ? "undo" : "redo"} ${e.label}: ${err.message}`, true);
+  } finally {
+    historyBusy = false;
+  }
+  await refresh(true);
+}
+const undo = () => stepHistory(true);
+const redo = () => stepHistory(false);
+
+// After a restore, things may be back under new ids.
+const remap = (cur, r) => ({
+  nodes: (cur.nodes || []).map((id) => (r.nodes && r.nodes[id] !== undefined ? r.nodes[id] : id)),
+  links: r.links || [], annotations: r.annotations || [],
+});
+
+function rememberCreated(label, made) {
+  const lp = labPath();
+  let cur = { nodes: [], links: [], annotations: [], ...made }, token = null;
+  remember({ label,
+    undo: async () => { token = (await api("POST", `${lp}/trash`, cur)).token; },
+    redo: async () => { cur = remap(cur, await api("POST", `${lp}/restore`, { token })); } });
+}
+
+function rememberDeleted(label, gone, token) {
+  const lp = labPath();
+  let cur = gone;
+  remember({ label,
+    undo: async () => { cur = remap(cur, await api("POST", `${lp}/restore`, { token })); },
+    redo: async () => { token = (await api("POST", `${lp}/trash`, cur)).token; } });
+}
+
+const MOD = /Mac|iPhone|iPad/.test(navigator.platform) ? "⌘" : "Ctrl+";
+
+function renderHistory() {
+  const hs = state.lab ? hist() : { done: [], undone: [] };
+  const last = (list) => list[list.length - 1];
+  for (const [id, list, word, keys] of [["#undo-btn", hs.done, "Undo", "Z"], ["#redo-btn", hs.undone, "Redo", "Shift+Z"]]) {
+    const b = $(id);
+    if (!b) continue;
+    b.disabled = !list.length;
+    b.title = list.length ? `${word} ${last(list).label} (${MOD}${keys})` : `${word} (${MOD}${keys})`;
+  }
+}
+
+// -- copy and paste: what is copied stays in this browser, so it pastes into other labs too
+
+let pointer = { p: null, inside: false };
+$("#canvas").addEventListener("pointermove", (e) => { pointer = { p: point(e), inside: true }; });
+$("#canvas").addEventListener("pointerleave", () => { pointer.inside = false; });
+
+function buildClip(items) {
+  const ids = new Set(refIds(items, "node"));
+  const nodes = [...ids].map(nodeById).filter(Boolean);
+  const annos = refIds(items, "anno").map(annoById).filter(Boolean);
+  if (!nodes.length && !annos.length) return null;
+  return {
+    lab: state.lab.id, pastes: 0,
+    nodes: nodes.map((n) => ({ ref: n.id, source: n.id, kind: n.kind, role: n.role, layer: n.layer, name: n.name,
+      ports: n.ports, cpus: n.cpus, ram_mb: n.ram_mb, address: n.address, gateway: n.gateway, dns: n.dns,
+      addressing: n.addressing, services: n.services, docker: n.docker, containers: n.containers, x: n.x, y: n.y })),
+    // Links between the copied devices come along; links to the Cloud or to others do not.
+    links: state.lab.links.filter((l) => l.b && ids.has(l.a.node) && ids.has(l.b.node))
+      .map((l) => ({ a: { ref: l.a.node, port: l.a.port }, b: { ref: l.b.node, port: l.b.port } })),
+    annotations: annos.map(({ id, ...rest }) => rest),
+  };
+}
+
+function copySelection(quiet) {
+  const clip = buildClip(selItems());
+  if (!clip) { if (!quiet) toast("Select devices or shapes to copy.", true); return null; }
+  writeStore("clipboard", clip);
+  if (!quiet) toast(`Copied ${countText(clip.nodes.length, clip.links.length, clip.annotations.length)}.`);
+  return clip;
+}
+
+function cutSelection() {
+  if (copySelection(true)) deleteSelected();
+  else toast("Select devices or shapes to cut.", true);
+}
+
+function pasteClipboard(withConfig) {
+  const clip = readStore("clipboard", null);
+  if (!clip || !(clip.nodes.length || clip.annotations.length)) { toast("Nothing copied yet. Select something and press " + MOD + "C."); return; }
+  // At the pointer when it is over the canvas; otherwise a step down from the original.
+  let offset = 0;
+  if (!pointer.inside) {
+    clip.pastes = (clip.pastes || 0) + 1;
+    writeStore("clipboard", clip);
+    offset = clip.lab === state.lab.id ? 80 * clip.pastes : 0;  // clear of the originals
+  }
+  pasteClip(clip, { withConfig, at: pointer.inside ? pointer.p : null, offset });
+}
+
+function duplicateSelection() {
+  const clip = buildClip(selItems());
+  if (!clip) { toast("Select devices or shapes to duplicate.", true); return; }
+  pasteClip(clip, { offset: 80, word: "duplicate" });
+}
+
+function pasteClip(clip, { withConfig = false, at = null, offset = 0, word = "paste" } = {}) {
+  const pts = [...clip.nodes.map((n) => [n.x, n.y]), ...clip.annotations.map((a) => [a.x + a.w / 2, a.y + a.h / 2])];
+  let dx = offset, dy = offset;
+  if (at) {
+    const xs = pts.map((q) => q[0]), ys = pts.map((q) => q[1]);
+    const d = (v) => (prefs.snap ? Math.round(v / 20) * 20 : Math.round(v));
+    dx = d(at.x - (Math.min(...xs) + Math.max(...xs)) / 2);
+    dy = d(at.y - (Math.min(...ys) + Math.max(...ys)) / 2);
+  }
+  const body = {
+    source_lab: clip.lab, with_config: !!withConfig, links: clip.links,
+    nodes: clip.nodes.map((n) => ({ ...n, x: n.x + dx, y: n.y + dy })),
+    annotations: clip.annotations.map((a) => ({ ...a, x: a.x + dx, y: a.y + dy })),
+  };
+  const lp = labPath();
+  return act(async () => {
+    const r = await api("POST", `${lp}/paste`, body);
+    const items = [...r.nodes.map((n) => ({ type: "node", id: n.id })), ...r.annotations.map((id) => ({ type: "anno", id }))];
+    state.sel = items.length > 1 ? { type: "group", items } : items[0] || null;
+    const what = countText(r.nodes.length, r.links.length, r.annotations.length);
+    rememberCreated(`${word} ${what}`, { nodes: r.nodes.map((n) => n.id), links: r.links, annotations: r.annotations });
+    const done = word === "paste" ? "Pasted" : "Duplicated";
+    if (withConfig && r.config_skipped.length) {
+      toast(`${done} ${what}. No configuration for ${r.config_skipped.join(", ")}: copy it while the original is stopped.`);
+    } else toast(`${done} ${what}${withConfig ? ", with configurations" : ""}.`);
+  });
+}
+
+// -- the panel for a selection of several things
+
+function boxOf(r) {
+  if (r.type === "node") { const n = nodeById(r.id); return { x: n.x - 30, y: n.y - 30, w: 60, h: 60 }; }
+  const a = annoById(r.id);
+  return { x: a.x, y: a.y, w: a.w, h: a.h };
+}
+
+function alignItems(items, how) {
+  const before = positions(items);
+  const boxes = items.map((r) => ({ r, b: boxOf(r) }));
+  const L = Math.min(...boxes.map(({ b }) => b.x)), R = Math.max(...boxes.map(({ b }) => b.x + b.w));
+  const T = Math.min(...boxes.map(({ b }) => b.y)), B = Math.max(...boxes.map(({ b }) => b.y + b.h));
+  const place = (r, x, y) => {
+    if (r.type === "node") { const n = nodeById(r.id); n.x = Math.round(x + 30); n.y = Math.round(y + 30); }
+    else { const a = annoById(r.id); a.x = Math.round(x); a.y = Math.round(y); }
+  };
+  if (how === "hspace" || how === "vspace") {
+    // Even gaps between the middles, the outermost two staying put.
+    const axis = how === "hspace" ? "x" : "y", size = how === "hspace" ? "w" : "h";
+    const sorted = boxes.slice().sort((p, q) => (p.b[axis] + p.b[size] / 2) - (q.b[axis] + q.b[size] / 2));
+    const first = sorted[0].b[axis] + sorted[0].b[size] / 2, last = sorted[sorted.length - 1].b[axis] + sorted[sorted.length - 1].b[size] / 2;
+    sorted.forEach(({ r, b }, i) => {
+      const mid = first + ((last - first) * i) / (sorted.length - 1);
+      if (axis === "x") place(r, mid - b.w / 2, b.y);
+      else place(r, b.x, mid - b.h / 2);
+    });
+  } else {
+    for (const { r, b } of boxes) {
+      const x = how === "left" ? L : how === "right" ? R - b.w : how === "center" ? (L + R) / 2 - b.w / 2 : b.x;
+      const y = how === "top" ? T : how === "bottom" ? B - b.h : how === "middle" ? (T + B) / 2 - b.h / 2 : b.y;
+      place(r, x, y);
+    }
+  }
+  renderCanvas();
+  commitMove(how.endsWith("space") ? `space out ${items.length} items` : `align ${items.length} items`, before, positions(items));
+}
+
+const ALIGN = [
+  ["left", "Align left edges", "alignL"], ["center", "Align centres", "alignC"], ["right", "Align right edges", "alignR"],
+  ["top", "Align top edges", "alignT"], ["middle", "Align middles", "alignM"], ["bottom", "Align bottom edges", "alignB"],
+  ["hspace", "Space out evenly across (3 or more)", "spaceH"], ["vspace", "Space out evenly down (3 or more)", "spaceV"],
+];
+
+function groupInspector(items) {
+  const nodes = refIds(items, "node").map(nodeById).filter(Boolean);
+  const movable = items.filter((r) => r.type === "node" || r.type === "anno");
+  const title = describeRefs(items);
+  const stopped = nodes.filter((n) => !n.running), running = nodes.filter((n) => n.running);
+  const each = (list, verb) => act(async () => {
+    const res = await Promise.allSettled(list.map((n) => api("POST", `${labPath()}/nodes/${n.id}/${verb}`)));
+    const bad = res.find((x) => x.status === "rejected");
+    if (bad) throw bad.reason;
+  });
+  return [
+    head(title[0].toUpperCase() + title.slice(1)),
+    h("p", { class: "hint group-hint" }, "Drag any of them to move them together. Shift+click adds or removes one."),
+    movable.length > 1 && h("section", {}, h("h2", {}, "Arrange"),
+      h("div", { class: "align-row" }, ALIGN.map(([how, label, ic]) =>
+        h("button", { type: "button", class: "icon-btn", title: label, "aria-label": label,
+          disabled: how.endsWith("space") && movable.length < 3, onclick: () => alignItems(movable, how) }, svgIcon(ic, 18))))),
+    nodes.length > 0 && h("section", {}, h("h2", {}, `Devices (${nodes.length})`),
+      h("div", { class: "row" },
+        h("button", { type: "button", class: "primary", disabled: !stopped.length, onclick: () => each(stopped, "start") },
+          stopped.length && running.length ? `Start ${stopped.length}` : "Start"),
+        h("button", { type: "button", disabled: !running.length, onclick: () => each(running, "stop") },
+          stopped.length && running.length ? `Stop ${running.length}` : "Stop"))),
+    h("section", {}, h("div", { class: "row" },
+      h("button", { type: "button", onclick: () => copySelection() }, "Copy"),
+      h("button", { type: "button", onclick: duplicateSelection }, "Duplicate"),
+      h("button", { type: "button", class: "danger", onclick: deleteSelected }, "Delete")),
+      h("p", { class: "hint" }, `${MOD}C, ${MOD}V and ${MOD}D work too. Links between the selected devices are copied with them.`)),
+  ];
 }
 
 // ---------------------------------------------------------------- Docker on a PC
@@ -1482,6 +1888,16 @@ const ICON_PATHS = {
   plus: "M12 5v14 M5 12h14",
   cube: "M12 3l8 4.5v9L12 21l-8-4.5v-9z M12 12l8-4.5 M12 12v9 M12 12L4 7.5",
   copy: "M9 9h11v11H9z M5 15H4V4h11v1",
+  alignL: "M4 3v18 M8 7h11v4H8z M8 14h6v4H8z",
+  alignC: "M12 3v18 M6 7h12v4H6z M8.5 14h7v4h-7z",
+  alignR: "M20 3v18 M5 7h11v4H5z M10 14h6v4h-6z",
+  alignT: "M3 4h18 M7 8h4v11H7z M14 8h4v6h-4z",
+  alignM: "M3 12h18 M7 6h4v12H7z M14 8.5h4v7h-4z",
+  alignB: "M3 20h18 M7 5h4v11H7z M14 10h4v6h-4z",
+  spaceH: "M4 4v16 M20 4v16 M10 7h4v10h-4z",
+  spaceV: "M4 4h16 M4 20h16 M7 10h10v4H7z",
+  undo: "M9 14L4 9l5-5 M4 9h10.5a5.5 5.5 0 0 1 0 11H11",
+  redo: "M15 14l5-5-5-5 M20 9H9.5a5.5 5.5 0 0 0 0 11H13",
   check: "M5 12.5l4.5 4.5L19 7.5",
   reload: "M19 12a7 7 0 1 1-2.05-4.95 M19 4v4h-4",
   tall: "M12 4v16 M8 8l4-4 4 4 M8 16l4 4 4-4",
@@ -1983,17 +2399,18 @@ function backupLine(n) {
 }
 
 function deleteSelected() {
-  const sel = state.sel;
-  if (!sel || sel.type === "mgmt") return;
-  if (sel.type === "node") {
-    const n = nodeById(sel.id);
-    if (!confirm(`Delete ${n.name}? Its configuration is lost.`)) return;
-    closeNodeTabs(n.id);
-    act(async () => { await api("DELETE", `${labPath()}/nodes/${n.id}`); state.sel = null; });
-  } else {
-    const kind = sel.type === "link" ? "links" : "annotations";
-    act(async () => { await api("DELETE", `${labPath()}/${kind}/${sel.id}`); state.sel = null; });
-  }
+  const items = selItems().filter((r) => r.type !== "mgmt");
+  if (!items.length) return;
+  const body = { nodes: refIds(items, "node"), links: refIds(items, "link"), annotations: refIds(items, "anno") };
+  const label = describeRefs(items);
+  for (const id of body.nodes) closeNodeTabs(id);
+  act(async () => {
+    const r = await api("POST", `${labPath()}/trash`, body);
+    state.sel = null;
+    rememberDeleted(`delete ${label}`, body, r.token);
+    // Nothing is lost: routers keep their configuration in the trash for a day.
+    toast(`Deleted ${label}.`, false, { label: "Undo", fn: undo });
+  });
 }
 
 // --------------------------------------------- dock: terminals, packets
@@ -2569,6 +2986,15 @@ async function topologyPng(scale) {
 // ---------------------------------------------------- menus and top bar
 
 const ACTIONS = {
+  "edit-undo": () => undo(),
+  "edit-redo": () => redo(),
+  "edit-cut": () => cutSelection(),
+  "edit-copy": () => copySelection(),
+  "edit-paste": () => { pointer.inside = false; pasteClipboard(false); },
+  "edit-paste-config": () => { pointer.inside = false; pasteClipboard(true); },
+  "edit-duplicate": () => duplicateSelection(),
+  "edit-all": () => selectAll(),
+  "edit-delete": () => deleteSelected(),
   "lab-new": () => openModal("New lab", [{ key: "name", label: "Name (letters, digits, - and _)", value: "" }], "Create", async (v) => {
     const lab = await api("POST", "/labs", { name: v.name });
     switchLab(lab);
@@ -2875,6 +3301,35 @@ function switchLab(lab) {
   if (activityState.list && !activityState.all) loadActivity().catch(() => {});
 }
 
+// The Edit menu says what Undo and Redo would do, and greys out what has nothing to act on.
+function updateEditMenu() {
+  const hs = state.lab ? hist() : { done: [], undone: [] };
+  const last = (list) => list[list.length - 1];
+  const items = selItems().filter((r) => r.type !== "mgmt");
+  const copyable = items.some((r) => r.type === "node" || r.type === "anno");
+  const clip = readStore("clipboard", null);
+  const set = (act_, on, text) => {
+    const b = document.querySelector(`[data-act="${act_}"]`);
+    b.disabled = !state.lab || !on;
+    if (text) b.firstChild.textContent = text;
+  };
+  set("edit-undo", hs.done.length, hs.done.length ? `Undo ${last(hs.done).label}` : "Undo");
+  set("edit-redo", hs.undone.length, hs.undone.length ? `Redo ${last(hs.undone).label}` : "Redo");
+  set("edit-cut", copyable);
+  set("edit-copy", copyable);
+  set("edit-duplicate", copyable);
+  set("edit-paste", clip && (clip.nodes.length || clip.annotations.length));
+  set("edit-paste-config", clip && clip.nodes.some((n) => n.kind === "chr"));
+  set("edit-all", state.lab && (state.lab.nodes.length || state.lab.annotations.length));
+  set("edit-delete", items.length);
+}
+for (const k of document.querySelectorAll("kbd[data-k]")) k.textContent = MOD + k.dataset.k;
+for (const k of document.querySelectorAll("kbd[data-plain]")) k.textContent = k.dataset.plain;
+$("#undo-btn").append(svgIcon("undo", 17));
+$("#redo-btn").append(svgIcon("redo", 17));
+$("#undo-btn").addEventListener("click", () => undo());
+$("#redo-btn").addEventListener("click", () => redo());
+
 function closeMenus() {
   for (const m of document.querySelectorAll(".menu")) {
     m.querySelector(".menu-list").hidden = true;
@@ -2887,6 +3342,7 @@ for (const m of document.querySelectorAll(".menu")) {
   btn.addEventListener("click", (e) => {
     e.stopPropagation();
     const open = list.hidden;
+    if (open && m.id === "edit-menu") updateEditMenu();
     closeMenus();
     list.hidden = !open;
     btn.setAttribute("aria-expanded", String(open));
@@ -2981,7 +3437,7 @@ $("#settings").addEventListener("click", () => {
   ], "Save", async (v) => {
     Object.assign(prefs, {
       theme: v.theme, grid: v.grid, snap: v.snap, labels: v.labels,
-      defPorts: Math.min(sys.max_chr_ports || 24, Math.max(1, Number(v.defPorts) || 8)),
+      defPorts: Math.min(sys.max_chr_ports || 24, Math.max(1, Number(v.defPorts) || 5)),
       defCpus: Math.min(8, Math.max(1, Number(v.defCpus) || 1)),
     });
     writeStore("prefs", prefs);
@@ -2995,11 +3451,25 @@ $("#settings").addEventListener("click", () => {
 
 window.addEventListener("keydown", (e) => {
   const typing = ["INPUT", "TEXTAREA", "SELECT"].includes(document.activeElement && document.activeElement.tagName);
+  const inTerm = document.activeElement && document.activeElement.closest && document.activeElement.closest("#terms");
+  if ((e.ctrlKey || e.metaKey) && !e.altKey && !typing && !inTerm && $("#modal").hidden && state.lab) {
+    const k = e.key.toLowerCase();
+    // Copying text someone selected on the page stays the browser's.
+    const text = String(window.getSelection ? window.getSelection() : "").length > 0;
+    const run = { z: () => (e.shiftKey ? redo() : undo()), y: redo, a: selectAll, d: duplicateSelection,
+      c: text ? null : () => copySelection(), x: text ? null : () => cutSelection(),
+      v: () => pasteClipboard(e.shiftKey) }[k];
+    if (run) { e.preventDefault(); run(); return; }
+  }
   if (e.key === "Escape") {
     if (drag && drag.kind === "link") {  // drop the link being dragged out
       drag = null;
       state.linkFrom = null;
       $("#canvas").classList.remove("linking");
+      render(true);
+    } else if (drag && (drag.kind === "marquee" || drag.kind === "group")) {
+      if (drag.kind === "group") applyPositions(drag.before, 0, 0);
+      drag = null;
       render(true);
     } else if (!$("#modal").hidden) $("#modal-cancel").click();
     else if (state.tool !== "select") setTool("select");

@@ -53,7 +53,7 @@ class Platform:
 CHR = Platform(
     kind=NodeKind.chr, label="MikroTik CHR", short="", roles=("router", "switch"),
     image_name="chr.img", image_format="raw",
-    nic="virtio-net-pci", disk_bus="virtio", default_ports=8, max_ports=24,
+    nic="virtio-net-pci", disk_bus="virtio", default_ports=5, max_ports=24,
     default_cpus=1, default_ram_mb=256, min_ram_mb=128, needs_kvm=False, guest_agent=True,
     experimental=False, login="admin, no password",
     image_help="Installed by scripts/install.sh.",

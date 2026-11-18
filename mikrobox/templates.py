@@ -20,9 +20,9 @@ class Build:
         self.used: dict[int, int] = {}
         self.cloud_at = cloud
 
-    def router(self, name: str, x: float, y: float, role: str = "router", ports: int = 4) -> int:
+    def router(self, name: str, x: float, y: float, role: str = "router", ports: int = 4, layer: int = 2) -> int:
         nid = len(self.nodes) + 1
-        self.nodes.append({"id": nid, "kind": "chr", "role": role, "name": name,
+        self.nodes.append({"id": nid, "kind": "chr", "role": role, "layer": layer, "name": name,
                            "ports": ports, "x": x, "y": y})
         self.used[nid] = 1  # ether1 stays free for the Cloud
         return nid
@@ -35,8 +35,8 @@ class Build:
         self.used[nid] = 1
         return nid
 
-    def switch(self, name: str, x: float, y: float) -> int:
-        return self.router(name, x, y, role="switch", ports=8)
+    def switch(self, name: str, x: float, y: float, layer: int = 2, ports: int = 8) -> int:
+        return self.router(name, x, y, role="switch", ports=ports, layer=layer)
 
     def pc(self, name: str, x: float, y: float, address: str, gateway: str) -> int:
         nid = len(self.nodes) + 1
@@ -113,8 +113,8 @@ def collapsed_core() -> Build:
     b.area(290, 210, 460, 150, "Core and distribution (collapsed)", "blue")
     b.area(150, 390, 740, 310, "Access", "green", label_pos="bottom-left")
     edge = b.router("EDGE", 520, 120)
-    core1 = b.router("CORE1", 380, 290, ports=8)
-    core2 = b.router("CORE2", 660, 290, ports=8)
+    core1 = b.switch("CORE1", 380, 290, layer=3)
+    core2 = b.switch("CORE2", 660, 290, layer=3)
     b.to_cloud(edge)
     b.link(edge, core1)
     b.link(edge, core2)
@@ -127,7 +127,7 @@ def collapsed_core() -> Build:
         b.link(sw, b.pc(f"PC{i}", x, 610, f"10.10.{i * 10}.10/24", f"10.10.{i * 10}.1"))
     b.note(960, 200, 300, 400,
            "Collapsed core\n\n"
-           "Two routers do both core and distribution. Every access switch is dual-homed, "
+           "Two layer 3 switches do both core and distribution. Every access switch is dual-homed, "
            "and the two links between the cores can be bonded.\n\n"
            "Suggested plan\n"
            "VLAN 10, 20, 30: one per access switch\n"
@@ -145,9 +145,10 @@ def spine_leaf() -> Build:
     b = Build(cloud=(90, 110))
     b.area(290, 70, 500, 150, "Spine", "blue")
     b.area(110, 290, 860, 150, "Leaf", "green")
-    spines = [b.router("SPINE1", 380, 150, ports=6), b.router("SPINE2", 700, 150, ports=6)]
+    # Layer 3 switches, as in a data centre: every link between them is routed.
+    spines = [b.switch("SPINE1", 380, 150, layer=3, ports=6), b.switch("SPINE2", 700, 150, layer=3, ports=6)]
     for i, x in enumerate((200, 420, 660, 880), start=1):
-        leaf = b.router(f"LEAF{i}", x, 370)
+        leaf = b.switch(f"LEAF{i}", x, 370, layer=3, ports=4)
         for spine in spines:
             b.link(leaf, spine)
         b.link(leaf, b.pc(f"PC{i}", x, 540, f"10.1.{i}.10/24", f"10.1.{i}.1"))
@@ -268,7 +269,7 @@ def aruba_mikrotik() -> Build:
 TEMPLATES: dict[str, tuple[str, str, Callable[[], Build]]] = {
     "ospf-multi-area": ("Multi-area OSPF", "A backbone with two border routers, each feeding its own area.",
                         ospf_multi_area),
-    "collapsed-core": ("Collapsed core", "Two core routers, three dual-homed access switches, and an edge "
+    "collapsed-core": ("Collapsed core", "Two layer 3 core switches, three dual-homed access switches, and an edge "
                        "router to the Cloud.", collapsed_core),
     "spine-leaf": ("Spine and leaf", "Two spines and four leaves, fully meshed between the layers.", spine_leaf),
     "isp-mpls": ("ISP with MPLS", "A provider core with two PE routers and two customers with two sites each.",

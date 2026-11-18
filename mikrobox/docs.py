@@ -19,9 +19,10 @@ def port_name(node: Node, port: int) -> str:
 def kind_label(node: Node) -> str:
     if node.kind == NodeKind.client:
         return "Client"
+    switch = "Layer 3 switch" if node.layer == 3 else "Switch"
     if node.kind == NodeKind.aoscx:
-        return "Switch (Aruba AOS-CX)"
-    return "Switch (CHR)" if node.role == "switch" else "Router (CHR)"
+        return f"{switch} (Aruba AOS-CX)"
+    return f"{switch} (CHR)" if node.role == "switch" else "Router (CHR)"
 
 
 def _cell(text: object) -> str:

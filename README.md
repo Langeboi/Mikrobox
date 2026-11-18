@@ -104,13 +104,23 @@ Windows-only H3C Cloud Lab, so neither is included.
 ## What works in this version
 
 - Labs made of CHR routers and lightweight Linux clients, stored in one JSON file.
-- Per router: name, number of ports (1-24), vCPUs and RAM.
+- Per router: name, number of ports (1-24, 5 by default), vCPUs and RAM.
 - A Switch device: a CHR with 24 ports and its own icon, for when you want one as a switch.
+  Choose layer 2 (the default) or layer 3 when adding it, or later in its settings; a layer 3
+  switch has its own icon. Either way it is a full CHR: bridging, VLANs and routing between
+  them are set up in RouterOS.
 - Links between any two ports. Frames pass untouched, so STP, LACP and LLDP/MNDP work.
   Use the Link tool, or hold Ctrl (⌘ on a Mac) and drag from one device to another.
 - A Cloud that gives linked devices internet and makes them reachable from your PC,
   either through the VM (NAT) or directly on your own network (bridged).
 - A browser workspace with a topology canvas (pan, zoom, snap), device settings and docked consoles.
+- Editing: select several things with Shift+click or by Shift+dragging a box (Ctrl+A for
+  all), drag them together, align or space them out. Copy and paste (Ctrl+C, Ctrl+V, or
+  Ctrl+D to duplicate) brings the links between the copied devices along, pastes at the
+  pointer, and works across labs; Ctrl+Shift+V also copies stopped routers' configurations.
+  Undo and redo (Ctrl+Z, Ctrl+Shift+Z) cover moves, adding, linking, pasting and deleting.
+  Deleted devices are kept for a day, disks included, so undo brings a router back with its
+  configuration. The undo history belongs to the browser tab and starts empty on reload.
 - Areas, ellipses, text labels and sticky notes to mark sites, routing areas and tasks.
 - Lab export and import as a single JSON file (topology, shapes and notes).
 - Router config export (one router, or all as a zip), config import, hostname push and

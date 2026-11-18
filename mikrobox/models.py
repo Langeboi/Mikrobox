@@ -61,6 +61,7 @@ class Node(BaseModel):
     # What the device is used as. kind says which operating system runs it; role says
     # whether it is drawn and sized as a router or a switch. A CHR can be either.
     role: Literal["router", "switch"] = "router"
+    layer: Literal[2, 3] = 2  # switches: layer 2, or layer 3 (routes between its VLANs)
     name: str = Field(pattern=NAME_PATTERN)
     ports: int = Field(ge=1)
     cpus: int = Field(default=1, ge=1, le=8)

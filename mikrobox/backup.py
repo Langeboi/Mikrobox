@@ -152,6 +152,23 @@ class Backups:
             old.unlink(missing_ok=True)
         return True
 
+    def is_included(self, lab_id: int, node_id: int) -> bool:
+        return node_id in self.settings(lab_id)["nodes"]
+
+    def stash_node(self, node_id: int, dest: Path) -> None:
+        """Revisions of a device going to the trash."""
+        src = self.dir / f"n{node_id}"
+        if src.exists():
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            shutil.move(src, dest)
+        self.status.pop(node_id, None)
+
+    def unstash_node(self, node_id: int, src: Path) -> None:
+        if src.exists():
+            shutil.rmtree(self.dir / f"n{node_id}", ignore_errors=True)
+            self.dir.mkdir(parents=True, exist_ok=True)
+            shutil.move(src, self.dir / f"n{node_id}")
+
     def forget_node(self, node_id: int) -> None:
         shutil.rmtree(self.dir / f"n{node_id}", ignore_errors=True)
         self.status.pop(node_id, None)

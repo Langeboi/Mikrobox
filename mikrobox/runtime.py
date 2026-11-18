@@ -391,6 +391,23 @@ class Runtime:
         shutil.copyfile(self.disk_path(src), self.disk_path(dst))
         return True
 
+    def stash_files(self, node: Node, dest: Path) -> None:
+        """A device goes to the trash: its disk, and a PC's Docker data, move to dest."""
+        dest.mkdir(parents=True, exist_ok=True)
+        if self.disk_path(node).exists():
+            shutil.move(self.disk_path(node), dest / "disk")
+        if node.kind == NodeKind.client and self.docker.data_root(node).exists():
+            shutil.move(self.docker.data_root(node), dest / "docker")
+
+    def unstash_files(self, node: Node, src: Path) -> None:
+        """Back from the trash, possibly under a new id."""
+        if (src / "disk").exists():
+            self.disk_path(node).parent.mkdir(parents=True, exist_ok=True)
+            shutil.move(src / "disk", self.disk_path(node))
+        if (src / "docker").exists():
+            self.docker.data_root(node).parent.mkdir(parents=True, exist_ok=True)
+            shutil.move(src / "docker", self.docker.data_root(node))
+
     def delete_disk(self, node: Node) -> None:
         """A device is deleted, reset or replaced: its disk goes, and a PC's Docker data too."""
         self.disk_path(node).unlink(missing_ok=True)
