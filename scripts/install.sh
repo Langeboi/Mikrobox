@@ -13,14 +13,16 @@
 #   --tag XX          two letters that prefix its interfaces, bridge and firewall table [mx]
 #   --cloud-net CIDR  its Cloud's private range [10.98.0.0/16]
 #   --label TEXT      shown in its top bar [Test build, from the name]
+#   --web-ports A-B   ports for links to lab web pages [21000-21999]
 # Pin a RouterOS version with CHR_VERSION=7.x.y.
+# Leave out Docker for Linux PCs with WITH_DOCKER=0.
 set -euo pipefail
 
 [ "$(id -u)" = 0 ] || { echo "Run this as root (sudo)." >&2; exit 1; }
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
 REMEMBER="$REPO/.mikrobox-install"
 
-NAME="" PORT="" TAG="" CLOUD_NET="" LABEL=""
+NAME="" PORT="" TAG="" CLOUD_NET="" LABEL="" WEB_PORTS=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --name) NAME="${2:-}"; shift 2 ;;
@@ -28,6 +30,7 @@ while [ $# -gt 0 ]; do
     --tag) TAG="${2:-}"; shift 2 ;;
     --cloud-net) CLOUD_NET="${2:-}"; shift 2 ;;
     --label) LABEL="${2:-}"; shift 2 ;;
+    --web-ports) WEB_PORTS="${2:-}"; shift 2 ;;
     -h|--help) sed -n '2,18p' "$0"; exit 0 ;;
     *) echo "Unknown option: $1 (see --help)" >&2; exit 1 ;;
   esac
@@ -50,8 +53,10 @@ if [ -n "$NAME" ]; then
     old() { sed -n "s/^$1=//p" "$ENVFILE" | head -1; }
     PORT="${PORT:-$(old MIKROBOX_PORT)}"; TAG="${TAG:-$(old MIKROBOX_TAG)}"
     CLOUD_NET="${CLOUD_NET:-$(old MIKROBOX_CLOUD_NET)}"; LABEL="${LABEL:-$(old MIKROBOX_LABEL)}"
+    WEB_PORTS="${WEB_PORTS:-$(old MIKROBOX_WEB_PORTS)}"
   fi
   PORT="${PORT:-8081}"; TAG="${TAG:-mx}"; CLOUD_NET="${CLOUD_NET:-10.98.0.0/16}"
+  WEB_PORTS="${WEB_PORTS:-21000-21999}"
   LABEL="${LABEL:-${NAME^} build}"
   [[ "$TAG" =~ ^[a-z]{2}$ ]] && [ "$TAG" != "mb" ] || { echo "--tag: two lowercase letters other than mb." >&2; exit 1; }
   [ "$CLOUD_NET" != "10.99.0.0/16" ] || { echo "--cloud-net: 10.99.0.0/16 is the main install's range." >&2; exit 1; }
@@ -60,6 +65,7 @@ else
   PREFIX="/opt/mikrobox"
   DATA="/var/lib/mikrobox"
   PORT="${PORT:-8080}"
+  WEB_PORTS="${WEB_PORTS:-20000-20999}"
   BRANCH="$(git -C "$REPO" rev-parse --abbrev-ref HEAD 2>/dev/null || true)"
   if [[ "$BRANCH" == experimental/* ]]; then
     echo "This folder is on the $BRANCH branch, and this would replace your MAIN install with it." >&2
@@ -73,7 +79,14 @@ else
   fi
 fi
 [[ "$PORT" =~ ^[0-9]+$ ]] && [ "$PORT" -ge 1024 ] && [ "$PORT" -le 65535 ] || { echo "--port: a number from 1024 to 65535." >&2; exit 1; }
+[[ "$WEB_PORTS" =~ ^([0-9]+)-([0-9]+)$ ]] && [ "${BASH_REMATCH[1]}" -ge 1024 ] && [ "${BASH_REMATCH[2]}" -le 65535 ] \
+  && [ "${BASH_REMATCH[1]}" -le "${BASH_REMATCH[2]}" ] || { echo "--web-ports: a range like 21000-21999." >&2; exit 1; }
 IMAGE="$DATA/images/chr.img"
+
+# Was Docker already running on this VM itself? Then it is someone's, and stays as it is.
+was_active() { systemctl is-active --quiet "$1" 2>/dev/null; }
+HOST_DOCKER=0; was_active docker.service && HOST_DOCKER=1
+HOST_CONTAINERD=0; was_active containerd.service && HOST_CONTAINERD=1
 
 echo "==> Installing packages"
 export DEBIAN_FRONTEND=noninteractive
@@ -82,6 +95,32 @@ apt-get install -y --no-install-recommends \
   qemu-system-x86 qemu-utils iproute2 dnsmasq-base nftables tcpdump arp-scan bridge-utils \
   traceroute iputils-ping bash python3 python3-venv unzip curl ca-certificates \
   iperf3 dnsutils nmap mtr-tiny netcat-openbsd busybox iputils-arping tshark
+
+if [ "${WITH_DOCKER:-1}" != 0 ]; then
+  echo "==> Installing Docker for Linux PCs"
+  # Each PC that has Docker turned on runs its own engine inside the PC; the VM
+  # itself does not need one. Keep the packages from starting one: Docker on the
+  # VM would set the firewall to drop forwarded traffic, which the Cloud needs.
+  HOLD=""
+  if [ "$HOST_DOCKER" = 0 ] && [ ! -e /usr/sbin/policy-rc.d ]; then
+    HOLD=/usr/sbin/policy-rc.d
+    printf '#!/bin/sh\nexit 101\n' > "$HOLD"; chmod 755 "$HOLD"
+    trap 'rm -f "$HOLD"' EXIT
+  fi
+  apt-get install -y --no-install-recommends docker.io iptables pigz xz-utils
+  apt-get install -y --no-install-recommends docker-compose-v2 2>/dev/null \
+    || apt-get install -y --no-install-recommends docker-compose 2>/dev/null \
+    || echo "    (Docker Compose isn't packaged here; PCs get Docker without it.)"
+  if [ -n "$HOLD" ]; then rm -f "$HOLD"; trap - EXIT; fi
+  if [ "$HOST_DOCKER" = 0 ]; then
+    systemctl disable --now docker.service docker.socket >/dev/null 2>&1 || true
+  else
+    echo "    Docker was already running on this VM and is left running." >&2
+  fi
+  if [ "$HOST_CONTAINERD" = 0 ] && [ "$HOST_DOCKER" = 0 ]; then
+    systemctl disable --now containerd.service >/dev/null 2>&1 || true
+  fi
+fi
 
 if [ ! -e /dev/kvm ]; then
   echo "WARNING: /dev/kvm is missing. Routers will run without acceleration and be very slow." >&2
@@ -132,11 +171,14 @@ MIKROBOX_TAG=$TAG
 MIKROBOX_CLOUD_NET=$CLOUD_NET
 MIKROBOX_CLOUD_MODE=nat
 MIKROBOX_LABEL=$LABEL
+MIKROBOX_WEB_PORTS=$WEB_PORTS
 EOF
   ENV_LINE="EnvironmentFile=$ENVFILE"
   echo "$NAME" > "$REMEMBER"
-elif [ "$PORT" != "8080" ]; then
-  ENV_LINE="Environment=MIKROBOX_PORT=$PORT"
+else
+  [ "$PORT" = "8080" ] || ENV_LINE="Environment=MIKROBOX_PORT=$PORT"
+  [ "$WEB_PORTS" = "20000-20999" ] || ENV_LINE="${ENV_LINE:+$ENV_LINE
+}Environment=MIKROBOX_WEB_PORTS=$WEB_PORTS"
 fi
 cat > "/etc/systemd/system/$SERVICE.service" <<EOF
 [Unit]
@@ -171,6 +213,9 @@ if curl -fsS -o /dev/null "http://127.0.0.1:$PORT/api/auth/status" 2>/dev/null; 
 else
   echo "The service did not answer on port $PORT. See:  journalctl -u $SERVICE -n 50" >&2
 fi
+echo
+echo "Links that open lab web pages in your browser use ports $WEB_PORTS."
+echo "If this VM has a firewall, let those in too (ufw: sudo ufw allow ${WEB_PORTS/-/:}/tcp)."
 echo
 if [ -n "$NAME" ]; then
   echo "This install is separate from the main one: it has its own accounts (create one on first"

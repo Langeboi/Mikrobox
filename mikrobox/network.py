@@ -24,7 +24,7 @@ import signal
 from pathlib import Path
 
 from .config import Settings
-from .shell import Shell
+from .shell import CommandError, Shell
 
 OLD_BRIDGE = "mbmgmt"
 
@@ -130,6 +130,9 @@ class Net:
             pass
         self.sh.run(["ip", "-n", ns, "link", "set", "lo", "up"])
         for i, host_if in enumerate(ifaces):
+            # A namespace that is still on its way out keeps its old cable; removing
+            # our end of it removes both.
+            self.delete(host_if)
             self.sh.run(
                 ["ip", "link", "add", host_if, "type", "veth",
                  "peer", "name", f"eth{i}", "netns", ns]
@@ -157,10 +160,14 @@ class Net:
         for src, dst in ((a, b), (b, a)):
             self.sh.run(["tc", "qdisc", "del", "dev", src, "clsact"], check=False)
             self.sh.run(["tc", "qdisc", "add", "dev", src, "clsact"])
-            self.sh.run(
-                ["tc", "filter", "add", "dev", src, "ingress", "matchall",
-                 "action", "mirred", "egress", "redirect", "dev", dst]
-            )
+            redirect = ["action", "mirred", "egress", "redirect", "dev", dst]
+            try:
+                self.sh.run(["tc", "filter", "add", "dev", src, "ingress", "matchall", *redirect])
+            except CommandError:
+                # Some kernels are built without the matchall classifier; a u32 rule
+                # that matches every frame does the same job.
+                self.sh.run(["tc", "filter", "add", "dev", src, "ingress", "protocol", "all",
+                             "u32", "match", "u32", "0", "0", *redirect])
 
     def disconnect(self, iface: str) -> None:
         if self.exists(iface):

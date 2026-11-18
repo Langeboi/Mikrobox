@@ -122,6 +122,17 @@ Windows-only H3C Cloud Lab, so neither is included.
 - Client services, switched on per client: a web server on port 80, an iperf3 server, a
   DHCP server (hands out .100-.199 of its subnet) and a DNS server that answers for every
   device in the lab as `<name>.lab` and forwards everything else.
+- Docker on Linux clients, switched on per client: each gets its own Docker engine inside
+  the client, so containers sit on the lab network and publish ports on the client's
+  address. Add containers from the device panel (nginx, Apache, whoami, Portainer,
+  Grafana, Uptime Kuma, PostgreSQL or any image) or with `docker` in its console. Ones
+  added from the panel are saved with the lab and start with the client; images are
+  downloaded through the VM, and a client that has an image shares it with the others.
+- Open in your browser: a link from your own browser to any web page inside the lab, over
+  HTTP or HTTPS, fetched the way a chosen client sees it. Pick a container's port or type
+  any address (a router's WebFig, say). HTTPS passes through untouched, so you see the
+  page's own certificate. Links can be for your computer only or for anyone, are listed
+  under Tools › Web access, and close when their client stops or after 8 hours unused.
 - A live packet view in the browser (Tools menu, or Packets on any running port), with
   capture filters, alongside pcap download for Wireshark. Clicking a packet shows the
   full protocol tree from tshark and its bytes: pointing at a field highlights its bytes,
@@ -168,7 +179,15 @@ The installer downloads the current stable CHR image from MikroTik. Pin a versio
 
 To update later: `git pull && sudo ./scripts/install.sh`. Running routers keep running.
 Updating this way also installs the packages newer features need (tshark for the packet
-decode, iperf3, dig and friends for clients); stopped clients pick them up on their next start.
+decode, iperf3, dig and friends for clients, Docker for clients); stopped clients pick them
+up on their next start.
+
+Docker is installed for clients but not started on the VM itself: each client with Docker
+turned on runs its own engine. If Docker was already running on the VM, it is left as it
+was. Skip Docker with `sudo WITH_DOCKER=0 ./scripts/install.sh`.
+
+Links to lab web pages use ports 20000-20999 on the VM (`MIKROBOX_WEB_PORTS=a-b` in the
+service's environment changes the range). If the VM has a firewall, open those too.
 
 ## Accounts
 
@@ -264,6 +283,8 @@ Add `?seconds=30` for a capture that ends by itself; the workspace's Capture lin
 | Capture | `tcpdump` on the port interface, streamed as pcap, or as lines plus bytes for the packet view |
 | Decode | `tshark -T pdml` on one packet at a time, run as `nobody` |
 | Client services | `udhcpc`, `dnsmasq`, `python3 -m http.server` and `iperf3 -s`, started inside the client's namespace |
+| Docker on a client | `dockerd` started inside the client's namespace with a private mount namespace (its own `/sys`, containerd and `resolv.conf`); data in `/var/lib/mikrobox/docker/n<id>`, socket in `/run/mikrobox/docker/n<id>.sock`, which the client's console uses as `DOCKER_HOST` |
+| Web links | A port on the VM per link; each connection is made from inside the client's namespace and passed through byte for byte |
 | Live updates | A websocket at `/api/events` that tells open workspaces to reload what changed |
 
 ## Known gaps
@@ -289,6 +310,14 @@ Add `?seconds=30` for a capture that ends by itself; the workspace's Capture lin
   segments are not reassembled there. Download the pcap for that.
 - Client services and DHCP were tested with stand-ins for the real programs; the commands
   they run are covered by tests, but expect to fix things on the first run on a real VM.
+- Docker on clients and web links have run for real (engines inside clients, containers
+  reached across lab links and from a browser), but only on a cgroup v1 test machine
+  without internet, so pulling from Docker Hub was tested with a stand-in. Each engine
+  uses about 100 MB of memory while its client runs.
+- Web links are plain TCP ports: anyone who can reach the VM can use a link made for
+  anyone. "Only this computer" goes by IP address.
+- If Docker runs on the VM itself, it may set the firewall to drop forwarded traffic,
+  which stops the Cloud's NAT; allow `mbcloud` in Docker's `DOCKER-USER` chain.
 
 ## Development
 

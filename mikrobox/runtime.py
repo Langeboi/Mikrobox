@@ -15,6 +15,7 @@ from .config import Settings
 from .models import Endpoint, Lab, Link, Node, NodeKind
 from .clients import ClientServices
 from .ksm import Ksm
+from .docker import Docker
 from .network import Net, pid_alive
 from .platforms import PLATFORMS, is_vm, platform
 from .shell import CommandError, Shell
@@ -53,6 +54,8 @@ class Runtime:
         self.net = Net(settings, self.sh)
         self.ksm = Ksm(settings)
         self.clients = ClientServices(self)
+        self.docker = Docker(self)
+        self.stop_hooks: list = []  # called with the node after it stops (web links close)
         self.lock = threading.RLock()
         self.cloud_ips: dict[str, str] = {}  # MAC -> address, discovered in bridged mode
         self._scanner: threading.Thread | None = None
@@ -137,6 +140,7 @@ class Runtime:
             "max_chr_ports": self.s.max_chr_ports,
             "platforms": [self.platform_info(p) for p in PLATFORMS.values()],
             "ksm": self.ksm.status(),
+            "docker": self.docker.available,
         }
 
     def platform_info(self, p) -> dict:
@@ -268,6 +272,7 @@ class Runtime:
                     node.dns if static else None,
                 )
                 self.clients.start(lab, node)
+                self.docker.start(lab, node)
             for link in lab.links:
                 if link.touches(node.id):
                     self.apply_link(lab, link)
@@ -314,8 +319,11 @@ class Runtime:
                 for port in range(1, node.ports + 1):
                     self.net.delete(self.iface(node.id, port))
             else:
+                self.docker.stop(node)  # stops its containers first
                 self.clients.stop(node)
                 self.net.delete_client(self.netns(node.id))
+        for hook in self.stop_hooks:
+            hook(node)
 
     def _kill(self, pidfile: Path) -> None:
         pid = pid_alive(pidfile, "qemu")
@@ -384,4 +392,14 @@ class Runtime:
         return True
 
     def delete_disk(self, node: Node) -> None:
+        """A device is deleted, reset or replaced: its disk goes, and a PC's Docker data too."""
         self.disk_path(node).unlink(missing_ok=True)
+        if node.kind == NodeKind.client:
+            self.docker.forget(node)
+
+    def resume(self) -> None:
+        """After Mikrobox itself restarts: reconnect to what kept running."""
+        for lab in self.store.state.labs:
+            for node in lab.nodes:
+                if node.kind == NodeKind.client and node.docker and self.node_running(node):
+                    self.docker.resume(lab, node)

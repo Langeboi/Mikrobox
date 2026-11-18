@@ -21,6 +21,7 @@ def client(tmp_path: Path):
         netns_etc=tmp_path / "etcns",
         kvm_device=tmp_path / "kvm",
         ksm_dir=tmp_path / "ksm",  # never touch the real host's KSM from tests
+        web_ports=(42000, 42049),
     )
     (tmp_path / "sysnet").mkdir()
     (tmp_path / "netns").mkdir()
@@ -1504,6 +1505,22 @@ TCPDUMP_XX = """\
 """
 
 
+def _alive(pid):
+    import os as _os
+    try:
+        with open(f"/proc/{pid}/stat") as f:
+            return f.read().split(") ")[-1][0] != "Z"  # a zombie has stopped
+    except OSError:
+        return False
+
+
+def _wait_for(check, seconds=3.0):
+    import time as _t
+    end = _t.time() + seconds
+    while _t.time() < end and not check():
+        _t.sleep(0.05)
+
+
 def test_tcpdump_hex_is_joined_to_its_packet():
     from mikrobox.packets import Assembler
 
@@ -1562,7 +1579,7 @@ def test_live_packets_can_be_decoded(client, tmp_path, monkeypatch):
     fake = tmp_path / "fakebin"
     fake.mkdir()
     (tmp_path / "td.txt").write_text(TCPDUMP_XX)
-    (fake / "tcpdump").write_text(f"#!/bin/sh\ncat {tmp_path / 'td.txt'}\nexec sleep 30\n")
+    (fake / "tcpdump").write_text(f"#!/bin/sh\necho $$ > {tmp_path / 'td.pid'}\ncat {tmp_path / 'td.txt'}\nexec sleep 30\n")
     (fake / "tcpdump").chmod(0o755)
     monkeypatch.setenv("PATH", f"{fake}:{os.environ['PATH']}")
     lab = make_lab(client)
@@ -1585,3 +1602,486 @@ def test_live_packets_can_be_decoded(client, tmp_path, monkeypatch):
             assert (target["p"], target["s"], target["t"]) == (38, 4, "Target IP address: 10.0.12.2")
         else:
             assert "needs tshark" in got["error"]
+        # Let the server finish its cleanup before the test client tears the session down: it
+        # cancels the handler right after sending the disconnect, a race a browser never causes.
+        ws.close()
+        _wait_for(lambda: not _alive(int((tmp_path / "td.pid").read_text())))  # the server stopped "tcpdump"
+
+
+# -- Docker on Linux clients ----------------------------------------------------
+
+import json  # used by FakeEngine below
+
+
+class FakeEngine:
+    """Just enough of Docker's Engine API, on a unix socket, to test Mikrobox against."""
+
+    def __init__(self, path, images=()):
+        import http.server, socketserver, threading as _th
+        self.path = str(path)
+        self.containers = {}  # name -> dict
+        self.images = set(images)
+        self.calls = []
+        self.loaded = []
+        engine = self
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def address_string(self):
+                return "fake"
+
+            def log_message(self, *a):
+                pass
+
+            def _send(self, code, body=b"", ctype="application/json"):
+                if isinstance(body, (dict, list)):
+                    body = json.dumps(body).encode()
+                self.send_response(code)
+                self.send_header("Content-Type", ctype)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def _body(self):
+                if self.headers.get("Transfer-Encoding") == "chunked":
+                    data = b""
+                    while True:
+                        size = int(self.rfile.readline().strip(), 16)
+                        if not size:
+                            self.rfile.readline()
+                            return data
+                        data += self.rfile.read(size)
+                        self.rfile.readline()
+                n = int(self.headers.get("Content-Length") or 0)
+                return self.rfile.read(n) if n else b""
+
+            def do_GET(self):
+                engine.calls.append(("GET", self.path))
+                from urllib.parse import urlparse, parse_qs, unquote
+                u = urlparse(self.path)
+                parts = [unquote(p) for p in u.path.strip("/").split("/")]
+                if u.path == "/_ping":
+                    return self._send(200, b"OK", "text/plain")
+                if u.path == "/version":
+                    return self._send(200, {"Version": "27.5.1"})
+                if u.path == "/containers/json":
+                    return self._send(200, [{
+                        "Names": ["/" + n], "Image": c["Image"], "State": c["State"],
+                        "Status": "Up 1 minute" if c["State"] == "running" else "Exited (0)",
+                        "Ports": [{"IP": "0.0.0.0", "PrivatePort": int(k.split("/")[0]), "PublicPort": int(b[0]["HostPort"]), "Type": k.split("/")[1]}
+                                  for k, b in c["HostConfig"].get("PortBindings", {}).items()]
+                                 + [{"IP": "::", "PrivatePort": int(k.split("/")[0]), "PublicPort": int(b[0]["HostPort"]), "Type": k.split("/")[1]}
+                                    for k, b in c["HostConfig"].get("PortBindings", {}).items()],
+                    } for n, c in engine.containers.items()])
+                if parts[0] == "containers" and parts[-1] == "json":
+                    return self._send(200, engine.containers[parts[1]]) if parts[1] in engine.containers else self._send(404, {"message": "No such container"})
+                if parts[0] == "containers" and parts[-1] == "logs":
+                    frame = lambda kind, text: bytes([kind, 0, 0, 0]) + len(text).to_bytes(4, "big") + text
+                    return self._send(200, frame(1, b"hello\n") + frame(2, b"oops\n"), "application/vnd.docker.raw-stream")
+                if parts[0] == "images" and parts[-1] == "json":
+                    return self._send(200, {"Id": "sha256:x"}) if "/".join(parts[1:-1]) in engine.images else self._send(404, {"message": "No such image"})
+                if u.path == "/images/get":
+                    return self._send(200, b"TARBALL:" + parse_qs(u.query)["names"][0].encode(), "application/x-tar")
+                self._send(404, {"message": "not here"})
+
+            def do_POST(self):
+                body = self._body()
+                engine.calls.append(("POST", self.path))
+                from urllib.parse import urlparse, parse_qs, unquote
+                u = urlparse(self.path)
+                q = parse_qs(u.query)
+                parts = [unquote(p) for p in u.path.strip("/").split("/")]
+                if u.path == "/containers/create":
+                    spec = json.loads(body)
+                    if spec["Image"] not in engine.images:
+                        return self._send(404, {"message": "No such image"})
+                    engine.containers[q["name"][0]] = {**spec, "State": "created"}
+                    return self._send(201, {"Id": "abc"})
+                if parts[0] == "containers" and parts[-1] in ("start", "stop", "restart"):
+                    c = engine.containers.get(parts[1])
+                    if c is None:
+                        return self._send(404, {"message": "No such container"})
+                    c["State"] = "exited" if parts[-1] == "stop" else "running"
+                    return self._send(204)
+                if u.path == "/images/create":
+                    ref = q["fromImage"][0] + (":" + q["tag"][0] if q.get("tag") else "")
+                    engine.images.add(ref)
+                    lines = [{"status": "Pulling"}, {"id": "l1", "progressDetail": {"current": 5, "total": 10}}, {"status": "Done"}]
+                    return self._send(200, b"\n".join(json.dumps(l).encode() for l in lines))
+                if u.path == "/images/load":
+                    engine.loaded.append(body)
+                    engine.images.add(body.decode().split(":", 1)[1])
+                    return self._send(200, {"stream": "Loaded"})
+                self._send(404, {"message": "not here"})
+
+            def do_DELETE(self):
+                engine.calls.append(("DELETE", self.path))
+                from urllib.parse import urlparse, unquote
+                name = unquote(urlparse(self.path).path.split("/")[2])
+                if engine.containers.pop(name, None) is None:
+                    return self._send(404, {"message": "No such container"})
+                self._send(204)
+
+        class Server(socketserver.ThreadingMixIn, socketserver.UnixStreamServer):
+            daemon_threads = True
+
+            def handle_error(self, request, client_address):
+                pass  # a caller that hung up early (a quick ping) is not news
+
+        self.server = Server(self.path, Handler)
+        _th.Thread(target=self.server.serve_forever, daemon=True).start()
+
+    def close(self):
+        self.server.shutdown()
+        self.server.server_close()
+
+
+@pytest.fixture
+def engines(client, monkeypatch):
+    """Pretend PCs with Docker have a running engine, a fake one per PC."""
+    made = {}
+    rt = client.rt
+    monkeypatch.setattr(rt, "node_running", lambda n: n.id in made or n.kind.value == "client" and getattr(n, "_up", False))
+
+    def up(node_id, images=()):
+        sock = client.tmp / f"engine{node_id}.sock"
+        made[node_id] = FakeEngine(sock, images)
+        monkeypatch.setattr(rt.docker, "sock", lambda n, _s=rt.docker.sock: client.tmp / f"engine{n.id}.sock")
+        rt.docker.state[node_id] = "running"
+        return made[node_id]
+
+    yield up
+    for e in made.values():
+        e.close()
+
+
+def test_docker_switch_and_engine_command(client):
+    lab = make_lab(client)
+    pc = add_node(client, lab, kind="client", name="PC1")
+    r1 = add_node(client, lab, name="R1")
+    url = f"/api/labs/{lab}/nodes/{pc['id']}"
+    assert client.post(f"/api/labs/{lab}/nodes/{r1['id']}/docker", json={"on": True}).status_code == 400
+    assert client.post(f"{url}/containers", json={"name": "web", "image": "nginx:alpine"}).status_code == 409  # off
+    got = client.post(f"{url}/docker", json={"on": True}).json()
+    assert got["engine"]["on"] and got["engine"]["state"] == "stopped"
+    client.rt.sh.history.clear()
+    client.post(f"{url}/start")
+    launch = next(c for c in client.rt.sh.history if c[0].endswith("docker-launch.sh"))
+    ns = f"mbc{pc['id']}"
+    assert launch[1] == str(client.rt.s.netns_dir / ns) and launch[2].endswith(f"{ns}/resolv.conf")
+    assert ["--data-root", str(client.tmp / "data" / "docker" / f"n{pc['id']}")] == launch[4:6]
+    assert "-H" in launch and launch[launch.index("-H") + 1] == f"unix://{client.tmp / 'run' / 'docker' / f'n{pc[chr(105) + chr(100)]}.sock'}"
+    script = (client.tmp / "run" / "docker" / "docker-launch.sh").read_text()
+    assert "mount -t sysfs sysfs /sys" in script and "mount --move" in script and "exec dockerd" in script
+    # Saved containers survive in the lab and come back in exports.
+    assert client.post(f"{url}/containers", json={"name": "web", "image": "nginx:alpine",
+                                                  "ports": [{"host": 8080, "container": 80}]}).status_code == 201
+    exported = client.get(f"/api/labs/{lab}/export").json()
+    node = next(n for n in exported["nodes"] if n["name"] == "PC1")
+    assert node["docker"] and node["containers"][0]["image"] == "nginx:alpine"
+    assert client.post(f"/api/labs/{lab}/nodes", json={"name": "R2", "kind": "chr"}).status_code == 201
+
+
+def test_container_rules(client):
+    lab = make_lab(client)
+    pc = add_node(client, lab, kind="client", name="PC1")
+    url = f"/api/labs/{lab}/nodes/{pc['id']}"
+    client.post(f"{url}/docker", json={"on": True})
+    bad = [
+        {"name": "web app", "image": "nginx"},
+        {"name": "web", "image": "nginx; rm -rf /"},
+        {"name": "web", "image": "nginx", "env": {"1BAD": "x"}},
+        {"name": "web", "image": "nginx", "ports": [{"host": 80, "container": 80}, {"host": 80, "container": 81}]},
+        {"name": "web", "image": "nginx", "ports": [{"host": 0, "container": 80}]},
+    ]
+    for body in bad:
+        assert client.post(f"{url}/containers", json=body).status_code == 422, body
+    assert client.post(f"{url}/containers", json={"name": "web", "image": "nginx"}).status_code == 201
+    assert client.post(f"{url}/containers", json={"name": "web", "image": "httpd"}).status_code == 409
+    view = client.get(f"{url}/containers").json()
+    assert view["containers"][0]["state"] == "pending" and view["containers"][0]["status"] == "Starts with the PC"
+    assert view["containers"][0]["command"] == "docker run -d --name web --restart unless-stopped nginx"
+    assert client.delete(f"{url}/containers/web").status_code == 200
+    assert client.get(f"{url}/containers").json()["containers"] == []
+
+
+def test_containers_on_a_running_engine(client, engines):
+    import time as _t
+    from mikrobox.docker import demux, run_command, split_ref
+
+    lab = make_lab(client)
+    pc = add_node(client, lab, kind="client", name="PC1")
+    url = f"/api/labs/{lab}/nodes/{pc['id']}"
+    client.post(f"{url}/docker", json={"on": True})
+    eng = engines(pc["id"])
+    spec = {"name": "web", "image": "nginx:alpine", "ports": [{"host": 8080, "container": 80}], "env": {"A": "1"}}
+    assert client.post(f"{url}/containers", json=spec).status_code == 201
+    for _ in range(50):
+        rows = client.get(f"{url}/containers").json()["containers"]
+        if rows and rows[0]["running"]:
+            break
+        _t.sleep(0.05)
+    row = rows[0]
+    assert row["running"] and row["saved"] and row["ports"] == [{"host": 8080, "container": 80, "proto": "tcp"}]
+    assert ("POST", "/images/create?fromImage=nginx&tag=alpine") in eng.calls  # downloaded
+    created = eng.containers["web"]
+    assert created["Env"] == ["A=1"] and created["HostConfig"]["PortBindings"] == {"80/tcp": [{"HostPort": "8080"}]}
+    assert created["HostConfig"]["RestartPolicy"] == {"Name": "unless-stopped"}
+    # A container made in the console shows up too, not saved.
+    eng.images.add("busybox")
+    eng.containers["mine"] = {"Image": "busybox", "State": "running", "HostConfig": {}}
+    rows = {r["name"]: r for r in client.get(f"{url}/containers").json()["containers"]}
+    assert rows["mine"]["running"] and not rows["mine"]["saved"] and rows["mine"]["command"] == ""
+    assert client.post(f"{url}/containers/web/stop").json()
+    assert eng.containers["web"]["State"] == "exited"
+    assert client.get(f"{url}/containers/web/logs").json()["text"] == "hello\noops\n"
+    assert client.delete(f"{url}/containers/mine").status_code == 200 and "mine" not in eng.containers
+    assert client.get(f"/api/labs/{lab}").json()["nodes"][0]["docker_summary"] == {"total": 1, "running": 0}
+    acts = [e["text"] for e in client.get("/api/activity", params={"lab": lab}).json()]
+    assert "added container web (nginx:alpine) to PC1" in acts and "stopped container web on PC1" in acts
+    # helpers
+    assert demux(b"plain text, no frames") == "plain text, no frames"
+    assert split_ref("ghcr.io/x/y:1.2") == ("ghcr.io/x/y", "1.2")
+
+
+def test_images_are_copied_between_pcs(client, engines):
+    import time as _t
+
+    lab = make_lab(client)
+    pc1 = add_node(client, lab, kind="client", name="PC1")
+    pc2 = add_node(client, lab, kind="client", name="PC2")
+    for pc in (pc1, pc2):
+        client.post(f"/api/labs/{lab}/nodes/{pc['id']}/docker", json={"on": True})
+    engines(pc1["id"], images={"grafana/grafana"})
+    second = engines(pc2["id"])
+    client.post(f"/api/labs/{lab}/nodes/{pc2['id']}/containers", json={"name": "g", "image": "grafana/grafana"})
+    for _ in range(50):
+        if "g" in second.containers and second.containers["g"]["State"] == "running":
+            break
+        _t.sleep(0.05)
+    assert second.loaded == [b"TARBALL:grafana/grafana"]  # copied from PC1, not downloaded
+    assert not any(c[1].startswith("/images/create") for c in second.calls)
+
+
+def test_pull_proxy_only_connects_to_https(tmp_path):
+    import socket as _s, ssl, threading as _th
+    from mikrobox.docker import PullProxy
+
+    lst = _s.socket(); lst.bind(("127.0.0.1", 0)); lst.listen(4)
+    proxy = PullProxy(lst)
+    port = lst.getsockname()[1]
+    try:
+        c = _s.create_connection(("127.0.0.1", port))
+        c.sendall(b"CONNECT example.com:22 HTTP/1.1\r\nHost: example.com:22\r\n\r\n")
+        assert c.recv(100).startswith(b"HTTP/1.1 403")
+        c = _s.create_connection(("127.0.0.1", port))
+        c.sendall(b"GET http://example.com/ HTTP/1.1\r\n\r\n")
+        assert c.recv(100).startswith(b"HTTP/1.1 403")
+    finally:
+        proxy.close()
+
+
+def test_pull_proxy_close_lets_go_of_every_socket():
+    # Sockets made inside a PC keep its network namespace alive, so close() must wake
+    # the accept loop and end open relays, not just drop the listener's file descriptor.
+    import socket as _s, time as _t
+    from mikrobox.docker import PullProxy
+
+    lst = _s.socket(); lst.bind(("127.0.0.1", 0)); lst.listen(4)
+    proxy = PullProxy(lst)
+    c = _s.create_connection(lst.getsockname())
+    c.sendall(b"CONNECT regis")  # an unfinished request: the relay waits for more
+    for _ in range(100):
+        if proxy.conns:
+            break
+        _t.sleep(0.01)
+    assert len(proxy.conns) == 1
+    proxy.close()
+    c.settimeout(2)
+    assert c.recv(10) == b""  # the relay hung up
+    for _ in range(100):
+        if not proxy.conns:
+            break
+        _t.sleep(0.01)
+    assert not proxy.conns and lst.fileno() == -1
+
+
+def test_links_fall_back_when_the_kernel_lacks_matchall(tmp_path):
+    from mikrobox.network import Net
+    from mikrobox.shell import CommandError, Shell
+
+    class NoMatchall(Shell):
+        def run(self, cmd, check=True, input=None):
+            if "matchall" in cmd:
+                raise CommandError("Error: TC classifier not found.")
+            return super().run(cmd, check, input)
+
+    sh = NoMatchall(dry_run=True)
+    Net(Settings(data_dir=tmp_path, run_dir=tmp_path / "run", dry_run=True), sh).connect("mb1p1", "mb2p1")
+    filters = [c for c in sh.history if c[:3] == ["tc", "filter", "add"]]
+    assert [c[4] for c in filters] == ["mb1p1", "mb2p1"]
+    assert all("u32" in c and c[-1] in ("mb1p1", "mb2p1") for c in filters)
+
+
+def test_docker_in_console_and_on_delete(client, monkeypatch):
+    lab = make_lab(client)
+    pc = add_node(client, lab, kind="client", name="PC1")
+    client.post(f"/api/labs/{lab}/nodes/{pc['id']}/docker", json={"on": True})
+    data = client.tmp / "data" / "docker" / f"n{pc['id']}"
+    data.mkdir(parents=True)
+    (data / "something").write_text("x")
+    monkeypatch.setattr(client.rt.docker.s, "dry_run", False)
+    monkeypatch.setattr(client.rt.docker, "stop", lambda node: None)
+    client.rt.delete_disk(client.rt.store.state.lab(lab).node(pc["id"]))
+    assert not data.exists()
+
+
+# -- links that open lab pages in your browser ----------------------------------
+
+@pytest.fixture
+def pages(tmp_path):
+    """A plain HTTP page and an HTTPS one (self-signed), standing in for pages in the lab."""
+    import http.server, ssl, subprocess, threading as _th
+
+    class Page(http.server.BaseHTTPRequestHandler):
+        def log_message(self, *a):
+            pass
+
+        def do_GET(self):
+            body = f"page {self.path} over {'https' if isinstance(self.connection, ssl.SSLSocket) else 'http'}".encode()
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+    plain = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Page)
+    secure = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Page)
+    subprocess.run(["openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "1", "-subj", "/CN=lab",
+                    "-keyout", str(tmp_path / "k.pem"), "-out", str(tmp_path / "c.pem")], check=True, capture_output=True)
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    ctx.load_cert_chain(tmp_path / "c.pem", tmp_path / "k.pem")
+    secure.socket = ctx.wrap_socket(secure.socket, server_side=True)
+    for srv in (plain, secure):
+        _th.Thread(target=srv.serve_forever, daemon=True).start()
+    yield {"http": plain.server_address[1], "https": secure.server_address[1]}
+    for srv in (plain, secure):
+        srv.shutdown()
+
+
+def _fetch(url, insecure=True):
+    import ssl, urllib.request
+    ctx = ssl.create_default_context()
+    if insecure:
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+    local = url.replace("testserver", "127.0.0.1")
+    with urllib.request.urlopen(local, timeout=5, context=ctx) as r:
+        return r.read().decode()
+
+
+@pytest.fixture
+def lab_pc(client, monkeypatch):
+    """A running PC whose 'inside' is this machine, so links reach the test pages."""
+    import socket as _s
+    lab = make_lab(client)
+    pc = add_node(client, lab, kind="client", name="PC1")
+    running = {pc["id"]}
+    monkeypatch.setattr(client.rt, "node_running", lambda n: n.id in running)
+    links = client.app.state.weblinks
+
+    def plain_socket(node_id):
+        s = _s.socket(); s.setblocking(False)
+        return s
+    monkeypatch.setattr(links, "connector", plain_socket)
+    return lab, pc, running
+
+
+def test_link_to_an_address(client, pages, lab_pc):
+    lab, pc, _ = lab_pc
+    r = client.post("/api/web", json={"lab": lab, "node": pc["id"], "url": f"127.0.0.1:{pages['http']}/hi?x=1", "who": "anyone"})
+    assert r.status_code == 201, r.text
+    link = r.json()
+    assert link["url"] == "http://testserver:42000/hi?x=1" and link["who"] == "anyone" and link["by"] == "tester"
+    assert link["title"] == f"http://127.0.0.1:{pages['http']}" and link["detail"] == "From PC1"
+    assert _fetch(link["url"]) == "page /hi?x=1 over http"
+    assert _fetch(link["url"].replace("/hi?x=1", "/other")) == "page /other over http"  # any page on that site
+    assert client.get("/api/web", params={"lab": lab}).json()[0]["id"] == link["id"]
+    # HTTPS given in the address passes straight through: the page's own certificate.
+    r = client.post("/api/web", json={"lab": lab, "node": pc["id"], "url": f"https://127.0.0.1:{pages['https']}", "who": "anyone"})
+    secure = r.json()
+    assert secure["url"] == "https://testserver:42001/" and _fetch(secure["url"]) == "page / over https"
+    import ssl, urllib.error
+    with pytest.raises((urllib.error.URLError, ssl.SSLError)):
+        _fetch(secure["url"], insecure=False)  # self-signed: a browser would warn, as it should
+
+
+def test_link_to_a_container_finds_https(client, pages, lab_pc, engines):
+    lab, pc, _ = lab_pc
+    client.post(f"/api/labs/{lab}/nodes/{pc['id']}/docker", json={"on": True})
+    eng = engines(pc["id"], images={"portainer/portainer-ce"})
+    eng.containers["secure"] = {"Image": "portainer/portainer-ce", "State": "running",
+                                "HostConfig": {"PortBindings": {"9443/tcp": [{"HostPort": str(pages["https"])}]}}}
+    eng.containers["web"] = {"Image": "nginx:alpine", "State": "running",
+                             "HostConfig": {"PortBindings": {"80/tcp": [{"HostPort": str(pages["http"])}]}}}
+    eng.containers["off"] = {"Image": "nginx:alpine", "State": "exited", "HostConfig": {"PortBindings": {"80/tcp": [{"HostPort": "1"}]}}}
+    secure = client.post("/api/web", json={"lab": lab, "node": pc["id"], "container": "secure", "who": "anyone"}).json()
+    assert secure["scheme"] == "https" and secure["title"] == "secure · portainer-ce"
+    assert secure["detail"] == f"Container on PC1, port {pages['https']}"
+    assert _fetch(secure["url"]) == "page / over https"
+    web = client.post("/api/web", json={"lab": lab, "node": pc["id"], "container": "web", "who": "anyone"}).json()
+    assert web["scheme"] == "http" and _fetch(web["url"]) == "page / over http"
+    assert client.post("/api/web", json={"lab": lab, "node": pc["id"], "container": "off"}).status_code == 409
+    assert client.post("/api/web", json={"lab": lab, "node": pc["id"], "container": "nope"}).status_code == 404
+
+
+def test_link_only_for_me_and_closing(client, pages, lab_pc):
+    import time as _t, urllib.error
+    lab, pc, running = lab_pc
+    mine = client.post("/api/web", json={"lab": lab, "node": pc["id"], "url": f"127.0.0.1:{pages['http']}"}).json()
+    assert mine["who"] == "me" and mine["allow"] == "testclient"
+    with pytest.raises((urllib.error.URLError, ConnectionError, OSError)):
+        _fetch(mine["url"])  # this test connects from 127.0.0.1, not from "testclient"
+    other = client.post("/api/web", json={"lab": lab, "node": pc["id"], "url": f"127.0.0.1:{pages['http']}", "who": "anyone"}).json()
+    assert client.delete(f"/api/web/{mine['id']}").status_code == 204
+    assert client.delete(f"/api/web/{mine['id']}").status_code == 404
+    # The PC stops: its links close.
+    running.discard(pc["id"])
+    client.rt.stop_node(client.rt.store.state.lab(lab), client.rt.store.state.lab(lab).node(pc["id"]))
+    for _ in range(40):
+        if not client.get("/api/web").json():
+            break
+        _t.sleep(0.05)
+    assert client.get("/api/web").json() == []
+    with pytest.raises((urllib.error.URLError, ConnectionError, OSError)):
+        _fetch(other["url"])
+    assert client.post("/api/web", json={"lab": lab, "node": pc["id"], "url": "10.0.0.1"}).status_code == 409  # stopped
+    acts = [e["text"] for e in client.get("/api/activity", params={"lab": lab}).json()]
+    assert f"opened a link to http://127.0.0.1:{pages['http']} from PC1 for anyone" in acts
+
+
+def test_link_addresses_and_ports(client, lab_pc, monkeypatch):
+    from mikrobox.weblinks import LinkError, parse_url
+    assert parse_url("10.0.0.1") == ("http", "10.0.0.1", 80, "/")
+    assert parse_url("https://r1.lab:8443/webfig/") == ("https", "r1.lab", 8443, "/webfig/")
+    for bad in ("ftp://x", "http://", "http://h:port"):
+        with pytest.raises(LinkError):
+            parse_url(bad)
+    lab, pc, _ = lab_pc
+    r1 = add_node(client, lab, name="R1")
+    assert client.post("/api/web", json={"lab": lab, "node": r1["id"], "url": "10.0.0.1"}).status_code == 400
+    assert client.post("/api/web", json={"lab": lab, "node": pc["id"], "url": "ftp://x"}).status_code == 409
+    assert client.post("/api/web", json={"lab": lab, "node": pc["id"]}).status_code == 400
+    # Nothing listening there: said plainly, no link made.
+    r = client.post("/api/web", json={"lab": lab, "node": pc["id"], "container": None, "url": "https://127.0.0.1:1"})
+    assert r.status_code == 201  # https given, so no probe; connecting fails later, per request
+    links = client.app.state.weblinks
+    monkeypatch.setattr(links, "first", 42010)
+    monkeypatch.setattr(links, "last", 42010)
+    import socket as _s
+    busy = _s.socket(); busy.bind(("0.0.0.0", 42010)); busy.listen(1)
+    try:
+        r = client.post("/api/web", json={"lab": lab, "node": pc["id"], "url": "10.0.0.1:80"})
+        assert r.status_code == 409 and "No free port" in r.json()["detail"]
+    finally:
+        busy.close()
