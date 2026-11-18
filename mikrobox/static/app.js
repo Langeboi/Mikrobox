@@ -1003,7 +1003,9 @@ const SERVICES = [
 ];
 function clientAddress(n) {
   if (n.addressing === "dhcp") return n.leased || (n.running ? "DHCP…" : "DHCP");
-  return n.address || "";
+  // A trunk with no address of its own: show its first VLAN's.
+  const v = !n.address && (n.vlans || []).find((x) => x.address);
+  return n.address || (v ? `${v.address} (VLAN ${v.id})` : "");
 }
 
 // ------------------------------------------------- router config tools
@@ -1076,6 +1078,66 @@ function pushIdentity(n) {
 }
 
 // ---------------------------------------------------------- inspector
+
+// ---------------------------------------------------------------- check this server
+//
+// What Mikrobox needs from the VM, checked on the server (selfcheck.py), with a fix for
+// each problem. The Docker test is separate: it takes a minute and downloads an image.
+
+const CHECK_MARK = { ok: ["✓", "OK"], warn: ["!", "Warning"], fail: ["✕", "Problem"], info: ["i", "Note"] };
+
+function renderChecks(list) {
+  const groups = new Map();
+  for (const c of list) {
+    if (!groups.has(c.group)) groups.set(c.group, []);
+    groups.get(c.group).push(c);
+  }
+  return [...groups].map(([group, items]) => h("section", { class: "check-group" }, h("h3", {}, group),
+    items.map((c) => h("div", { class: `check ${c.status}` },
+      h("span", { class: "check-mark", role: "img", "aria-label": CHECK_MARK[c.status][1] }, CHECK_MARK[c.status][0]),
+      h("div", { class: "check-text" }, h("strong", {}, c.title), c.detail && h("span", {}, c.detail),
+        c.fix && (c.fix.startsWith("sudo ") ? copyRow(c.fix) : h("span", { class: "fix" }, c.fix)))))));
+}
+
+function checkSummary(list) {
+  const n = (st) => list.filter((c) => c.status === st).length;
+  const fail = n("fail"), warn = n("warn");
+  if (!fail && !warn) return h("p", { class: "check-sum ok" }, "Everything Mikrobox needs is in place.");
+  const parts = [fail && `${fail} problem${fail > 1 ? "s" : ""}`, warn && `${warn} warning${warn > 1 ? "s" : ""}`].filter(Boolean);
+  return h("p", { class: `check-sum ${fail ? "fail" : "warn"}` }, `${parts.join(" and ")}. Each says how to fix it.`);
+}
+
+function checkDialog() {
+  const summary = h("div", {});
+  const body = h("div", { class: "checks" });
+  const dockerBox = h("div", { class: "checks" });
+  const load = async () => {
+    body.replaceChildren(h("p", { class: "hint" }, "Checking…"));
+    summary.replaceChildren();
+    try {
+      const r = await api("GET", "/system/check");
+      summary.replaceChildren(checkSummary(r.checks));
+      body.replaceChildren(...renderChecks(r.checks));
+    } catch (e) { body.replaceChildren(h("p", { class: "warn-text" }, e.message)); }
+  };
+  const dockerBtn = h("button", { type: "button" }, "Run the Docker test");
+  dockerBtn.addEventListener("click", async () => {
+    dockerBtn.disabled = true;
+    dockerBox.replaceChildren(h("p", { class: "hint" },
+      "Starting an engine the way a server does, downloading hello-world from Docker Hub and running it. This can take a minute or two."));
+    try {
+      const r = await api("POST", "/system/check/docker");
+      dockerBox.replaceChildren(...renderChecks(r.steps));
+    } catch (e) { dockerBox.replaceChildren(h("p", { class: "warn-text" }, e.message)); }
+    dockerBtn.disabled = false;
+  });
+  openModal("Check this server", [
+    { node: summary }, { node: body },
+    { node: h("section", { class: "check-group" }, h("h3", {}, "Docker test"),
+      h("p", { class: "hint" }, "Shows whether servers can download images and run containers on this VM."), dockerBtn, dockerBox) },
+  ], "Check again", async () => { await load(); return true; }, null, true);
+  load();
+}
 
 function copyRow(text) {
   const copy = () => {
@@ -1235,8 +1297,14 @@ function nodeInspector(n) {
   };
   const svcBoxes = {};
   const nicInputs = [];
+  let vlanRows = null;
   const save = () => act(async () => {
     const body = {};
+    if (vlanRows) {
+      const list = vlanRows.map((r) => r.read()).filter((v) => v.id);
+      const now = (n.vlans || []).map(({ id, nic, address }) => ({ id, nic, address }));
+      if (JSON.stringify(list) !== JSON.stringify(now)) body.vlans = list;
+    }
     if (nicInputs.length) {
       const list = nicInputs.map((i) => i.value.trim() || null);
       while (list.length && list[list.length - 1] === null) list.pop();
@@ -1275,6 +1343,37 @@ function nodeInspector(n) {
     return [h("div", { class: "field" }, h("label", { for: "i-addressing" }, "Addressing"), mode), lease, ...fixed];
   };
   // A server's NICs: how many, bonded or not, and addresses for the others when not.
+  // Tagged VLANs: which NIC (or the bond), the VLAN ID, and an address on it.
+  const vlanFields = () => {
+    if (n.kind !== "client") return [];
+    const nics = n.bond ? ["bond0"] : Array.from({ length: n.ports }, (_, i) => `eth${i}`);
+    const box = h("div", { class: "vlan-rows" });
+    vlanRows = [];
+    const addRow = (v = {}) => {
+      const nic = h("select", { "aria-label": "NIC", disabled: n.running || nics.length < 2 }, nics.map((x) => h("option", { value: x }, x)));
+      nic.value = nics.includes(v.nic) ? v.nic : nics[0];
+      const id = h("input", { type: "number", min: 1, max: 4094, value: v.id || "", placeholder: "ID", "aria-label": "VLAN ID", disabled: n.running });
+      const addr = h("input", { type: "text", value: v.address || "", placeholder: "10.10.0.5/24", "aria-label": "Address on this VLAN",
+        autocomplete: "off", disabled: n.running });
+      const row = h("div", { class: "vlan-row" + (nics.length < 2 ? " one-nic" : "") }, nics.length > 1 && nic, id, addr,
+        h("button", { type: "button", class: "icon-btn", "aria-label": "Remove this VLAN", disabled: n.running,
+          onclick: () => { row.remove(); vlanRows.splice(vlanRows.indexOf(entry), 1); } }, "×"));
+      const entry = { read: () => ({ id: Number(id.value) || 0, nic: nic.value, address: addr.value.trim() || null }) };
+      vlanRows.push(entry);
+      box.append(row);
+      return id;
+    };
+    for (const v of n.vlans || []) addRow(v);
+    return [h("div", { class: "field" }, h("span", { class: "label" }, "VLANs (802.1Q, tagged)"),
+      box,
+      h("div", { class: "row-inline" },
+        h("button", { type: "button", class: "small", disabled: n.running || (n.vlans || []).length >= 8,
+          onclick: () => addRow().focus() }, "+ Add VLAN"),
+        h("span", { class: "hint" }, (nics.length === 1 ? `On ${nics[0]}. ` : "") + ((n.vlans || []).length
+          ? "The switch port must carry these VLANs tagged."
+          : "For a trunk port: the address above stays untagged.")))),
+    ];
+  };
   const serverFields = () => {
     if (!isServer(n)) return [];
     const bond = h("select", { id: "i-bond", disabled: n.running || n.ports < 2 }, BONDS.map(([v, label]) => h("option", { value: v }, label)));
@@ -1342,7 +1441,7 @@ function nodeInspector(n) {
             field("ports", "Ports", "number", { min: 1, max: 24 }),
             field("cpus", "vCPUs", "number", { min: 1, max: 8 }),
             field("ram_mb", "RAM (MB)", "number", { min: 128 }))
-        : [...clientFields(), ...serverFields()],
+        : [...clientFields(), ...serverFields(), ...vlanFields()],
       n.running
         ? h("p", {}, "Stop the device to change its settings.")
         : h("button", { type: "button", onclick: save }, "Save changes")),
@@ -1355,7 +1454,9 @@ function nodeInspector(n) {
           h("label", { for: "i-svc-" + key }, h("strong", {}, label), h("span", {}, tip)));
       }),
       n.running && h("p", {}, "Stop the server to change what it runs.")),
-    h("section", {}, h("h2", {}, "Interfaces"), h("table", {}, h("tbody", {}, rows)),
+    h("section", {}, h("h2", {}, "Interfaces"), h("table", {}, h("tbody", {}, rows,
+      (n.vlans || []).map((v) => h("tr", {}, h("td", { class: "mono" }, `${v.nic}.${v.id}`),
+        h("td", { colspan: 2 }, `VLAN ${v.id}` + (v.address ? ` · ${v.address}` : " · no address")))))),
       n.bond && h("p", { class: "hint" }, `Bonded as bond0, ${n.bond === "lacp" ? "LACP (802.3ad)" : "active-backup"}.`)),
     h("section", {}, h("h2", {}, "Access from your PC"), access),
     isChr && h("section", {}, h("h2", {}, "Configuration"),
@@ -1590,7 +1691,7 @@ function buildClip(items) {
     nodes: nodes.map((n) => ({ ref: n.id, source: n.id, kind: n.kind, role: n.role, layer: n.layer, name: n.name,
       ports: n.ports, cpus: n.cpus, ram_mb: n.ram_mb, address: n.address, gateway: n.gateway, dns: n.dns,
       addressing: n.addressing, services: n.services, docker: n.docker, containers: n.containers,
-      bond: n.bond, nic_addresses: n.nic_addresses, x: n.x, y: n.y })),
+      bond: n.bond, nic_addresses: n.nic_addresses, vlans: n.vlans, x: n.x, y: n.y })),
     // Links between the copied devices come along; links to the Cloud or to others do not.
     links: state.lab.links.filter((l) => l.b && ids.has(l.a.node) && ids.has(l.b.node))
       .map((l) => ({ a: { ref: l.a.node, port: l.a.port }, b: { ref: l.b.node, port: l.b.port } })),
@@ -2794,6 +2895,7 @@ const ACTIONS = {
   "tool-packets": () => packetDialog(),
   "tool-activity": () => openActivity(),
   "tool-web": () => openWebAccess(),
+  "tool-check": () => checkDialog(),
   "tool-nuke": () => nukeDialog(),
   "tool-test": () => reachDialog(),
   "tool-docs": async () => {
@@ -3184,6 +3286,7 @@ $("#settings").addEventListener("click", () => {
       row("Free memory", sys.mem_available_mb != null ? `${sys.mem_available_mb} MB` : "?"),
       row("Cloud", sys.cloud ? (sys.cloud.mode === "bridged" ? `your network ${sys.cloud.network || ""}` : `NAT, ${sys.cloud.network}`) : "?"),
       row("API reference", h("a", { href: "/docs", target: "_blank", rel: "noopener" }, "/docs"))) },
+    { node: h("button", { type: "button", onclick: () => checkDialog() }, "Check this server") },
   ], "Save", async (v) => {
     Object.assign(prefs, {
       theme: v.theme, grid: v.grid, snap: v.snap, labels: v.labels,

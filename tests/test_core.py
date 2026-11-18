@@ -278,6 +278,114 @@ def test_server_bonds_and_second_nics(client):
     assert udhcpc[udhcpc.index("-i") + 1] == "eth0"
 
 
+def test_vlans_on_pcs_and_servers(client):
+    lab = make_lab(client)
+    url = f"/api/labs/{lab}/nodes"
+    pc = add_node(client, lab, kind="client", name="PC1", vlans=[{"id": 10, "address": "10.10.0.5/24"}])
+    assert pc["vlans"] == [{"id": 10, "nic": "eth0", "address": "10.10.0.5/24"}]
+    srv = add_node(client, lab, kind="client", role="server", name="SRV1", address="10.0.0.10/24",
+                   bond="lacp", services=["dns"], gateway="10.20.0.1",
+                   vlans=[{"id": 20, "nic": "bond0", "address": "10.20.0.10/24"}, {"id": 30, "nic": "bond0"}])
+    # Rules: on a NIC it has, on the bond when bonded, once each; not on routers.
+    bad = [({"kind": "client", "name": "X1", "vlans": [{"id": 10, "nic": "eth1"}]}, "doesn't have"),
+           ({"kind": "client", "role": "server", "name": "X2", "bond": "lacp", "vlans": [{"id": 10, "nic": "eth0"}]}, "bond0"),
+           ({"kind": "client", "name": "X3", "vlans": [{"id": 10}, {"id": 10}]}, "twice"),
+           ({"name": "R9", "vlans": [{"id": 10}]}, "RouterOS")]
+    for body, words in bad:
+        r = client.post(url, json=body)
+        assert r.status_code == 400 and words in r.json()["detail"], (body, r.text)
+    assert client.post(url, json={"kind": "client", "name": "X4", "vlans": [{"id": 4095}]}).status_code == 422
+    assert client.post(url, json={"kind": "client", "name": "X5", "vlans": [{"id": 5, "address": "10.1.1.1"}]}).status_code == 422
+
+    client.rt.sh.history.clear()
+    client.post(f"{url}/{srv['id']}/start")
+    client.post(f"{url}/{pc['id']}/start")
+    cmds = [" ".join(c) for c in client.rt.sh.history]
+    ns, pns = f"mbc{srv['id']}", f"mbc{pc['id']}"
+    assert f"ip -n {ns} link add link bond0 name bond0.20 type vlan id 20" in cmds
+    assert f"ip -n {ns} addr add 10.20.0.10/24 dev bond0.20" in cmds and f"ip -n {ns} link set bond0.30 up" in cmds
+    assert not any("dev bond0.30" in c and " addr add " in c for c in cmds)  # no address on VLAN 30
+    # The default route comes after the VLANs, so a gateway on a VLAN works.
+    assert cmds.index(f"ip -n {ns} route add default via 10.20.0.1") > cmds.index(f"ip -n {ns} addr add 10.20.0.10/24 dev bond0.20")
+    assert f"ip -n {pns} link add link eth0 name eth0.10 type vlan id 10" in cmds
+    node = client.rt.store.state.lab(lab).node(srv["id"])
+    dnsmasq = next(argv for name, argv, _ in client.rt.clients.commands(client.rt.store.state.lab(lab), node) if name == "dnsmasq")
+    assert "--interface=bond0" in dnsmasq and "--interface=bond0.20" in dnsmasq and "--interface=bond0.30" not in dnsmasq
+    client.post(f"{url}/{pc['id']}/stop")
+    got = client.patch(f"{url}/{pc['id']}", json={"vlans": [{"id": 10, "address": "10.10.0.6/24"}, {"id": 11}]})
+    assert got.status_code == 200 and [v["id"] for v in got.json()["vlans"]] == [10, 11]
+    acts = [e["text"] for e in client.get("/api/activity", params={"lab": lab}).json()]
+    assert "changed PC1's VLANs" in acts
+    # Copied in the same lab, VLANs come along without their addresses.
+    r = client.post(f"/api/labs/{lab}/paste", json={"source_lab": lab, "nodes": [
+        {"ref": 1, "kind": "client", "role": "pc", "name": "PC1", "ports": 1, "vlans": got.json()["vlans"]}]}).json()
+    copy = next(n for n in client.get(f"/api/labs/{lab}").json()["nodes"] if n["id"] == r["nodes"][0]["id"])
+    assert copy["vlans"] == [{"id": 10, "nic": "eth0", "address": None}, {"id": 11, "nic": "eth0", "address": None}]
+
+
+def test_check_this_server(client, monkeypatch, tmp_path):
+    import dataclasses, subprocess
+    from mikrobox import selfcheck as sc
+    # In dry-run nothing on the machine is looked at.
+    r = client.get("/api/system/check").json()
+    assert [c["title"] for c in r["checks"]] == ["Dry-run mode"]
+    assert client.post("/api/system/check/docker").json()["ok"] is False
+
+    # For real, with the machine stood in for: no bonding module, no tshark, no KVM.
+    calls = []
+    def fake_run(argv, timeout=10):
+        calls.append(argv)
+        bad = "bond" in argv and "add" in argv
+        return subprocess.CompletedProcess(argv, 1 if bad else 0, stdout="Docker version 29.9.3\n",
+                                           stderr="Error: Unknown device type.\n" if bad else "")
+    monkeypatch.setattr(sc, "_run", fake_run)
+    monkeypatch.setattr(sc.shutil, "which", lambda p: None if p in ("tshark", "ufw") else f"/usr/bin/{p}")
+    check = sc.SelfCheck(client.rt, (20000, 20999))
+    check.s = dataclasses.replace(client.rt.s, dry_run=False, kvm_device=tmp_path / "kvm")
+    got = {c["title"]: c for c in check.run()}
+    assert got["Hardware acceleration (KVM)"]["status"] == "fail"
+    assert got["Optional programs"]["status"] == "warn" and "tshark" in got["Optional programs"]["detail"]
+    assert got["Required programs"]["status"] == "ok"
+    assert got["Bonding (servers)"]["status"] == "fail" and got["Bonding (servers)"]["fix"] == "sudo modprobe bonding max_bonds=0"
+    assert got["VLANs (PCs and servers)"]["status"] == "ok" and got["Links between devices"]["status"] == "ok"
+    # The scratch namespace for those probes is always removed.
+    ns = next(c[3] for c in calls if c[:3] == ["ip", "netns", "add"])
+    assert ["ip", "netns", "del", ns] in calls
+
+    assert sc.ufw_web_ports("Status: inactive", 20000, 20999) is None
+    assert sc.ufw_web_ports("Status: active\n20000:20999/tcp ALLOW Anywhere", 20000, 20999) is True
+    assert sc.ufw_web_ports("Status: active\n22/tcp ALLOW Anywhere", 20000, 20999) is False
+
+
+def test_docker_test_runs_hello_world():
+    from mikrobox.selfcheck import run_hello
+    from mikrobox.docker import EngineError
+
+    class Stub:
+        def __init__(self, code=0, said=b"Hello from Docker!"):
+            self.code, self.said, self.calls = code, said, []
+        def call(self, method, path, body=None, timeout=8):
+            self.calls.append((method, path))
+            if path == "/containers/create":
+                return {"Id": "abc"}
+            if path.endswith("/json"):
+                return {"State": {"Running": False, "ExitCode": self.code}}
+            if "/logs" in path:
+                return self.said
+            return None
+
+    good = Stub()
+    assert run_hello(good, "hello-world")["status"] == "ok"
+    assert ("DELETE", "/containers/abc?force=1") in good.calls  # nothing left behind
+    bad = run_hello(Stub(code=1, said="exec /hello: operation not permitted"), "hello-world")
+    assert bad["status"] == "fail" and "not permitted" in bad["detail"]
+
+    class Broken(Stub):
+        def call(self, method, path, body=None, timeout=8):
+            raise EngineError("no such image")
+    assert run_hello(Broken(), "hello-world")["detail"] == "no such image"
+
+
 def test_links_and_management_address(client):
     lab = make_lab(client)
     r1 = add_node(client, lab, name="R1")

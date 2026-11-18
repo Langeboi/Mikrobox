@@ -115,6 +115,7 @@ class Net:
     def create_client(
         self, ns: str, ifaces: list[str], address: str | None, gateway: str | None,
         dns: str | None = None, bond: str | None = None, extra: list | None = None,
+        vlans: list | None = None,
     ) -> None:
         self.sh.run(["ip", "netns", "add", ns])
         # `ip netns exec` shows this file to the client as its /etc/resolv.conf.
@@ -157,6 +158,12 @@ class Net:
         for i, extra_addr in enumerate(extra or [], start=1):
             if extra_addr and i < len(ifaces) and primary == "eth0":
                 self.sh.run(["ip", "-n", ns, "addr", "add", extra_addr, "dev", f"eth{i}"])
+        for v in vlans or []:
+            # Tagged 802.1Q: the switch port on the other side carries this VLAN tagged.
+            self.sh.run(["ip", "-n", ns, "link", "add", "link", v.nic, "name", v.iface, "type", "vlan", "id", str(v.id)])
+            self.sh.run(["ip", "-n", ns, "link", "set", v.iface, "up"])
+            if v.address:
+                self.sh.run(["ip", "-n", ns, "addr", "add", v.address, "dev", v.iface])
         if gateway:
             self.sh.run(["ip", "-n", ns, "route", "add", "default", "via", gateway])
 

@@ -24,12 +24,13 @@ apt-get install -y --no-install-recommends \
   traceroute iputils-ping bash python3 python3-venv unzip curl ca-certificates \
   iperf3 dnsutils nmap mtr-tiny netcat-openbsd busybox iputils-arping tshark
 
-echo "==> Bonding for servers"
-# Servers bond their NICs inside their own namespace. max_bonds=0 stops the module from
-# making a bond0 on the VM itself when it loads.
+echo "==> Bonding and VLANs for PCs and servers"
+# Servers bond their NICs, and PCs and servers tag VLANs, inside their own namespaces.
+# max_bonds=0 stops the bonding module from making a bond0 on the VM itself.
 echo "options bonding max_bonds=0" > /etc/modprobe.d/mikrobox-bonding.conf
-echo bonding > /etc/modules-load.d/mikrobox-bonding.conf
+printf 'bonding\n8021q\n' > /etc/modules-load.d/mikrobox-bonding.conf
 modprobe bonding max_bonds=0 2>/dev/null || echo "    Could not load the bonding module; servers can't bond their NICs." >&2
+modprobe 8021q 2>/dev/null || echo "    Could not load the 8021q module; PCs and servers can't tag VLANs." >&2
 
 if [ "${WITH_DOCKER:-1}" != 0 ]; then
   echo "==> Installing Docker for Linux servers"
