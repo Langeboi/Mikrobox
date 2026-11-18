@@ -143,15 +143,16 @@ class ShellHub(Hub):
 
     keep_when_empty = False
 
-    def __init__(self, key: str, registry: dict, netns: str, name: str) -> None:
+    def __init__(self, key: str, registry: dict, netns: str, name: str, env: dict | None = None) -> None:
         super().__init__(key, registry)
         self.netns, self.name = netns, name
+        self.env = env or {}  # e.g. DOCKER_HOST for a PC with Docker
 
     async def open(self) -> None:
         self.master, slave = pty.openpty()
         self.proc = subprocess.Popen(
             ["ip", "netns", "exec", self.netns, "env", f"PS1={self.name}# ", "TERM=xterm-256color",
-             "bash", "--norc", "--noprofile", "-i"],
+             *[f"{k}={v}" for k, v in self.env.items()], "bash", "--norc", "--noprofile", "-i"],
             stdin=slave, stdout=slave, stderr=slave, close_fds=True, preexec_fn=_claim_tty,
         )
         os.close(slave)

@@ -17,6 +17,43 @@ class NodeKind(str, Enum):
     client = "client"
 
 
+class PortMap(BaseModel):
+    """A published port: host is the port on the PC, container the one inside."""
+
+    host: int = Field(ge=1, le=65535)
+    container: int = Field(ge=1, le=65535)
+    proto: Literal["tcp", "udp"] = "tcp"
+
+
+class ContainerSpec(BaseModel):
+    """A container saved with the lab, recreated on its PC when missing (see docker.py)."""
+
+    name: str = Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,62}$")
+    image: str = Field(min_length=1, max_length=255, pattern=r"^[A-Za-z0-9][A-Za-z0-9._/:@-]*$")
+    ports: list[PortMap] = Field(default_factory=list, max_length=16)
+    env: dict[str, str] = Field(default_factory=dict)
+    restart: bool = True  # start again with the PC
+    docker_socket: bool = False  # mount the PC's own Docker socket (Portainer and the like)
+
+    @field_validator("env")
+    @classmethod
+    def _check_env(cls, v: dict[str, str]) -> dict[str, str]:
+        for key in v:
+            if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]{0,127}", key):
+                raise ValueError(f"{key!r} is not a valid variable name")
+        return v
+
+    @field_validator("ports")
+    @classmethod
+    def _check_ports(cls, v: list[PortMap]) -> list[PortMap]:
+        seen = set()
+        for p in v:
+            if (p.host, p.proto) in seen:
+                raise ValueError(f"port {p.host}/{p.proto} is published twice")
+            seen.add((p.host, p.proto))
+        return v
+
+
 class Node(BaseModel):
     id: int
     kind: NodeKind
@@ -32,6 +69,8 @@ class Node(BaseModel):
     dns: Optional[str] = None  # one to three resolver addresses, comma separated
     addressing: Literal["static", "dhcp"] = "static"  # clients: fixed address, or ask DHCP
     services: list[Literal["web", "iperf", "dhcp", "dns"]] = Field(default_factory=list)  # clients only
+    docker: bool = False  # clients only: run a Docker engine on this PC
+    containers: list[ContainerSpec] = Field(default_factory=list, max_length=32)  # saved with the lab
     # Position on the topology canvas.
     x: float = 0
     y: float = 0

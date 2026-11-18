@@ -31,6 +31,7 @@ class Settings:
     netns_etc: Path = Path("/etc/netns")  # per-client resolv.conf lives here
     kvm_device: Path = Path("/dev/kvm")
     qemu_binary: str = "qemu-system-x86_64"
+    web_ports: tuple[int, int] = (20000, 20999)  # links that open lab pages in your browser
 
     extra: dict = field(default_factory=dict)
 
@@ -54,6 +55,9 @@ class Settings:
             kwargs["auth_enabled"] = False
         if env.get("MIKROBOX_CLOUD_MODE") in ("auto", "nat", "bridged"):
             kwargs["cloud_mode"] = env["MIKROBOX_CLOUD_MODE"]
+        if "MIKROBOX_WEB_PORTS" in env:
+            lo, _, hi = env["MIKROBOX_WEB_PORTS"].partition("-")
+            kwargs["web_ports"] = (int(lo), int(hi or lo))
         if "MIKROBOX_MAX_DEVICES" in env:
             kwargs["max_devices"] = min(128, int(env["MIKROBOX_MAX_DEVICES"]))
         return cls(**kwargs)

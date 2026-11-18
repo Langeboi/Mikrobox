@@ -20,6 +20,7 @@ from typing import Literal, Optional
 from fastapi import FastAPI, Query, Request, WebSocket
 from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
+from starlette.concurrency import run_in_threadpool
 from pydantic import BaseModel, Field, ValidationError
 
 from . import __version__, routeros, templates
@@ -34,8 +35,10 @@ from . import docs
 from .packets import Assembler
 from .packets import decode as decode_packet
 from .models import (
-    NAME_PATTERN, Annotation, Endpoint, Lab, Link, Node, NodeKind, default_chr_ram, free_id,
+    NAME_PATTERN, Annotation, ContainerSpec, Endpoint, Lab, Link, Node, NodeKind, default_chr_ram, free_id,
 )
+from .docker import EngineError
+from .weblinks import LinkError, WebLinks, parse_url, plain_ip
 from .runtime import Conflict, Invalid, NotFound, Runtime
 from .shell import CommandError
 from .store import Store
@@ -68,6 +71,19 @@ class NodeCreate(BaseModel):
     services: list[Literal["web", "iperf", "dhcp", "dns"]] = Field(default_factory=list)
     x: float = 0
     y: float = 0
+
+
+class DockerSwitch(BaseModel):
+    on: bool
+
+
+class WebLinkCreate(BaseModel):
+    lab: int
+    node: int
+    container: Optional[str] = None  # one of its published ports...
+    port: Optional[int] = None
+    url: Optional[str] = Field(default=None, max_length=2000)  # ...or any address the PC can reach
+    who: Literal["me", "anyone"] = "me"
 
 
 class NodeUpdate(BaseModel):
@@ -218,6 +234,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     events = Events()
     activity = Activity(settings.data_dir / "activity.jsonl", events)
+    weblinks = WebLinks(rt, settings.web_ports, on_change=lambda: events.publish({"t": "web"}))
     store.on_save = lambda: events.publish({"t": "labs"})
     backups.activity, backups.events = activity, events
 
@@ -241,7 +258,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         events.bind(asyncio.get_running_loop())
+        weblinks.bind(asyncio.get_running_loop())
         rt.ensure_host()
+        rt.resume()
         if not settings.dry_run:
             threading.Thread(target=backups.loop, daemon=True).start()
         yield
@@ -250,13 +269,14 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.state.rt = rt
     app.state.backups = backups
     app.state.events, app.state.activity = events, activity
+    app.state.weblinks = weblinks
     hubs: dict[str, consoles.Hub] = {}  # shared consoles, by "lab/node"
     presence: dict[str, dict] = {}  # browser tab -> who, where, when
     auth = Auth(settings.data_dir, enabled=settings.auth_enabled)
     app.state.auth = auth
     app.add_middleware(AuthMiddleware, auth=auth)
 
-    for exc, code in ((NotFound, 404), (Conflict, 409), (Invalid, 400), (CommandError, 500), (AuthError, 400),
+    for exc, code in ((NotFound, 404), (Conflict, 409), (Invalid, 400), (CommandError, 500), (AuthError, 400), (LinkError, 409),
                       (routeros.RouterError, 502)):
         def handler(request, e, code=code):
             return JSONResponse({"detail": str(e)}, status_code=code)
@@ -302,6 +322,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         view["console"] = f"/console?lab={lab.id}&node={node.id}"
         view["backup"] = backups.node_summary(lab, node)
         view["leased"] = rt.clients.leased(node) if view["running"] else None
+        view["docker_summary"] = rt.docker.summary(lab, node) if node.docker and view["running"] else None
         return view
 
     def check_client(node: Node) -> None:
@@ -309,6 +330,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         if node.kind != NodeKind.client:
             if node.addressing != "static" or node.services:
                 raise Invalid("addressing and services apply to clients only.")
+            if node.docker or node.containers:
+                raise Invalid("Docker runs on Linux clients only.")
             return
         if ("dhcp" in node.services or "dns" in node.services) and (node.addressing != "static" or not node.address):
             raise Invalid("A DHCP or DNS server needs a fixed address. Set one, or switch those off.")
@@ -922,6 +945,153 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         return Response(data, media_type="application/zip", headers={
             "Content-Disposition": f'attachment; filename="{lab.name}-documentation.zip"'})
 
+    # -- Docker on Linux clients ---------------------------------------------
+
+    def docker_pc(lab_id: int, node_id: int, running: bool = False):
+        lab = get_lab(lab_id)
+        node = get_node(lab, node_id)
+        if node.kind != NodeKind.client:
+            raise Invalid("Docker runs on Linux clients only.")
+        if running:
+            if not node.docker:
+                raise Conflict(f"Turn on Docker for {node.name} first.")
+            if not rt.node_running(node):
+                raise Conflict(f"Start {node.name} first.")
+            if not rt.docker.ready(node):
+                raise Conflict(f"Docker on {node.name} is still starting. Try again in a moment.")
+        return lab, node
+
+    @app.post("/api/labs/{lab_id}/nodes/{node_id}/docker")
+    def set_docker(lab_id: int, node_id: int, body: DockerSwitch):
+        """Docker on or off for a PC. Works while it runs: the engine starts or stops now."""
+        with rt.lock:
+            lab, node = docker_pc(lab_id, node_id)
+            if body.on and not rt.docker.available:
+                raise Conflict("Docker isn't installed on this server. Run the installer again to add it.")
+            if node.docker == body.on:
+                return rt.docker.containers(lab, node)
+            node.docker = body.on
+            store.save()
+            if rt.node_running(node):
+                rt.docker.start(lab, node) if body.on else rt.docker.stop(node)
+            activity.record(f"turned Docker {'on' if body.on else 'off'} for {node.name}", lab)
+            return rt.docker.containers(lab, node)
+
+    @app.get("/api/labs/{lab_id}/nodes/{node_id}/containers")
+    def list_containers(lab_id: int, node_id: int):
+        lab, node = docker_pc(lab_id, node_id)
+        return rt.docker.containers(lab, node)
+
+    @app.post("/api/labs/{lab_id}/nodes/{node_id}/containers", status_code=201)
+    def add_container(lab_id: int, node_id: int, spec: ContainerSpec):
+        """Save a container with the lab, and create and start it now if the PC runs."""
+        with rt.lock:
+            lab, node = docker_pc(lab_id, node_id)
+            if not node.docker:
+                raise Conflict(f"Turn on Docker for {node.name} first.")
+            names = {c.name for c in node.containers}
+            if rt.docker.ready(node):
+                names |= {r["name"] for r in rt.docker.containers(lab, node)["containers"]}
+            if spec.name in names:
+                raise Conflict(f"{node.name} already has a container called {spec.name}.")
+            node.containers.append(spec)
+            store.save()
+            if rt.docker.ready(node):
+                threading.Thread(target=rt.docker.ensure, args=(lab, node, spec), daemon=True).start()
+            activity.record(f"added container {spec.name} ({spec.image}) to {node.name}", lab)
+            return rt.docker.containers(lab, node)
+
+    @app.post("/api/labs/{lab_id}/nodes/{node_id}/containers/{name}/{action}")
+    def container_action(lab_id: int, node_id: int, name: str, action: Literal["start", "stop", "restart"]):
+        lab, node = docker_pc(lab_id, node_id, running=True)
+        spec = next((c for c in node.containers if c.name == name), None)
+        if spec and action == "start" and not any(r["name"] == name and r["state"] != "pending"
+                                                  for r in rt.docker.containers(lab, node)["containers"]):
+            threading.Thread(target=rt.docker.ensure, args=(lab, node, spec), daemon=True).start()
+        else:
+            try:
+                rt.docker.act(node, name, action)
+            except EngineError as e:
+                raise Conflict(str(e))
+        done = {"start": "started", "stop": "stopped", "restart": "restarted"}[action]
+        activity.record(f"{done} container {name} on {node.name}", lab)
+        return rt.docker.containers(lab, node)
+
+    @app.delete("/api/labs/{lab_id}/nodes/{node_id}/containers/{name}")
+    def remove_container(lab_id: int, node_id: int, name: str):
+        with rt.lock:
+            lab, node = docker_pc(lab_id, node_id)
+            saved = [c for c in node.containers if c.name != name]
+            was_saved = len(saved) != len(node.containers)
+            node.containers = saved
+            store.save()
+            if rt.docker.ready(node):
+                try:
+                    rt.docker.act(node, name, "remove")
+                except EngineError as e:
+                    if not was_saved:
+                        raise Conflict(str(e))
+            activity.record(f"removed container {name} from {node.name}", lab, kind="danger")
+            return rt.docker.containers(lab, node)
+
+    @app.get("/api/labs/{lab_id}/nodes/{node_id}/containers/{name}/logs")
+    def container_logs(lab_id: int, node_id: int, name: str, tail: int = 400):
+        lab, node = docker_pc(lab_id, node_id, running=True)
+        try:
+            return {"text": rt.docker.logs(node, name, max(1, min(tail, 5000)))}
+        except EngineError as e:
+            raise Conflict(str(e))
+
+    # -- links that open lab pages in your browser ------------------------------
+
+    @app.get("/api/web")
+    def list_links(request: Request, lab: Optional[int] = None):
+        host = request.url.hostname or "localhost"
+        return [l.view(host) for l in weblinks.links.values() if lab is None or l.lab == lab]
+
+    @app.post("/api/web", status_code=201)
+    async def open_link(body: WebLinkCreate, request: Request):
+        lab = get_lab(body.lab)
+        node = get_node(lab, body.node)
+        if node.kind != NodeKind.client:
+            raise Invalid("Pages are opened from a Linux client. Pick one.")
+        if not rt.node_running(node):
+            raise Conflict(f"Start {node.name} first.")
+        if body.container:
+            rows = (await run_in_threadpool(rt.docker.containers, lab, node))["containers"]
+            row = next((r for r in rows if r["name"] == body.container), None)
+            if row is None:
+                raise NotFound(f"{node.name} has no container called {body.container}.")
+            ports = [p for p in row["ports"] if p["proto"] == "tcp" and body.port in (None, p["host"])]
+            if not ports or not row["running"]:
+                raise Conflict(f"{body.container} is not running with a published TCP port.")
+            host, port, scheme, path = "127.0.0.1", ports[0]["host"], None, "/"
+            title = f"{body.container} · {row['image'].split('/')[-1].split(':')[0]}"
+            detail = f"Container on {node.name}, port {port}"
+        elif body.url:
+            scheme, name, port, path = parse_url(body.url)
+            host = await run_in_threadpool(weblinks.resolve, node.id, name)
+            default = (scheme == "http" and port == 80) or (scheme == "https" and port == 443)
+            title = f"{scheme}://{name}" + ("" if default else f":{port}")
+            detail = f"From {node.name}"
+        else:
+            raise Invalid("Say what to open: a container, or an address.")
+        allow = None if body.who == "anyone" else plain_ip(request.client.host if request.client else None)
+        user = (request.scope.get("state") or {}).get("user") or ""
+        link = await weblinks.open(lab=lab, node=node, title=title, detail=detail, host=host, port=port,
+                                   scheme=scheme, path=path, allow=allow, by=user)
+        activity.record(f"opened a link to {title} from {node.name}" + (" for anyone" if not allow else ""), lab)
+        return link.view(request.url.hostname or "localhost")
+
+    @app.delete("/api/web/{link_id}", status_code=204)
+    def close_link(link_id: int):
+        link = weblinks.close(link_id)
+        if link is None:
+            raise NotFound("That link is already closed.")
+        lab = store.state.lab(link.lab)
+        if lab:
+            activity.record(f"closed the link to {link.title}", lab)
+
     @app.post("/api/labs/{lab_id}/nodes/{node_id}/test")
     def reach_test(lab_id: int, node_id: int, body: ReachTest):
         """Run ping or traceroute from a client."""
@@ -1198,7 +1368,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             if node.kind == NodeKind.chr:
                 await consoles.join(hubs, key, lambda: consoles.SerialHub(key, hubs, rt.serial_socket(node)), ws, user)
             else:
-                await consoles.join(hubs, key, lambda: consoles.ShellHub(key, hubs, rt.netns(node.id), node.name), ws, user)
+                env = {"DOCKER_HOST": rt.docker.docker_host(node)} if node.docker else {}
+                await consoles.join(hubs, key, lambda: consoles.ShellHub(key, hubs, rt.netns(node.id), node.name, env), ws, user)
         except OSError as e:
             await ws.send_text(f"\r\nConsole unavailable: {e}\r\n")
         try:
