@@ -13,6 +13,7 @@ available through the API (interactive docs at `/docs`).
 - Per router: name, number of ports (1-24), vCPUs and RAM.
 - A Switch device: a CHR with 24 ports and its own icon, for when you want one as a switch.
 - Links between any two ports. Frames pass untouched, so STP, LACP and LLDP/MNDP work.
+  Use the Link tool, or hold Ctrl (⌘ on a Mac) and drag from one device to another.
 - A Cloud that gives linked devices internet and makes them reachable from your PC,
   either through the VM (NAT) or directly on your own network (bridged).
 - A browser workspace with a topology canvas (pan, zoom, snap), device settings and docked consoles.

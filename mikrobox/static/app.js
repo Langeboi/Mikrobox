@@ -41,7 +41,7 @@ const icon = (name) => s("svg", { class: "icon", viewBox: "0 0 24 24", "aria-hid
 
 const TOOLS = [
   { id: "select", label: "Select", tip: "Select, move and pan" },
-  { id: "link", label: "Link", tip: "Connect two ports" },
+  { id: "link", label: "Link", tip: "Connect two ports. Shortcut: Ctrl+drag from one device to another" },
   null,
   { id: "chr", label: "Router", tip: "Add a MikroTik CHR router", add: true },
   { id: "switch", label: "Switch", tip: "Add a CHR with 24 ports to use as a switch", add: true },
@@ -523,7 +523,15 @@ function renderCanvas() {
     if (a.kind === "text" || a.kind === "note") world.append(annoElement(a, isSel("anno", a.id)));
   }
 
-  const cls = (ref, extra) => "node" + (extra || "") + (sameRef(state.sel, ref) ? " sel" : "") + (sameRef(state.linkFrom, ref) ? " from" : "");
+  // A link being dragged out with Ctrl: a dashed line to the pointer, or to the device under it.
+  const linking = drag && drag.kind === "link" && drag.moved ? drag : null;
+  if (linking) {
+    const B = linking.target ? refPoint(linking.target) : { x: linking.x, y: linking.y };
+    world.append(s("line", { class: "rubber", x1: linking.x0, y1: linking.y0, x2: B.x, y2: B.y }));
+  }
+
+  const cls = (ref, extra) => "node" + (extra || "") + (sameRef(state.sel, ref) ? " sel" : "") + (sameRef(state.linkFrom, ref) ? " from" : "")
+    + (linking && sameRef(linking.target, ref) ? " target" : "");
   const handlers = (ref) => ({
     tabindex: 0,
     onpointerdown: (e) => nodeDown(e, ref),
@@ -584,6 +592,15 @@ function nodeDown(e, ref) {
   e.preventDefault();
   e.stopPropagation();
   if (state.tool === "link") { linkClick(ref); return; }
+  // Ctrl (or ⌘ on a Mac) and drag from a device draws a link to where it is dropped.
+  if ((e.ctrlKey || e.metaKey) && state.tool === "select") {
+    const p = point(e), at = refPoint(ref);
+    drag = { kind: "link", from: ref, x0: at.x, y0: at.y, sx: p.x, sy: p.y, x: p.x, y: p.y, target: null, moved: false };
+    state.linkFrom = ref;
+    $("#canvas").classList.add("linking");
+    renderCanvas();
+    return;
+  }
   // Double click on a device opens its console. Tracked by hand because the
   // canvas is redrawn on the first click, which swallows the native event.
   const now = Date.now();
@@ -642,6 +659,11 @@ window.addEventListener("pointermove", (e) => {
     } else if (drag.kind === "resize") {
       const a = annoById(drag.id);
       a.w = Math.max(40, snap(p.x - a.x)); a.h = Math.max(24, snap(p.y - a.y));
+    } else if (drag.kind === "link") {
+      if (!drag.moved && Math.hypot(p.x - drag.sx, p.y - drag.sy) < 6) return;  // still a click
+      drag.x = p.x; drag.y = p.y;
+      const t = refAt(p);
+      drag.target = t && !sameRef(t, drag.from) ? t : null;
     }
   }
   drag.moved = true;
@@ -656,11 +678,38 @@ window.addEventListener("pointerup", () => {
   const fail = (err) => toast(err.message, true);
   if (d.kind === "pan") { if (d.moved) saveView(); return; }
   if (d.kind === "draw") { finishDraw(d); return; }
+  if (d.kind === "link") { finishLink(d); return; }
   if (!d.moved) return;
   if (d.kind === "mgmt") api("PATCH", labPath(), { mgmt_x: state.lab.mgmt_x, mgmt_y: state.lab.mgmt_y }).catch(fail);
   else if (d.kind === "node") { const n = nodeById(d.id); api("PATCH", `${labPath()}/nodes/${n.id}`, { x: n.x, y: n.y }).catch(fail); }
   else { const a = annoById(d.id); api("PATCH", `${labPath()}/annotations/${a.id}`, { x: a.x, y: a.y, w: a.w, h: a.h }).catch(fail); }
 });
+
+// Where a device or the Cloud sits, and which one is under a point on the canvas.
+function refPoint(ref) {
+  return ref.type === "mgmt" ? { x: state.lab.mgmt_x, y: state.lab.mgmt_y } : nodeById(ref.id);
+}
+function refAt(p) {
+  const lab = state.lab;
+  const n = lab.nodes.find((m) => Math.abs(p.x - m.x) <= 36 && Math.abs(p.y - m.y) <= 36);
+  if (n) return { type: "node", id: n.id };
+  if (Math.abs(p.x - lab.mgmt_x) <= 50 && Math.abs(p.y - lab.mgmt_y) <= 36) return { type: "mgmt", id: 0 };
+  return null;
+}
+
+function finishLink(d) {
+  $("#canvas").classList.remove("linking");
+  if (!d.moved) {
+    // A plain Ctrl+click: carry on as with the Link tool, the next device clicked completes it.
+    setTool("link");
+    state.linkFrom = d.from;
+    render(true);
+    return;
+  }
+  state.linkFrom = null;
+  if (d.target) linkDialog(d.from, d.target);
+  else render(true);
+}
 
 function finishDraw(d) {
   drag = d;
@@ -678,6 +727,9 @@ function finishDraw(d) {
     state.sel = { type: "anno", id: a.id };
   }).then(() => { const t = $("#i-text"); if (t) t.focus(); });
 }
+
+// On a Mac, Ctrl+click is also a right click; the link shortcut should not open a menu.
+$("#canvas").addEventListener("contextmenu", (e) => { if (e.ctrlKey) e.preventDefault(); });
 
 $("#canvas").addEventListener("wheel", (e) => {
   e.preventDefault();
@@ -714,6 +766,8 @@ function linkDialog(r1, r2) {
       state.linkFrom = null;
     },
     () => setTool("select"));
+  // The first free ports are already chosen: Enter takes them, Tab reaches the lists.
+  $("#modal-ok").focus();
 }
 
 // -------------------------------------------------------------- modal
@@ -2198,7 +2252,12 @@ $("#settings").addEventListener("click", () => {
 window.addEventListener("keydown", (e) => {
   const typing = ["INPUT", "TEXTAREA", "SELECT"].includes(document.activeElement && document.activeElement.tagName);
   if (e.key === "Escape") {
-    if (!$("#modal").hidden) $("#modal-cancel").click();
+    if (drag && drag.kind === "link") {  // drop the link being dragged out
+      drag = null;
+      state.linkFrom = null;
+      $("#canvas").classList.remove("linking");
+      render(true);
+    } else if (!$("#modal").hidden) $("#modal-cancel").click();
     else if (state.tool !== "select") setTool("select");
     else if (state.sel) select(null);
     closeMenus();
