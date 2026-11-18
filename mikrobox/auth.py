@@ -22,6 +22,7 @@ import threading
 import time
 from http.cookies import SimpleCookie
 from pathlib import Path
+from urllib.parse import urlsplit
 
 from .events import CURRENT_USER
 
@@ -133,20 +134,24 @@ class Auth:
 
     # -- sessions --------------------------------------------------------
 
-    def new_session(self, name: str) -> str:
+    def new_session(self, name: str, ip: str | None = None) -> str:
+        """A sign-in, good only from the address it was made from: a copy of the cookie
+        (a lab page can be sent it, see from_elsewhere) is no use anywhere else."""
         token = secrets.token_urlsafe(32)
         now = time.time()
         with self.lock:
             self.sessions = {k: v for k, v in self.sessions.items() if v["expires"] > now}
-            self.sessions[_digest(token)] = {"user": name.lower(), "expires": now + SESSION_SECONDS}
+            self.sessions[_digest(token)] = {"user": name.lower(), "expires": now + SESSION_SECONDS, "ip": client_ip(ip)}
             self._save(self.sessions_file, self.sessions)
         return token
 
-    def session_user(self, token: str | None) -> str | None:
+    def session_user(self, token: str | None, ip: str | None = None) -> str | None:
         if not token:
             return None
         s = self.sessions.get(_digest(token))
         if not s or s["expires"] < time.time():
+            return None
+        if s.get("ip") and s["ip"] != client_ip(ip):
             return None
         user = self.users.get(s["user"])
         return user["name"] if user else None
@@ -170,8 +175,8 @@ class Auth:
             return None
         return jar[self.cookie].value if self.cookie in jar else None
 
-    def user_from_headers(self, headers: dict[bytes, bytes]) -> str | None:
-        user = self.session_user(self.cookie_token(headers))
+    def user_from_headers(self, headers: dict[bytes, bytes], ip: str | None = None) -> str | None:
+        user = self.session_user(self.cookie_token(headers), ip)
         if user:
             return user
         basic = headers.get(b"authorization", b"")
@@ -184,6 +189,41 @@ class Auth:
         return None
 
 
+UNSAFE = {"POST", "PUT", "PATCH", "DELETE"}
+
+
+def client_ip(addr: str | None) -> str | None:
+    if not addr:
+        return None
+    return addr[7:] if addr.startswith("::ffff:") else addr
+
+
+def scope_ip(scope) -> str | None:
+    client = scope.get("client")
+    return client_ip(client[0]) if client else None
+
+
+def from_elsewhere(scope) -> bool:
+    """A browser request that another page made: refused, so that pages in the lab, which
+    web links serve from this same machine on other ports, can't act with your sign-in.
+
+    Cookies don't tell ports apart, and to SameSite those pages count as this site, so
+    the cookie alone doesn't protect: changes and websockets must come from this page.
+    Requests from scripts and tools (no Origin, no Sec-Fetch-Site) are not affected.
+    """
+    if scope["type"] == "http" and scope.get("method", "GET") not in UNSAFE:
+        return False
+    headers = {k.decode("latin-1").lower(): v.decode("latin-1") for k, v in scope.get("headers") or []}
+    site = headers.get("sec-fetch-site")
+    if site in ("same-site", "cross-site"):
+        return True
+    origin = headers.get("origin")
+    if origin is None:
+        return False
+    hosts = {headers.get("host"), headers.get("x-forwarded-host")} - {None}
+    return origin == "null" or urlsplit(origin).netloc not in hosts
+
+
 class AuthMiddleware:
     """Everything except the sign-in page and its API needs a signed-in account."""
 
@@ -194,12 +234,23 @@ class AuthMiddleware:
         self.auth = auth
 
     async def __call__(self, scope, receive, send):
+        if scope["type"] in ("http", "websocket") and from_elsewhere(scope):
+            if scope["type"] == "websocket":
+                await receive()
+                await send({"type": "websocket.close", "code": 4403})
+                return
+            body = b'{"detail":"Only Mikrobox\'s own pages can do that."}'
+            await send({"type": "http.response.start", "status": 403,
+                        "headers": [(b"content-type", b"application/json"),
+                                    (b"content-length", str(len(body)).encode())]})
+            await send({"type": "http.response.body", "body": body})
+            return
         if scope["type"] not in ("http", "websocket") or not self.auth.enabled:
             return await self.app(scope, receive, send)
         path = scope["path"]
         if path in self.PUBLIC or path.startswith(("/static/", "/api/auth/")):
             return await self.app(scope, receive, send)
-        user = self.auth.user_from_headers(dict(scope.get("headers") or []))
+        user = self.auth.user_from_headers(dict(scope.get("headers") or []), scope_ip(scope))
         if user:
             scope.setdefault("state", {})["user"] = user
             token = CURRENT_USER.set(user)  # so the activity log knows who did it

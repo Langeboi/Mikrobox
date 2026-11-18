@@ -2060,6 +2060,41 @@ def test_link_only_for_me_and_closing(client, pages, lab_pc):
     assert f"opened a link to http://127.0.0.1:{pages['http']} from PC1 for anyone" in acts
 
 
+def test_pages_in_the_lab_cannot_act_with_your_sign_in(client):
+    # Web links serve lab pages from this machine on other ports: to the browser, the same
+    # site. Changes and websockets must come from Mikrobox's own page.
+    lab = make_lab(client)
+    own = {"Origin": "http://testserver", "Sec-Fetch-Site": "same-origin"}
+    assert client.post("/api/labs", json={"name": "ok"}, headers=own).status_code == 201
+    assert client.post("/api/labs", json={"name": "cli"}).status_code == 201  # tools send neither header
+    for headers in ({"Origin": "http://testserver:20000"}, {"Sec-Fetch-Site": "same-site"},
+                    {"Sec-Fetch-Site": "cross-site", "Origin": "http://evil.example"}, {"Origin": "null"}):
+        r = client.post("/api/labs", json={"name": "nope"}, headers=headers)
+        assert r.status_code == 403, headers
+        assert client.delete(f"/api/labs/{lab}", headers=headers).status_code == 403
+    assert client.get(f"/api/labs/{lab}", headers={"Origin": "http://testserver:20000"}).status_code == 200  # reading is fine
+    assert client.post("/api/labs", json={"name": "proxied"}, headers={"Origin": "https://lab.example", "X-Forwarded-Host": "lab.example"}).status_code == 201
+    from starlette.websockets import WebSocketDisconnect
+    with pytest.raises(WebSocketDisconnect) as e:
+        with client.websocket_connect("/api/events", headers={"Origin": "http://testserver:20000"}) as ws:
+            ws.receive_json()
+    assert e.value.code == 4403
+    with client.websocket_connect("/api/events", headers={"Origin": "http://testserver"}) as ws:
+        assert ws.receive_json()["t"] == "hello"
+
+
+def test_a_sign_in_works_only_from_where_it_was_made(tmp_path):
+    from mikrobox.auth import Auth
+    auth = Auth(tmp_path)
+    auth.create_user("mla", "lab-password-1")
+    token = auth.new_session("mla", "192.168.1.20")
+    assert auth.session_user(token, "192.168.1.20") == "mla"
+    assert auth.session_user(token, "::ffff:192.168.1.20") == "mla"
+    assert auth.session_user(token, "10.99.1.5") is None  # a copy of the cookie, used from the lab
+    old = auth.new_session("mla")  # sessions from before this check keep working
+    assert auth.session_user(old, "10.99.1.5") == "mla"
+
+
 def test_link_addresses_and_ports(client, lab_pc, monkeypatch):
     from mikrobox.weblinks import LinkError, parse_url
     assert parse_url("10.0.0.1") == ("http", "10.0.0.1", 80, "/")

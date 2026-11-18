@@ -26,7 +26,7 @@ from pydantic import BaseModel, Field, ValidationError
 from . import __version__, routeros, templates
 from . import clients as clients_mod
 from .backup import INTERVALS, Backups
-from .auth import MIN_PASSWORD, SESSION_SECONDS, Auth, AuthError, AuthMiddleware
+from .auth import MIN_PASSWORD, SESSION_SECONDS, Auth, AuthError, AuthMiddleware, scope_ip
 from .config import Settings
 from . import console as consoles
 from .activity import Activity
@@ -388,8 +388,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     # -- accounts --------------------------------------------------------
 
-    def signed_in(response: JSONResponse, name: str) -> JSONResponse:
-        response.set_cookie(auth.cookie, auth.new_session(name), max_age=SESSION_SECONDS,
+    def signed_in(response: JSONResponse, name: str, request: Request) -> JSONResponse:
+        response.set_cookie(auth.cookie, auth.new_session(name, scope_ip(request.scope)), max_age=SESSION_SECONDS,
                             httponly=True, samesite="lax", path="/")
         return response
 
@@ -402,22 +402,22 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @app.get("/api/auth/status")
     def auth_status(request: Request):
-        user = auth.user_from_headers(dict(request.scope["headers"])) if auth.enabled else None
+        user = auth.user_from_headers(dict(request.scope["headers"]), scope_ip(request.scope)) if auth.enabled else None
         return {"enabled": auth.enabled, "setup_needed": auth.enabled and not auth.users, "user": user,
                 "label": settings.label, "version": __version__, "min_password": MIN_PASSWORD}
 
     @app.post("/api/auth/setup")
-    def auth_setup(body: Login):
+    def auth_setup(body: Login, request: Request):
         """Create the very first account. Refused once any account exists."""
         with auth.lock:
             if auth.users:
                 raise Conflict("An account already exists. Sign in instead.")
             name = auth.create_user(body.username, body.password)
         activity.record("created the first account", user=name)
-        return signed_in(JSONResponse({"user": name}), name)
+        return signed_in(JSONResponse({"user": name}), name, request)
 
     @app.post("/api/auth/login")
-    def auth_login(body: Login):
+    def auth_login(body: Login, request: Request):
         name = auth.verify(body.username, body.password)
         if name is None:
             known = body.username.lower() in auth.users
@@ -426,7 +426,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                             kind="danger", user=body.username[:32] if known else "someone")
             return JSONResponse({"detail": "Wrong username or password."}, status_code=401)
         activity.record("signed in", user=name)
-        return signed_in(JSONResponse({"user": name}), name)
+        return signed_in(JSONResponse({"user": name}), name, request)
 
     @app.post("/api/auth/logout")
     def auth_logout(request: Request):
