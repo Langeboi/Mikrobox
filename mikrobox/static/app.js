@@ -2161,9 +2161,10 @@ function openWebDialog(pre = {}) {
   const anyone = h("input", { id: "w-any", type: "radio", name: "w-who" });
   const inTab = h("input", { id: "w-tab", type: "radio", name: "w-how", checked: pre.mode !== "link" });
   const inBrowser = h("input", { id: "w-browser", type: "radio", name: "w-how", checked: pre.mode === "link" });
+  const gwd = viaDomain();
   const who = h("fieldset", { class: "who-can" }, h("legend", {}, "Who can use the link"),
-    h("div", { class: "field check" }, me, h("label", { for: "w-me" }, "Only this computer")),
-    h("div", { class: "field check" }, anyone, h("label", { for: "w-any" }, "Anyone who can reach Mikrobox")));
+    h("div", { class: "field check" }, me, h("label", { for: "w-me" }, gwd ? "Only the browser that opens it first" : "Only this computer")),
+    h("div", { class: "field check" }, anyone, h("label", { for: "w-any" }, gwd ? "Anyone with the link" : "Anyone who can reach Mikrobox")));
   const how = () => {
     who.hidden = inTab.checked;
     $("#modal-ok").textContent = inTab.checked ? "Open tab" : "Make link";
@@ -2208,10 +2209,14 @@ function openWebDialog(pre = {}) {
         h("code", { class: "mono" }, link.url),
         h("button", { type: "button", onclick: () => copyText(link.url) }, "Copy"),
         h("a", { class: "button primary", href: link.url, target: "_blank", rel: "noopener" }, "Open", svgIcon("out", 13))),
-      h("span", { class: "hint" }, (https
+      h("span", { class: "hint" }, (link.gateway
+        ? `Through ${gwd}, over HTTPS with its certificate. Mikrobox fetches the page from the lab${https ? " without checking the page's own certificate" : ""}.`
+        : https
         ? "HTTPS passes straight through, so you see the page's own certificate. A self-signed one gets a browser warning; that is expected."
         : "Plain HTTP, exactly as the page serves it.")
-        + (link.who === "me" ? ` Only ${link.allow} can use this link.` : " Anyone who can reach this server can use this link.")));
+        + (link.gateway
+          ? (link.who === "me" ? " The first browser that opens it keeps it; anyone else is turned away." : " Anyone with the link can use it.")
+          : link.who === "me" ? ` Only ${link.allow} can use this link.` : " Anyone who can reach this server can use this link.")));
     result.hidden = false;
     $("#modal-ok").hidden = true;
     $("#modal-cancel").textContent = "Close";
@@ -2252,6 +2257,9 @@ function buildViewer(key, link, target) {
   const overlay = h("div", { class: "vw-overlay", hidden: true });
   const secure = link.scheme === "https";
   const v = { link, frame, addr, overlay, target: { node: target.node, container: target.container, port: target.port, url: target.url } };
+  // Through your domain the first request brings the link's key, which it keeps as a cookie.
+  const entry = (path) => (v.link.enter ? v.link.enter + encodeURIComponent(path) : v.link.base + path);
+  v.outside = () => { const u = new URL(v.last); return entry(u.pathname + u.search); };
   v.go = (path) => {
     overlay.hidden = true;
     v.trouble = false;
@@ -2260,8 +2268,9 @@ function buildViewer(key, link, target) {
     v.hits0 = v.link.hits || 0;
     v.refused0 = v.link.refused || 0;
     addr.value = v.link.target + path;
-    frame.src = v.last = v.link.base + path;
-    if (location.protocol === "https:") viewerTrouble(v, v.link, "https");
+    frame.src = entry(path);
+    v.last = v.link.base + path;
+    if (location.protocol === "https:" && !v.link.gateway) viewerTrouble(v, v.link, "https");
   };
   const navigate = () => act(async () => {
     const text = addr.value.trim();
@@ -2284,7 +2293,7 @@ function buildViewer(key, link, target) {
     addr,
     h("span", { class: "vw-from" }, `from ${link.node_name}`),
     h("button", { type: "button", class: "icon-btn", title: "Open in a browser tab", "aria-label": "Open in a browser tab",
-      onclick: () => window.open(v.last, "_blank", "noopener") }, svgIcon("out")),
+      onclick: () => window.open(v.outside(), "_blank", "noopener") }, svgIcon("out")),
     h("button", { type: "button", class: "icon-btn", title: "Make the panel taller", "aria-label": "Make the panel taller",
       onclick: () => setDockHeight(window.innerHeight * 0.8) }, svgIcon("tall")));
   const pane = h("div", { class: "pv viewer" }, bar, h("div", { class: "vw-body" }, frame, overlay));
@@ -2328,34 +2337,74 @@ function webPorts() {
 // port forwarding), it came from another address than Mikrobox sees, or Mikrobox is on HTTPS.
 function viewerTrouble(v, link, why) {
   const [a, b] = webPorts();
+  const sys = state.sys || {};
+  const d = sys.web_domain, gw = sys.gateway_port;
   v.trouble = why;
-  const text = {
+  const text = link.gateway ? {
+    unreachable: [`Your browser can't reach ${new URL(link.base).host}`,
+      `Through ${d}, each viewer tab has a name of its own, and nothing has arrived from your browser on it. `
+      + `It takes a proxied DNS record for *.${d}, and a rule in your reverse proxy that sends *.${d} to port ${gw} on this VM, with websockets on. `
+      + "Check this server (Tools) tests it."],
+    refused: ["The viewer didn't let your browser in",
+      `It lets in the browser that brings its key, and keeps it in a cookie for ${new URL(link.base).host}. Allow cookies for ${d}, then try again.`],
+  }[why] : {
     unreachable: [`Your browser can't reach port ${link.port} on the VM`,
       `The page comes through ports ${a}-${b} on the VM, and nothing has arrived from your browser on port ${link.port}. `
       + `A firewall on the VM, or a reverse proxy or port forwarding that only passes port ${location.port || (location.protocol === "https:" ? 443 : 80)}, is the usual reason. `
-      + "Behind a reverse proxy, open Mikrobox at the VM's own address on your network for viewer tabs. "
+      + "Behind a reverse proxy, set a domain for links in Settings, or open Mikrobox at the VM's own address. "
       + "Check this server (Tools) tests it."],
     refused: ["The viewer turned your browser away",
       `It answers only ${link.allow}, the address Mikrobox sees for you, but your browser came from ${link.refused_ip}. `
       + "A proxy, VPN or NAT between you and the VM changes your address."],
-    https: ["Viewer tabs need Mikrobox on plain HTTP",
-      `You opened Mikrobox over HTTPS, and browsers block plain HTTP pages inside HTTPS ones. Viewer tabs also come through ports ${a}-${b}, which a reverse proxy or Cloudflare doesn't pass. Open Mikrobox over http:// at the VM's own address on your network.`],
+    https: ["Viewer tabs need Mikrobox on plain HTTP here",
+      `You opened Mikrobox over HTTPS, and browsers block plain HTTP pages inside HTTPS ones. Viewer tabs also come through ports ${a}-${b}, which a reverse proxy or Cloudflare doesn't pass. `
+      + (d ? `Open Mikrobox through ${d} instead, where viewer tabs use HTTPS too, or over http:// at the VM's own address.`
+        : "Set a domain for links in Settings to use HTTPS through your reverse proxy, or open Mikrobox over http:// at the VM's own address.")],
   }[why];
-  v.overlay.replaceChildren(
+  v.overlay.replaceChildren(...[
     h("strong", {}, text[0]),
     h("span", {}, text[1]),
-    why === "unreachable" && copyRow(`sudo ufw allow ${a}:${b}/tcp`),
+    why === "unreachable" && copyRow(link.gateway ? `sudo ufw allow ${gw}/tcp` : `sudo ufw allow ${a}:${b}/tcp`),
     h("div", { class: "row" },
       h("button", { type: "button", class: "primary", onclick: () => v.go(new URL(v.last).pathname + new URL(v.last).search) }, "Try again"),
-      h("button", { type: "button", onclick: () => window.open(v.last, "_blank", "noopener") }, "Open in a browser tab"),
-      why !== "https" && h("button", { type: "button", onclick: () => { v.trouble = "waiting"; v.overlay.hidden = true; } }, "Keep waiting")));
+      h("button", { type: "button", onclick: () => window.open(v.outside(), "_blank", "noopener") }, "Open in a browser tab"),
+      why !== "https" && h("button", { type: "button", onclick: () => { v.trouble = "waiting"; v.overlay.hidden = true; } }, "Keep waiting")),
+  ].filter(Boolean));
   v.overlay.hidden = false;
+}
+
+// Mikrobox opened through the domain set for links: links and viewer tabs go through it too.
+function viaDomain() {
+  const d = (state.sys && state.sys.web_domain) || "";
+  const host = location.hostname.toLowerCase();
+  return d && (host === d || host.endsWith("." + d)) ? d : "";
 }
 
 // Can this browser reach the link ports at all? A port from the range answers once.
 async function probeWebPorts() {
   const g = "Network", title = "Your browser and the link ports";
   const [a, b] = webPorts();
+  const d = viaDomain();
+  if (d) {
+    const t = `Your browser and links through ${d}`;
+    try {
+      const p = await api("POST", "/web/probe?gateway=1");
+      const host = new URL(p.url).host;
+      const ctl = new AbortController();
+      const timer = setTimeout(() => ctl.abort(), 8000);
+      let got = null;
+      try { got = await (await fetch(p.url, { signal: ctl.signal, cache: "no-store" })).json(); } catch (e) { got = null; }
+      clearTimeout(timer);
+      if (got && got.ok) {
+        return { group: g, title: t, status: "ok", fix: null, detail: `This browser reaches ${host} through DNS and your reverse proxy: links and viewer tabs open there, over HTTPS.` };
+      }
+      return { group: g, title: t, status: "fail", fix: null,
+        detail: `This browser can't reach ${host}. It takes a proxied DNS record for *.${d}, and a rule in your reverse proxy `
+          + `that sends *.${d} to port ${p.port} on this VM, keeping the Host header, with websockets on. The README shows how.` };
+    } catch (e) {
+      return { group: g, title: t, status: "warn", fix: null, detail: `Could not test: ${e.message}` };
+    }
+  }
   if (location.protocol === "https:") {
     return { group: g, title, status: "warn", fix: null,
       detail: "Mikrobox is open over HTTPS, so browsers block viewer tabs (plain HTTP inside HTTPS). Links still open in their own tab." };
@@ -2457,7 +2506,9 @@ async function loadWeb() {
       h("td", {}, h("div", { class: "url-cell" }, h("code", { class: "mono" }, l.url),
         h("button", { type: "button", class: "icon-btn", title: "Copy", "aria-label": `Copy the link to ${l.title}`, onclick: () => copyText(l.url) }, svgIcon("copy")),
         h("a", { class: "icon-btn", href: l.url, target: "_blank", rel: "noopener", title: "Open", "aria-label": `Open ${l.title}` }, svgIcon("out")))),
-      h("td", { class: l.who === "anyone" ? "anyone" : "" }, l.mode === "view" ? `Viewer tab, only ${l.allow}` : l.who === "anyone" ? "Anyone who can reach Mikrobox" : `Only ${l.allow}`),
+      h("td", { class: l.who === "anyone" ? "anyone" : "" }, l.mode === "view" ? (l.gateway ? "Viewer tab" : `Viewer tab, only ${l.allow}`)
+        : l.who === "anyone" ? (l.gateway ? "Anyone with the link" : "Anyone who can reach Mikrobox")
+        : l.gateway ? "The first browser that opened it" : `Only ${l.allow}`),
       h("td", {}, l.by || "someone"),
       h("td", { class: "sub" }, ago(l.used)),
       h("td", { class: "end" }, h("button", { type: "button", class: "small", "aria-label": `Close the link to ${l.title}`,
@@ -3488,6 +3539,11 @@ $("#settings").addEventListener("click", () => {
     { node: h("h2", {}, "New routers") },
     { key: "defPorts", label: "Default number of ports", type: "number", value: prefs.defPorts, min: 1, max: sys.max_chr_ports || 24 },
     { key: "defCpus", label: "Default vCPUs", type: "number", value: prefs.defCpus, min: 1, max: 8 },
+    { node: h("h2", {}, "Links through your domain") },
+    { key: "webDomain", label: "Domain", type: "text", value: sys.web_domain || "", placeholder: "example.com" },
+    { node: h("p", { class: "hint" }, "Behind a reverse proxy or Cloudflare: when you open Mikrobox through a name under this domain, "
+      + `links and viewer tabs get names like https://3f9c….${sys.web_domain || "example.com"}, over HTTPS, instead of ports. `
+      + `Your reverse proxy sends *.${sys.web_domain || "example.com"} to port ${sys.gateway_port || 8090} on this VM. Leave it empty to turn this off.`) },
     { node: h("h2", {}, "This server") },
     { node: h("dl", { class: "info" },
       row("Mikrobox", sys.version || "?"),
@@ -3499,6 +3555,10 @@ $("#settings").addEventListener("click", () => {
       row("API reference", h("a", { href: "/docs", target: "_blank", rel: "noopener" }, "/docs"))) },
     { node: h("button", { type: "button", onclick: () => checkDialog() }, "Check this server") },
   ], "Save", async (v) => {
+    if (v.webDomain !== (sys.web_domain || "")) {
+      const r = await api("PUT", "/system/web", { domain: v.webDomain });
+      state.sys = { ...state.sys, web_domain: r.web_domain };
+    }
     Object.assign(prefs, {
       theme: v.theme, grid: v.grid, snap: v.snap, labels: v.labels,
       defPorts: Math.min(sys.max_chr_ports || 24, Math.max(1, Number(v.defPorts) || 5)),

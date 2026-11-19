@@ -113,6 +113,13 @@ class DockerSwitch(BaseModel):
     on: bool
 
 
+class WebDomain(BaseModel):
+    domain: str = Field(max_length=253)  # "" turns links through a domain off
+
+
+DOMAIN_PATTERN = re.compile(r"^(?=.{4,253}$)([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z][a-z0-9-]{0,61}[a-z0-9]$")
+
+
 class WebLinkCreate(BaseModel):
     lab: int
     node: int
@@ -342,10 +349,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     events = Events()
     activity = Activity(settings.data_dir / "activity.jsonl", events)
-    weblinks = WebLinks(rt, settings.web_ports, on_change=lambda: events.publish({"t": "web"}))
+    weblinks = WebLinks(rt, settings.web_ports, on_change=lambda: events.publish({"t": "web"}),
+                        domain=lambda: store.state.web_domain)
     trash = Trash(settings.data_dir / "trash")
     trash.purge()
     selfcheck = SelfCheck(rt, settings.web_ports)
+    selfcheck.gateway = lambda: (weblinks.gateway_port, weblinks.gateway_error, store.state.web_domain)
     store.on_save = lambda: events.publish({"t": "labs"})
     backups.activity, backups.events = activity, events
 
@@ -372,6 +381,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     async def lifespan(app: FastAPI):
         events.bind(asyncio.get_running_loop())
         weblinks.bind(asyncio.get_running_loop())
+        await weblinks.start_gateway(settings.gateway_port)
         rt.ensure_host()
         rt.resume()
         if not settings.dry_run:
@@ -630,11 +640,31 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @app.get("/api/system")
     def system():
-        return {**rt.system_info(), "web_ports": list(settings.web_ports)}
+        return {**rt.system_info(), "web_ports": list(settings.web_ports), "web_domain": store.state.web_domain,
+                "gateway_port": weblinks.gateway_port or settings.gateway_port, "gateway_error": weblinks.gateway_error}
+
+    @app.put("/api/system/web")
+    def set_web_domain(body: WebDomain):
+        """The domain links go through when Mikrobox is opened through it (see weblinks.py)."""
+        domain = re.sub(r"^https?://", "", body.domain.strip().lower()).split("/")[0].rstrip(".")
+        domain = domain[2:] if domain.startswith("*.") else domain
+        if domain and not DOMAIN_PATTERN.match(domain):
+            raise Invalid("Enter a domain name like example.com, without http:// or a path.")
+        with rt.lock:
+            store.state.web_domain = domain
+            store.save()
+        return {"web_domain": domain}
 
     @app.post("/api/web/probe")
-    async def web_probe(request: Request):
-        """A port from the link range for the browser to fetch: can it reach them at all?"""
+    async def web_probe(request: Request, gateway: bool = False):
+        """A port from the link range for the browser to fetch: can it reach them at all?
+        With gateway, a name under the domain instead, through the reverse proxy."""
+        if gateway:
+            domain = store.state.web_domain
+            if not domain or weblinks.gateway_port is None:
+                raise Conflict("Links through a domain are off.")
+            return {"url": f"https://{weblinks.gate_probe()}.{domain}/.mikrobox/probe", "domain": domain,
+                    "port": weblinks.gateway_port}
         port = await weblinks.probe()
         host = request.url.hostname or "localhost"
         shown = f"[{host}]" if ":" in host else host
@@ -1444,10 +1474,13 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     # -- links that open lab pages in your browser ------------------------------
 
+    def link_view(link, request: Request) -> dict:
+        user = (request.scope.get("state") or {}).get("user") or ""
+        return link.view(request.url.hostname or "localhost", store.state.web_domain, mine=link.by == user)
+
     @app.get("/api/web")
     def list_links(request: Request, lab: Optional[int] = None):
-        host = request.url.hostname or "localhost"
-        return [l.view(host) for l in weblinks.links.values() if lab is None or l.lab == lab]
+        return [link_view(l, request) for l in weblinks.links.values() if lab is None or l.lab == lab]
 
     @app.post("/api/web", status_code=201)
     async def open_link(body: WebLinkCreate, request: Request):
@@ -1489,7 +1522,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         if link.id not in known:
             activity.record((f"viewed {title} in Mikrobox from {node.name}" if viewer else
                              f"opened a link to {title} from {node.name}" + (" for anyone" if not allow else "")), lab)
-        return link.view(request.url.hostname or "localhost")
+        return link_view(link, request)
 
     @app.delete("/api/web/{link_id}", status_code=204)
     def close_link(link_id: int):

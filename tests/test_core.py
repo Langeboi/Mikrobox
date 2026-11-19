@@ -21,6 +21,7 @@ def client(tmp_path: Path):
         netns_etc=tmp_path / "etcns",
         kvm_device=tmp_path / "kvm",
         web_ports=(42000, 42049),
+        gateway_port=0,  # any free port
     )
     (tmp_path / "sysnet").mkdir()
     (tmp_path / "netns").mkdir()
@@ -2288,7 +2289,8 @@ def app_pages(tmp_path):
                     if not data:
                         return
                     self.connection.sendall(data.upper())
-            seen = {k: self.headers[k] for k in ("Host", "Origin", "Referer", "Cookie", "Connection") if self.headers[k]}
+            seen = {k: self.headers[k] for k in ("Host", "Origin", "Referer", "Cookie", "Connection",
+                                                 "X-Forwarded-For", "CF-Connecting-IP") if self.headers[k]}
             self._answer(_j.dumps({"path": self.path, "headers": seen}).encode(), extra=[("Content-Type", "application/json")])
 
         def do_POST(self):
@@ -2385,6 +2387,91 @@ def test_viewer_passes_websockets_and_reports_unreachable_pages(client, app_page
     link.port = 1
     answer = _raw(view["port"], b"GET / HTTP/1.1\r\nHost: x\r\n\r\n").decode()
     assert answer.startswith("HTTP/1.1 502") and "could not reach http://127.0.0.1:1 from PC1" in answer
+
+
+def test_links_through_your_domain(client, app_pages, lab_pc):
+    """Behind a reverse proxy (and Cloudflare), links and viewer tabs get a name under the
+    domain instead of a port, and the gateway port serves them by that name."""
+    import json as _j, socket as _s
+    lab, pc, _ = lab_pc
+    gw = client.get("/api/system").json()["gateway_port"]
+    assert gw and client.get("/api/system").json()["web_domain"] == ""
+    assert client.put("/api/system/web", json={"domain": "https://*.Example.COM/"}).json() == {"web_domain": "example.com"}
+    assert client.put("/api/system/web", json={"domain": "not a domain"}).status_code == 400
+    page = app_pages["http"]
+    proxied = {"Host": "mikrobox.example.com"}
+    view = client.post("/api/web", json={"lab": lab, "node": pc["id"], "url": f"127.0.0.1:{page}/", "mode": "view"},
+                       headers=proxied).json()
+    label = view["base"].split("//")[1].split(".")[0]
+    host = f"{label}.example.com"
+    assert view["gateway"] and view["base"] == f"https://{host}" and len(label) == 20
+    key = view["enter"].split("k=")[1].split("&")[0]
+    assert view["enter"] == f"https://{host}/.mikrobox/enter?k={key}&to="
+    # Opened at the VM's own address, the same link is its port, as before.
+    plain = next(l for l in client.get("/api/web").json() if l["id"] == view["id"])
+    assert not plain["gateway"] and plain["base"].startswith("http://testserver:") and "enter" not in plain
+    https = 'CF-Visitor: {"scheme":"https"}\r\n'
+
+    def ask(path, extra=""):
+        return _raw(gw, f"GET {path} HTTP/1.1\r\nHost: {host}\r\n{https}{extra}\r\n".encode()).decode()
+
+    assert ask("/").startswith("HTTP/1.1 403")  # no key yet
+    assert ask(f"/.mikrobox/enter?k=wrong&to=/").startswith("HTTP/1.1 403")
+    answer = ask(f"/.mikrobox/enter?k={key}&to=%2Fhome%3Fx%3D1%0D%0AX-Bad%3A%201")
+    assert answer.startswith("HTTP/1.1 302") and "Location: /home?x=1%0D%0AX-Bad:%201\r\n" in answer
+    assert f"Set-Cookie: mikrobox_link={key}; Path=/; HttpOnly; SameSite=Lax; Secure\r\n" in answer
+    # With the cookie: the page, as if asked directly. The proxy's headers and Mikrobox's cookie stay here.
+    answer = ask("/api", f"Origin: https://{host}\r\nReferer: https://{host}/page\r\nCookie: mikrobox_link={key}; app=1\r\n"
+                         "X-Forwarded-For: 203.0.113.9\r\nCF-Connecting-IP: 203.0.113.9\r\n")
+    head, body = answer.split("\r\n\r\n", 1)
+    assert _j.loads(body)["headers"] == {"Host": f"127.0.0.1:{page}", "Origin": f"http://127.0.0.1:{page}",
+                                         "Referer": f"http://127.0.0.1:{page}/page", "Cookie": "app=1", "Connection": "close"}
+    assert "Cloudflare-CDN-Cache-Control: no-store\r\n" in head and "X-Frame-Options" not in head
+    assert f"Location: https://{host}/home?x=1\r\n" in ask("/login", f"Cookie: mikrobox_link={key}\r\n")
+    # Websockets go through too.
+    c = _s.create_connection(("127.0.0.1", gw), timeout=5)
+    c.sendall(f"GET /ws HTTP/1.1\r\nHost: {host}\r\nCookie: mikrobox_link={key}\r\nConnection: Upgrade\r\nUpgrade: echo\r\n\r\n".encode())
+    got = b""
+    while b"\r\n\r\n" not in got:
+        got += c.recv(1000)
+    assert got.startswith(b"HTTP/1.1 101")
+    c.sendall(b"ping")
+    assert c.recv(100) == b"PING"
+    c.close()
+    assert next(l for l in client.get("/api/web").json() if l["id"] == view["id"])["hits"] >= 4
+
+    # A link for "me": its address carries the key, and the first browser to open it keeps it.
+    mine = client.post("/api/web", json={"lab": lab, "node": pc["id"], "url": f"127.0.0.1:{page}/x"}, headers=proxied).json()
+    mhost = mine["base"].split("//")[1]
+    assert mine["url"].startswith(f"https://{mhost}/.mikrobox/enter?k=") and mine["url"].endswith("&to=%2Fx")
+    path = mine["url"].split(mhost, 1)[1]
+    first = _raw(gw, f"GET {path} HTTP/1.1\r\nHost: {mhost}\r\n\r\n".encode()).decode()
+    assert first.startswith("HTTP/1.1 302") and "Location: /x\r\n" in first and "Set-Cookie: mikrobox_link=" in first
+    assert _raw(gw, f"GET {path} HTTP/1.1\r\nHost: {mhost}\r\n\r\n".encode()).startswith(b"HTTP/1.1 403")
+    # Someone else listing links doesn't get the key.
+    client.app.state.weblinks.links[mine["id"]].by = "someone"
+    assert "enter" not in next(l for l in client.get("/api/web", headers=proxied).json() if l["id"] == mine["id"])
+    # A link for anyone needs no key.
+    anyone = client.post("/api/web", json={"lab": lab, "node": pc["id"], "url": f"127.0.0.1:{page}/", "who": "anyone"},
+                         headers=proxied).json()
+    ahost = anyone["base"].split("//")[1]
+    assert anyone["url"] == f"https://{ahost}/" and "enter" not in anyone
+    assert _raw(gw, f"GET /x HTTP/1.1\r\nHost: {ahost}:443\r\n\r\n".encode()).startswith(b"HTTP/1.1 200")
+    # A closed link, or a name that never was one.
+    client.delete(f"/api/web/{anyone['id']}")
+    assert _raw(gw, f"GET / HTTP/1.1\r\nHost: {ahost}\r\n\r\n".encode()).startswith(b"HTTP/1.1 404")
+    assert _raw(gw, b"GET / HTTP/1.1\r\nHost: other.example.org\r\n\r\n").startswith(b"HTTP/1.1 404")
+
+    # Check this server: a name that answers, through DNS and the proxy, for a moment.
+    probe = client.post("/api/web/probe", params={"gateway": True}).json()
+    plabel = probe["url"].split("//")[1].split(".")[0]
+    assert probe["url"] == f"https://{plabel}.example.com/.mikrobox/probe" and probe["port"] == gw
+    answer = _raw(gw, f"GET /.mikrobox/probe HTTP/1.1\r\nHost: {plabel}.example.com\r\nOrigin: https://mikrobox.example.com\r\n\r\n".encode())
+    assert b"Access-Control-Allow-Origin: *" in answer and answer.endswith(b'{"ok": true}')
+    for l in (view, mine):
+        client.delete(f"/api/web/{l['id']}")
+    assert client.put("/api/system/web", json={"domain": ""}).json() == {"web_domain": ""}
+    assert client.post("/api/web/probe", params={"gateway": True}).status_code == 409
 
 
 def test_link_addresses_and_ports(client, lab_pc, monkeypatch):

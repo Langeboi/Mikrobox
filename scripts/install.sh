@@ -118,6 +118,8 @@ echo "Mikrobox is running:  http://$IP:8080/"
 echo
 echo "Links that open lab web pages in your browser use ports 20000-20999."
 echo "If this VM has a firewall, let those in too (ufw: sudo ufw allow 20000:20999/tcp)."
+echo "Behind a reverse proxy, links can go through your own domain instead: port 8090"
+echo "(see 'Through your own domain' in the README)."
 echo
 echo "The Cloud currently gives lab devices internet through this VM (NAT)."
 echo "To put them directly on your own network instead, see what would change with:"

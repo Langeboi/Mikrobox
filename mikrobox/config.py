@@ -32,6 +32,9 @@ class Settings:
     kvm_device: Path = Path("/dev/kvm")
     qemu_binary: str = "qemu-system-x86_64"
     web_ports: tuple[int, int] = (20000, 20999)  # links that open lab pages in your browser
+    # Links through your own domain: a reverse proxy sends *.<domain> here (see weblinks.py).
+    # None turns it off; 0 picks any free port (tests).
+    gateway_port: int | None = 8090
 
     extra: dict = field(default_factory=dict)
 
@@ -58,6 +61,9 @@ class Settings:
         if "MIKROBOX_WEB_PORTS" in env:
             lo, _, hi = env["MIKROBOX_WEB_PORTS"].partition("-")
             kwargs["web_ports"] = (int(lo), int(hi or lo))
+        if "MIKROBOX_GATEWAY_PORT" in env:
+            v = env["MIKROBOX_GATEWAY_PORT"].strip().lower()
+            kwargs["gateway_port"] = None if v in ("", "off", "none") else int(v)
         if "MIKROBOX_MAX_DEVICES" in env:
             kwargs["max_devices"] = min(128, int(env["MIKROBOX_MAX_DEVICES"]))
         return cls(**kwargs)
