@@ -574,3 +574,5 @@ a.button.primary { background: var(--accent); border-color: var(--accent); color
 .check-text .fix { color: var(--text); }
 .check-text .copy { margin-top: 4px; }
 .check-group > button { margin: 6px 0 4px; }
+.vw-overlay .copy { width: min(460px, 100%); }
+.vw-overlay > span { max-width: 560px; line-height: 1.5; }
