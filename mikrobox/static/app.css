@@ -563,3 +563,5 @@ a.button.primary { background: var(--accent); border-color: var(--accent); color
 .vw-overlay span { color: var(--muted); font-size: 13.5px; }
 .vw-overlay button { margin-top: 6px; }
 @media (max-width: 640px) { .vw-from { display: none; } }
+.vw-overlay .copy { width: min(460px, 100%); }
+.vw-overlay > span { max-width: 560px; line-height: 1.5; }

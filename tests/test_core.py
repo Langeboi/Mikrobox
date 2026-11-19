@@ -2115,6 +2115,35 @@ def lab_pc(client, monkeypatch):
     return lab, pc, running
 
 
+def test_viewer_knows_whether_the_browser_came(client, pages, lab_pc):
+    """A blank viewer tab says why: the browser never reached the port, or came from
+    another address than Mikrobox saw."""
+    import socket as _s, json as _j, urllib.request
+    lab, pc, _ = lab_pc
+    view = client.post("/api/web", json={"lab": lab, "node": pc["id"], "url": f"127.0.0.1:{pages['http']}", "mode": "view"}).json()
+    assert (view["hits"], view["refused"]) == (0, 0)
+    # The test client is "testclient"; this connection comes from 127.0.0.1: turned away and counted.
+    c = _s.create_connection(("127.0.0.1", view["port"]), timeout=5)
+    assert c.recv(10) == b""
+    c.close()
+    got = next(l for l in client.get("/api/web").json() if l["id"] == view["id"])
+    assert (got["hits"], got["refused"], got["refused_ip"]) == (0, 1, "127.0.0.1")
+    client.app.state.weblinks.links[view["id"]].allow = "127.0.0.1"
+    _raw(view["port"], b"GET / HTTP/1.1\r\nHost: x\r\n\r\n")
+    assert next(l for l in client.get("/api/web").json() if l["id"] == view["id"])["hits"] == 1
+
+    # Check this server's port test: a port from the top of the range answers with the address it saw.
+    probe = client.post("/api/web/probe").json()
+    assert probe["port"] == 42049 and probe["you"] == "testclient" and probe["url"] == "http://testserver:42049/"
+    with urllib.request.urlopen(f"http://127.0.0.1:{probe['port']}/", timeout=5) as r:
+        assert r.headers["Access-Control-Allow-Origin"] == "*"
+        assert _j.loads(r.read()) == {"ok": True, "from": "127.0.0.1"}
+    nxt = client.post("/api/web/probe").json()["port"]
+    assert nxt == 42048  # the first is still lent out for a moment
+    assert client.get("/api/system").json()["web_ports"] == [42000, 42049]
+    assert client.delete(f"/api/web/{view['id']}").status_code == 204  # frees 42000 for the next test
+
+
 def test_link_to_an_address(client, pages, lab_pc):
     lab, pc, _ = lab_pc
     r = client.post("/api/web", json={"lab": lab, "node": pc["id"], "url": f"127.0.0.1:{pages['http']}/hi?x=1", "who": "anyone"})

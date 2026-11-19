@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import asyncio
 import ipaddress
+import json
 import ssl
 import subprocess
 import time
@@ -56,6 +57,10 @@ class Link:
     mode: str = "link"  # or "view", for the viewer tab
     name: str = ""      # the host name the page expects (Host header, TLS name)
     page: str = ""      # view links: the last page the frame went to, for its address bar
+    # Who came: so a viewer tab that stays blank can say whether the browser got here at all.
+    hits: int = 0
+    refused: int = 0
+    refused_ip: str = ""
 
     @property
     def target(self) -> str:
@@ -78,6 +83,7 @@ class Link:
             "url": f"{scheme}://{shown}:{self.listen}{self.path}", "port": self.listen,
             "base": f"{scheme}://{shown}:{self.listen}", "target": self.target, "path": self.path,
             "page": self.page or self.path,
+            "hits": self.hits, "refused": self.refused, "refused_ip": self.refused_ip,
             "who": "me" if self.allow else "anyone", "allow": self.allow, "by": self.by,
             "created": self.created, "used": self.used,
         }
@@ -97,6 +103,7 @@ class WebLinks:
         self.next_id = 1
         self.loop: asyncio.AbstractEventLoop | None = None
         self.on_change = on_change or (lambda: None)
+        self.probing: set[int] = set()  # ports lent to Check this server for a moment
         rt.stop_hooks.append(self._node_stopped)
 
     def bind(self, loop: asyncio.AbstractEventLoop) -> None:
@@ -164,7 +171,7 @@ class WebLinks:
                 if (l.mode, l.node, l.host, l.port, l.scheme, l.allow, l.name) == (mode, node.id, host, port, scheme, allow, name or host):
                     l.path, l.used = path or "/", time.time()
                     return l
-        used = {l.listen for l in self.links.values()}
+        used = {l.listen for l in self.links.values()} | self.probing
         for listen in range(self.first, self.last + 1):
             if listen in used:
                 continue
@@ -184,9 +191,13 @@ class WebLinks:
 
     async def _serve(self, link: Link, reader, writer) -> None:
         peer = writer.get_extra_info("peername")
-        if link.allow and plain_ip(peer[0] if peer else None) != link.allow:
+        ip = plain_ip(peer[0] if peer else None)
+        if link.allow and ip != link.allow:
+            link.refused += 1
+            link.refused_ip = ip or ""
             writer.close()
             return
+        link.hits += 1
         link.used = time.time()
         if link.mode == "view":
             link.conns.add(writer)
@@ -289,6 +300,44 @@ class WebLinks:
             sending.cancel()
         finally:
             w2.close()
+
+    # -- can the browser reach these ports at all? ---------------------------
+
+    async def probe(self) -> int:
+        """A port from the range that answers anyone, once or for 30 seconds, with the
+        address it saw. Check this server fetches it from the browser: if that fails, a
+        firewall or port forwarding keeps browsers from links and viewer tabs."""
+        used = {l.listen for l in self.links.values()} | self.probing
+        for port in range(self.last, self.first - 1, -1):  # from the top, away from links
+            if port in used:
+                continue
+
+            async def answer(reader, writer):
+                peer = writer.get_extra_info("peername")
+                body = json.dumps({"ok": True, "from": plain_ip(peer[0] if peer else None)}).encode()
+                try:
+                    await asyncio.wait_for(reader.readuntil(b"\r\n\r\n"), 5)
+                except (asyncio.IncompleteReadError, asyncio.LimitOverrunError, asyncio.TimeoutError, OSError):
+                    pass
+                writer.write(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\n"
+                             b"Cache-Control: no-store\r\nConnection: close\r\nContent-Length: %d\r\n\r\n%s" % (len(body), body))
+                try:
+                    await writer.drain()
+                finally:
+                    writer.close()
+
+            try:
+                server = await asyncio.start_server(answer, "0.0.0.0", port)
+            except OSError:
+                continue
+            self.probing.add(port)
+
+            def done(server=server, port=port):
+                server.close()
+                self.probing.discard(port)
+            asyncio.get_running_loop().call_later(30, done)
+            return port
+        raise LinkError("All the link ports are in use.")
 
     @staticmethod
     async def _pipe(r, w, link: Link) -> None:
