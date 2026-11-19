@@ -667,7 +667,16 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @app.get("/api/system")
     def system():
-        return rt.system_info()
+        return {**rt.system_info(), "web_ports": list(settings.web_ports)}
+
+    @app.post("/api/web/probe")
+    async def web_probe(request: Request):
+        """A port from the link range for the browser to fetch: can it reach them at all?"""
+        port = await weblinks.probe()
+        host = request.url.hostname or "localhost"
+        shown = f"[{host}]" if ":" in host else host
+        return {"port": port, "url": f"http://{shown}:{port}/",
+                "you": plain_ip(request.client.host if request.client else None)}
 
     @app.put("/api/host/ksm")
     def set_ksm(body: KsmSetting):
@@ -1510,7 +1519,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             if not ports or not row["running"]:
                 raise Conflict(f"{body.container} is not running with a published TCP port.")
             host, port, scheme, path = "127.0.0.1", ports[0]["host"], None, "/"
-            name = host
+            # Reached over the server's own loopback, but shown (and asked for) at the
+            # server's address in the lab, where everyone else would find it.
+            own = (node.address if node.addressing == "static" else rt.clients.leased(node)) or ""
+            name = own.split("/")[0] or host
             title = f"{body.container} · {row['image'].split('/')[-1].split(':')[0]}"
             detail = f"Container on {node.name}, port {port}"
         elif body.url:

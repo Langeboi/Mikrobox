@@ -1272,9 +1272,10 @@ function checkDialog() {
     body.replaceChildren(h("p", { class: "hint" }, "Checking…"));
     summary.replaceChildren();
     try {
-      const r = await api("GET", "/system/check");
-      summary.replaceChildren(checkSummary(r.checks));
-      body.replaceChildren(...renderChecks(r.checks));
+      const [r, ports] = await Promise.all([api("GET", "/system/check"), probeWebPorts()]);
+      const checks = [...r.checks, ports];
+      summary.replaceChildren(checkSummary(checks));
+      body.replaceChildren(...renderChecks(checks));
     } catch (e) { body.replaceChildren(h("p", { class: "warn-text" }, e.message)); }
   };
   const dockerBtn = h("button", { type: "button" }, "Run the Docker test");
@@ -2429,8 +2430,14 @@ function buildViewer(key, link, target) {
   const v = { link, frame, addr, overlay, target: { node: target.node, container: target.container, port: target.port, url: target.url } };
   v.go = (path) => {
     overlay.hidden = true;
+    v.trouble = false;
+    v.reached = false;
+    v.started = Date.now();
+    v.hits0 = v.link.hits || 0;
+    v.refused0 = v.link.refused || 0;
     addr.value = v.link.target + path;
     frame.src = v.last = v.link.base + path;
+    if (location.protocol === "https:") viewerTrouble(v, v.link, "https");
   };
   const navigate = () => act(async () => {
     const text = addr.value.trim();
@@ -2471,13 +2478,85 @@ function buildViewer(key, link, target) {
 // goes: the address bar and Reload follow that.
 setInterval(async () => {
   const v = viewers.get(state.activeDock);
-  if (!v || document.hidden || !v.overlay.hidden || document.activeElement === v.addr) return;
+  if (!v || document.hidden || (!v.overlay.hidden && !v.trouble)) return;
   let link;
   try { link = (await api("GET", `/web?lab=${v.link.lab}`)).find((l) => l.id === v.link.id); } catch (e) { return; }
-  if (!link || document.activeElement === v.addr) return;
+  if (!link) return;
+  v.link = link;
+  if (link.hits > v.hits0) {
+    v.reached = true;
+    if (v.trouble === "unreachable" || v.trouble === "refused") { v.trouble = false; v.overlay.hidden = true; }
+  } else if (!v.reached && !v.trouble && Date.now() - v.started > 6000) {
+    // Six seconds and the browser hasn't come to the viewer's port: say why, not a blank page.
+    viewerTrouble(v, link, link.refused > v.refused0 ? "refused" : "unreachable");
+    return;
+  }
+  if (v.trouble || document.activeElement === v.addr) return;
   v.addr.value = link.target + link.page;
   v.last = link.base + link.page;
 }, 1500);
+
+function webPorts() {
+  return (state.sys && state.sys.web_ports) || [20000, 20999];
+}
+
+// Why a viewer tab is still blank: the browser never reached the viewer's port (firewall,
+// port forwarding), it came from another address than Mikrobox sees, or Mikrobox is on HTTPS.
+function viewerTrouble(v, link, why) {
+  const [a, b] = webPorts();
+  v.trouble = why;
+  const text = {
+    unreachable: [`Your browser can't reach port ${link.port} on the VM`,
+      `The page comes through ports ${a}-${b} on the VM, and nothing has arrived from your browser on port ${link.port}. `
+      + `A firewall on the VM, or port forwarding that only covers port ${location.port || (location.protocol === "https:" ? 443 : 80)}, is the usual reason. `
+      + "Check this server (Tools) tests it."],
+    refused: ["The viewer turned your browser away",
+      `It answers only ${link.allow}, the address Mikrobox sees for you, but your browser came from ${link.refused_ip}. `
+      + "A proxy, VPN or NAT between you and the VM changes your address."],
+    https: ["Viewer tabs need Mikrobox on plain HTTP",
+      "You opened Mikrobox over HTTPS, and browsers block plain HTTP pages inside HTTPS ones. Use http:// for Mikrobox, or open the page with a link instead."],
+  }[why];
+  v.overlay.replaceChildren(
+    h("strong", {}, text[0]),
+    h("span", {}, text[1]),
+    why === "unreachable" && copyRow(`sudo ufw allow ${a}:${b}/tcp`),
+    h("div", { class: "row" },
+      h("button", { type: "button", class: "primary", onclick: () => v.go(new URL(v.last).pathname + new URL(v.last).search) }, "Try again"),
+      h("button", { type: "button", onclick: () => window.open(v.last, "_blank", "noopener") }, "Open in a browser tab"),
+      why !== "https" && h("button", { type: "button", onclick: () => { v.trouble = "waiting"; v.overlay.hidden = true; } }, "Keep waiting")));
+  v.overlay.hidden = false;
+}
+
+// Can this browser reach the link ports at all? A port from the range answers once.
+async function probeWebPorts() {
+  const g = "Network", title = "Your browser and the link ports";
+  const [a, b] = webPorts();
+  if (location.protocol === "https:") {
+    return { group: g, title, status: "warn", fix: null,
+      detail: "Mikrobox is open over HTTPS, so browsers block viewer tabs (plain HTTP inside HTTPS). Links still open in their own tab." };
+  }
+  try {
+    const p = await api("POST", "/web/probe");
+    const ctl = new AbortController();
+    const timer = setTimeout(() => ctl.abort(), 6000);
+    let got = null;
+    try { got = await (await fetch(p.url, { signal: ctl.signal, cache: "no-store" })).json(); } catch (e) { got = null; }
+    clearTimeout(timer);
+    if (!got) {
+      return { group: g, title, status: "fail", fix: `sudo ufw allow ${a}:${b}/tcp`,
+        detail: `This browser can't reach port ${p.port} on the VM, so viewer tabs stay blank and links don't open. `
+          + `Ports ${a}-${b} must reach the VM: open them in its firewall (with ufw, the command below), and in any port forwarding in front of it.` };
+    }
+    if (got.from !== p.you) {
+      return { group: g, title, status: "warn", fix: null,
+        detail: `Reached, but from ${got.from} where Mikrobox sees ${p.you}: something in between changes your address, `
+          + "so viewer tabs and 'only this computer' links will turn you away." };
+    }
+    return { group: g, title, status: "ok", fix: null, detail: `This browser reaches port ${p.port}: viewer tabs and links can load.` };
+  } catch (e) {
+    return { group: g, title, status: "warn", fix: null, detail: `Could not test: ${e.message}` };
+  }
+}
 
 // A viewer's link closes when its PC stops: say so in the tab, with a way back.
 async function checkViewers() {
