@@ -224,6 +224,8 @@ class Lab(BaseModel):
 
 class State(BaseModel):
     labs: list[Lab] = Field(default_factory=list)
+    # Links and viewer tabs get a name under this domain when Mikrobox is opened through it.
+    web_domain: str = ""
 
     def lab(self, lab_id: int) -> Optional[Lab]:
         return next((lab for lab in self.labs if lab.id == lab_id), None)

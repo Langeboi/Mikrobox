@@ -159,6 +159,9 @@ Windows-only H3C Cloud Lab, so neither is included.
   address bar, reload and a button to pop it out. The viewer fetches HTTPS pages without
   checking their certificate (the tab says so) and lifts the headers that stop pages from
   being shown in a frame, so router pages and dashboards that refuse frames still open.
+- Links and viewer tabs through your own domain: behind a reverse proxy or Cloudflare,
+  each one gets a name like `https://3f9c….example.com` instead of a port, over HTTPS.
+  See [Through your own domain](#through-your-own-domain-reverse-proxy-cloudflare).
 - A live packet view in the browser (Tools menu, or Packets on any running port), with
   capture filters, alongside pcap download for Wireshark. Clicking a packet shows the
   full protocol tree from tshark and its bytes: pointing at a field highlights its bytes,
@@ -214,6 +217,60 @@ was. Skip Docker with `sudo WITH_DOCKER=0 ./scripts/install.sh`.
 
 Links to lab web pages use ports 20000-20999 on the VM (`MIKROBOX_WEB_PORTS=a-b` in the
 service's environment changes the range). If the VM has a firewall, open those too.
+
+## Through your own domain (reverse proxy, Cloudflare)
+
+If you open Mikrobox through a reverse proxy, say as `https://mikrobox.example.com`, the
+link ports don't come along: the proxy (and Cloudflare) only pass their own. Mikrobox can
+give each link and viewer tab a name of its own under your domain instead, like
+`https://3f9c2a….example.com`, which the proxy sends to one port on the VM, 8090 (8091
+for a named install like the test build). Pages
+then open from anywhere, over HTTPS, viewer tabs included. Opened at the VM's own address,
+Mikrobox keeps using ports as before.
+
+1. **DNS.** A record for `*` (in Cloudflare: type A or CNAME, name `*`, proxied) pointing
+   where your Mikrobox record points. Names you already have keep working: the wildcard
+   only answers for names without a record of their own. Link names sit directly under
+   the domain because Cloudflare's free certificate covers only one level of names.
+2. **Reverse proxy.** Send `*.example.com` to `http://<VM address>:8090`, keeping the Host
+   header, with websockets on. If Cloudflare's SSL mode is Full (strict), the proxy's own
+   certificate must cover `*.example.com` too.
+   - Nginx Proxy Manager: Add Proxy Host, domain `*.example.com`, scheme http, forward to
+     the VM's address, port 8090, Websockets Support on. On the SSL tab, a Let's Encrypt
+     certificate for `*.example.com` with the DNS challenge (Cloudflare API token).
+   - Caddy (with the `caddy-dns/cloudflare` module):
+     ```
+     *.example.com {
+         tls { dns cloudflare {env.CF_API_TOKEN} }
+         reverse_proxy 10.10.200.28:8090
+     }
+     ```
+   - nginx:
+     ```
+     map $http_upgrade $connection_upgrade { default upgrade; "" close; }
+     server {
+         listen 443 ssl;
+         server_name *.example.com;
+         # ssl_certificate and ssl_certificate_key for *.example.com
+         location / {
+             proxy_pass http://10.10.200.28:8090;
+             proxy_http_version 1.1;
+             proxy_set_header Host $host;
+             proxy_set_header Upgrade $http_upgrade;
+             proxy_set_header Connection $connection_upgrade;
+             proxy_read_timeout 1h;
+         }
+     }
+     ```
+3. **Mikrobox.** Settings › Links through your domain: `example.com`.
+4. **Firewall.** If the VM runs ufw, let the proxy in: `sudo ufw allow 8090/tcp`.
+
+Check this server, opened through the domain, tests the whole way from your browser.
+Everyone arrives from the proxy's address there, so "only this computer" can't go by
+address: a link for you lets in the first browser that opens it (its address carries a
+key, which it then keeps as a cookie), and a viewer tab's key goes only to whoever opened
+it. A link for anyone opens for anyone who has it; its name is long and random.
+`MIKROBOX_GATEWAY_PORT` in the service's environment changes the port (`off` turns it off).
 
 ## Accounts
 
@@ -311,6 +368,7 @@ Add `?seconds=30` for a capture that ends by itself; the workspace's Capture lin
 | Client services | `udhcpc`, `dnsmasq`, `python3 -m http.server` and `iperf3 -s`, started inside the client's namespace |
 | Docker on a client | `dockerd` started inside the client's namespace with a private mount namespace (its own `/sys`, containerd and `resolv.conf`); data in `/var/lib/mikrobox/docker/n<id>`, socket in `/run/mikrobox/docker/n<id>.sock`, which the client's console uses as `DOCKER_HOST` |
 | Web links | A port on the VM per link; each connection is made from inside the client's namespace and passed through byte for byte |
+| Through a domain | One port (8090) for every link, found by the name it was asked for; served like a viewer tab, one request per connection |
 | Live updates | A websocket at `/api/events` that tells open workspaces to reload what changed |
 
 ## Known gaps
@@ -341,7 +399,9 @@ Add `?seconds=30` for a capture that ends by itself; the workspace's Capture lin
   without internet, so pulling from Docker Hub was tested with a stand-in. Each engine
   uses about 100 MB of memory while its client runs.
 - Web links are plain TCP ports: anyone who can reach the VM can use a link made for
-  anyone. "Only this computer" goes by IP address.
+  anyone. "Only this computer" goes by IP address. Through your domain it's a key kept
+  as a cookie instead, and the reverse proxy setup was tested with a stand-in proxy, not
+  with Cloudflare itself.
 - Browsers don't keep cookies apart by port, so a lab page opened through a link is sent
   Mikrobox's sign-in cookie too. Two things make that harmless: Mikrobox refuses changes
   and websockets that come from any page but its own, and a sign-in only works from the

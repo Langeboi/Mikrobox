@@ -12,6 +12,7 @@ and fix, when there is one, is a command or a step to take.
 from __future__ import annotations
 
 import os
+import re
 import platform
 import shutil
 import subprocess
@@ -72,6 +73,7 @@ class SelfCheck:
         self.s = rt.s
         self.web_ports = web_ports
         self.docker_lock = threading.Lock()
+        self.gateway = lambda: (None, "", "")  # (port, error, domain): links through a domain
 
     # -- the quick checks ----------------------------------------------------
 
@@ -80,7 +82,8 @@ class SelfCheck:
             return [item("This VM", "Dry-run mode", INFO,
                          "Mikrobox is only pretending here, so nothing on this machine was checked.")]
         out: list[dict] = []
-        for part in (self._vm, self._images, self._programs, self._network, self._probes, self._docker, self._firewall):
+        for part in (self._vm, self._images, self._programs, self._network, self._probes, self._docker, self._firewall,
+                     self._gateway):
             try:
                 out += part()
             except Exception as e:  # a check that breaks says so instead of hiding the others
@@ -254,6 +257,27 @@ class SelfCheck:
                      f"Ports {first}-{last}, used by links to lab web pages, are "
                      + ("allowed." if allowed else "blocked, so those links won't open."),
                      None if allowed else f"sudo ufw allow {first}:{last}/tcp")]
+
+    def _gateway(self) -> list[dict]:
+        """Links through your domain: the port the reverse proxy sends *.<domain> to."""
+        port, error, domain = self.gateway()
+        if not domain:
+            return []
+        g, title = "Network", f"Links through {domain}"
+        if port is None:
+            return [item(g, title, FAIL, error or "The gateway port is off (MIKROBOX_GATEWAY_PORT).",
+                         "Free the port, or set another with MIKROBOX_GATEWAY_PORT, and restart Mikrobox.")]
+        out = [item(g, title, OK, f"Port {port} takes *.{domain} from your reverse proxy.")]
+        if shutil.which("ufw"):
+            try:
+                status = _run(["ufw", "status"]).stdout
+            except (OSError, subprocess.SubprocessError):
+                status = ""
+            if "Status: active" in status and not re.search(rf"(?m)^{port}(/tcp)?\s+ALLOW", status):
+                out.append(item(g, f"Firewall (ufw) and port {port}", WARN,
+                                f"Your reverse proxy can't reach port {port}, so links through {domain} won't open.",
+                                f"sudo ufw allow {port}/tcp"))
+        return out
 
     # -- the Docker test -----------------------------------------------------
 
