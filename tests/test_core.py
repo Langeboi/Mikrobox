@@ -488,9 +488,17 @@ def test_delete_node_removes_its_links(client):
 
 
 def test_ui_is_served_and_positions_are_saved(client):
-    assert "Mikrobox" in client.get("/").text
-    assert client.get("/static/app.js").status_code == 200
+    page = client.get("/")
+    assert "Mikrobox" in page.text and page.headers["cache-control"] == "no-cache"
+    # A CDN or the browser can't keep an old app.js after an update: it's a new address.
+    import re as _re
+    src = _re.search(r'src="(/static/app\.js\?v=[0-9a-f]{10})"', page.text)
+    assert src, "app.js is fingerprinted"
+    r = client.get(src.group(1))
+    assert r.status_code == 200 and r.headers["cache-control"] == "no-cache"
+    assert _re.search(r'href="/static/app\.css\?v=[0-9a-f]{10}"', page.text)
     assert client.get("/static/vendor/xterm.js").status_code == 200
+    assert "?v=" in client.get("/console").text
     lab = make_lab(client)
     r1 = add_node(client, lab, name="R1", x=300, y=200)
     assert (r1["x"], r1["y"]) == (300, 200)

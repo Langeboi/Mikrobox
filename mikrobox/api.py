@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import hashlib
 import io
 import time
 import ipaddress
@@ -48,6 +49,35 @@ from .trash import Trash, free_name
 from .selfcheck import SelfCheck
 
 STATIC = Path(__file__).parent / "static"
+# Pages and their files are always checked with Mikrobox before use: a CDN in front (Cloudflare
+# caches .js and .css by default) or the browser would otherwise keep the old ones after an
+# update. Each page names its files with a fingerprint, so a changed file is a new address.
+FRESH = {"Cache-Control": "no-cache"}
+_STATIC_REF = re.compile(r'(/static/[\w./-]+\.(?:js|css|svg))(?=")')
+
+
+def _fingerprint(path: Path, _seen: dict = {}) -> str:
+    stamp = path.stat().st_mtime_ns
+    if _seen.get(path, (None,))[0] != stamp:
+        _seen[path] = (stamp, hashlib.sha256(path.read_bytes()).hexdigest()[:10])
+    return _seen[path][1]
+
+
+def page(name: str) -> Response:
+    def versioned(m: re.Match) -> str:
+        file = STATIC / m.group(1)[len("/static/"):]
+        return f"{m.group(1)}?v={_fingerprint(file)}" if file.is_file() else m.group(1)
+    html = _STATIC_REF.sub(versioned, (STATIC / name).read_text())
+    return Response(html, media_type="text/html; charset=utf-8", headers=FRESH)
+
+
+class FreshStatic(StaticFiles):
+    async def get_response(self, path, scope):
+        response = await super().get_response(path, scope)
+        response.headers.update(FRESH)
+        return response
+
+
 ANNO_WORDS = {"rect": "an area", "ellipse": "an area", "text": "a text label", "note": "a note"}
 
 
@@ -514,7 +544,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @app.get("/login", include_in_schema=False)
     def login_page():
-        return FileResponse(STATIC / "login.html")
+        return page("login.html")
 
     @app.get("/api/auth/status")
     def auth_status(request: Request):
@@ -695,9 +725,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @app.get("/", include_in_schema=False)
     def index_page():
-        return FileResponse(STATIC / "index.html")
+        return page("index.html")
 
-    app.mount("/static", StaticFiles(directory=STATIC), name="static")
+    app.mount("/static", FreshStatic(directory=STATIC), name="static")
 
     @app.get("/favicon.ico", include_in_schema=False)
     def favicon():
@@ -705,7 +735,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @app.get("/console", include_in_schema=False)
     def console_page():
-        return FileResponse(STATIC / "console.html")
+        return page("console.html")
 
     # -- labs ------------------------------------------------------------
 

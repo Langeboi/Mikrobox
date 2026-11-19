@@ -2508,13 +2508,14 @@ function viewerTrouble(v, link, why) {
   const text = {
     unreachable: [`Your browser can't reach port ${link.port} on the VM`,
       `The page comes through ports ${a}-${b} on the VM, and nothing has arrived from your browser on port ${link.port}. `
-      + `A firewall on the VM, or port forwarding that only covers port ${location.port || (location.protocol === "https:" ? 443 : 80)}, is the usual reason. `
+      + `A firewall on the VM, or a reverse proxy or port forwarding that only passes port ${location.port || (location.protocol === "https:" ? 443 : 80)}, is the usual reason. `
+      + "Behind a reverse proxy, open Mikrobox at the VM's own address on your network for viewer tabs. "
       + "Check this server (Tools) tests it."],
     refused: ["The viewer turned your browser away",
       `It answers only ${link.allow}, the address Mikrobox sees for you, but your browser came from ${link.refused_ip}. `
       + "A proxy, VPN or NAT between you and the VM changes your address."],
     https: ["Viewer tabs need Mikrobox on plain HTTP",
-      "You opened Mikrobox over HTTPS, and browsers block plain HTTP pages inside HTTPS ones. Use http:// for Mikrobox, or open the page with a link instead."],
+      `You opened Mikrobox over HTTPS, and browsers block plain HTTP pages inside HTTPS ones. Viewer tabs also come through ports ${a}-${b}, which a reverse proxy or Cloudflare doesn't pass. Open Mikrobox over http:// at the VM's own address on your network.`],
   }[why];
   v.overlay.replaceChildren(
     h("strong", {}, text[0]),
